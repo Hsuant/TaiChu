@@ -1,0 +1,71 @@
+# ============================================================================
+# TaiChu (太初) Tokenizer 训练配置
+# ============================================================================
+
+# 数据配置
+data:
+  # 推荐使用 ChineseWebText（通用基础） + COIG-CQIA（对话风格）混合训练
+  files:
+    - "E:/Academic/Datasets/LLM/pretrain_hq.jsonl"
+  epoch: 1                             # 训练迭代次数，大数据量时设为 1 即可
+
+# 预分词器配置
+pre_tokenizer:
+  type: "bytelevel"                    # 字节级 BPE，处理多语言鲁棒性最佳
+
+# BPE 训练器配置
+trainer:
+  vocab_size: 50304                    # 词表大小，可根据需求调整（如 64000）
+  min_frequency: 2                     # 低频词阈值，建议设为 2 或 3，过滤掉低频稀有词
+  limit_alphabet: 1000                 # 建议设为 1000，覆盖绝大多数字符的同时控制内存
+  show_progress: true
+  # 特殊 Token 列表（确保后处理器和 Chat 模板中出现的 Token 都包含）
+  special_tokens:
+    - "<|endoftext|>"                  # 文档结束标记
+    - "<|im_start|>"                   # 消息起始
+    - "<|im_end|>"                     # 消息结束（同时兼任 eos / pad）
+    - "<|think|>"                      # 思考开始
+    - "<|/think|>"                     # 思考结束
+    - "<unk>"                          # 未登录词标记
+
+# 后处理器配置（TemplateProcessing）
+post_processor:
+  # 单序列模板：用于无对话历史时的助手生成
+  single_template: "<|im_start|>assistant\n$A<|im_end|>\n"
+  # 双序列模板：用于单轮问答（用户-助手）
+  pair_template: "<|im_start|>user\n$A<|im_end|>\n<|im_start|>assistant\n$B<|im_end|>\n"
+  # 模板中实际出现的特殊 Token（必须与 trainer.special_tokens 对应）
+  special_tokens:
+    - "<|im_start|>"
+    - "<|im_end|>"
+
+# Chat Template（Jinja2 格式，支持多轮对话、系统消息、思考标签）
+chat_template: |
+  {%- if messages[0]['role'] == 'system' %}
+      {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+      {%- set loop_messages = messages[1:] %}
+  {%- else %}
+      {%- set loop_messages = messages %}
+  {%- endif %}
+  {%- for message in loop_messages %}
+      {%- if message['role'] == 'user' %}
+          {{- '<|im_start|>user\n' + message['content'] + '<|im_end|>\n' }}
+      {%- elif message['role'] == 'assistant' %}
+          {%- if message.get('reasoning_content') %}
+              {{- '<|im_start|>assistant\n<|think|>' + message['reasoning_content'] + '<|/think|>\n' + message['content'] + '<|im_end|>\n' }}
+          {%- else %}
+              {{- '<|im_start|>assistant\n' + message['content'] + '<|im_end|>\n' }}
+          {%- endif %}
+      {%- endif %}
+  {%- endfor %}
+  {%- if add_generation_prompt %}
+      {{- '<|im_start|>assistant\n' }}
+  {%- endif %}
+
+# 解码器配置
+decoder:
+  type: "bytelevel"                    # 与预分词器一致
+
+# 保存路径
+save:
+  directory: "./taichu_tokenizer"

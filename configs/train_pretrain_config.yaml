@@ -1,0 +1,48 @@
+# TaiChu 预训练参数配置
+
+optimizer:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+
+scheduler:
+  warmup_steps: 1000
+  max_steps: 100000
+  min_lr_ratio: 0.1
+
+data:
+  # 训练数据文件列表（支持通配符）
+  train_files:
+    - "./dataset/test/test_pretrain_train.jsonl"
+  # 验证数据文件列表
+  val_files:
+    - "./dataset/test/test_pretrain_eval.jsonl"
+  tokenizer_path: "./taichu_tokenizer/tokenizer.json"
+  max_seq_length: 2048
+  text_field: "text"   # 若 JSON 中文本键为 "text"
+  # 若已预分词，可设为 true 并指定 pre_tokenized_dir
+  from_pre_tokenized: false
+  pre_tokenized_dir: "./data/tokenized"
+  num_workers: 2
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_steps: 100000
+  save_interval: 5000
+  log_interval: 10
+  output_dir: "./checkpoints/TaiChu_pretrain"
+  use_mixed_precision: false
+  dtype: "bfloat16"
+  seed: 42
+
+# 测试配置
+evaluating:
+  eval_interval: 200
+  prompts: # 用于生成的提示词列表
+    - "人工智能的未来是"
+    - "深度学习之所以强大是因为"
+    - "春天很美丽草原上有"
+  num_generate_tokens: 50   # 每个提示生成的 token 数量

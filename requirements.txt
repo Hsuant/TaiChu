@@ -1,75 +1,21 @@
-# ============= 核心依赖 =============
-# 深度学习框架
-torch
-torchvision
-torchaudio
-torch_scatter
-transformers>=4.40.0
-fairscale>=0.4.13
+# ============================================================
+# TaiChu (太初) 项目依赖
+# 包含：模型构建（PyTorch）、Tokenizer 训练（tokenizers）及相关工具
+# ============================================================
 
-# Tokenizer
-sentencepiece
+# ---------- 深度学习框架 ----------
+torch>=2.11.0                # PyTorch 核心库，用于模型定义与训练
 
-# 数据处理
-numpy>=1.24.0
-pandas>=2.0.0
+# ---------- Tokenizer 训练（基于 HuggingFace tokenizers） ----------
+tokenizers>=0.15.0          # 高性能 CPU 分词器训练与推理
+tqdm>=4.64.0               # 训练进度条显示
 
-# 配置管理
-pyyaml==6.0.2
+# ---------- 配置与序列化 ----------
+pyyaml>=6.0                # 解析 YAML 配置文件（模型超参、Tokenizer 配置等）
 
-# ============= 模型组件 =============
-# DropPath实现
-timm==1.0.17
+# ---------- 可选性能加速 ----------
+# 若需使用 FlashAttention，请取消以下注释并安装对应版本
+# flash-attn>=2.3.0        # 高效注意力计算（需 CUDA 环境，CPU 可忽略）
 
-# ============= NLP评估工具 =============
-nltk>=3.9.1
-rouge-score>=0.1.2
-
-# ============= Tokenizer 训练专用 =============
-# 高性能 tokenizer 库
-tokenizers>=0.21.0
-
-# 数据集处理
-datasets>=3.2.0
-
-# ============= 可视化与监控 =============
-# 实验追踪
-swanlab==0.6.6
-
-# 可视化工具
-matplotlib>=3.7.0
-seaborn>=0.12.0
-tabulate>=0.9.0
-
-# 终端UI
-rich>=13.0.0
-
-# ============= 测试与开发 =============
-# 单元测试
-pytest==8.3.4
-pytest-cov>=4.1.0
-
-# 类型检查
-mypy>=1.5.0
-types-PyYAML>=6.0.0
-types-tabulate>=0.9.0
-
-# ============= 分布式训练 =============
-# 分布式训练支持
-torch-xla>=2.0.0 ; platform_system != "Windows"
-
-# ============= 性能优化 =============
-# 内存优化
-accelerate>=0.20.0 ; platform_system != "Windows"
-torch-optimizer>=0.3.0
-
-# ============= 日志与工具 =============
-# 日志管理
-tqdm>=4.65.0
-
-# 系统资源监控
-psutil>=5.9.0
-
-# ============= 其他工具 =============
-typing-extensions>=4.7.0
-requests>=2.31.0
+# ---------- 开发与调试（建议安装） ----------
+numpy>=1.24.0              # 基础数值计算（通常随 torch 自动安装，显式列出以保证版本）

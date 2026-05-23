@@ -1,0 +1,39 @@
+# ============================================================================
+# TaiChu 小型语言模型配置文件
+# 项目名称: TaiChu (太初)
+# ============================================================================
+
+# 模型名称与基础信息
+model_name: "TaiChu-50M"           # 模型标识名称，用于日志与保存
+
+# 模型架构超参数
+architecture:
+  vocab_size: 50304                # 词表大小，通常取2的幂次方倍数以优化嵌入矩阵计算
+  hidden_size: 768                 # 隐藏层维度（d_model），Transformer主干的特征宽度
+  num_layers: 12                   # Transformer解码器层数（仅decoder堆叠）
+  num_attention_heads: 12          # 注意力头数，需能被hidden_size整除
+  num_key_value_heads: 4           # 键值头数（GQA），设为0或等于num_attention_heads即为标准MHA
+  intermediate_size: 3072          # 前馈网络中间层维度，通常为hidden_size的4倍
+  max_position_embeddings: 2048    # 最大序列长度（决定了位置编码的预计算范围）
+  rope_theta: 10000.0              # RoPE的基频参数，影响长程衰减特性
+  rms_norm_eps: 1.0e-6             # RMSNorm的epsilon，防止除零
+  tie_word_embeddings: true        # 是否共享输入嵌入和输出头的权重
+
+# 激活函数与正则化配置
+activation:
+  hidden_act: "silu"               # SwiGLU中的门控激活函数，通常为silu（即swish）
+  ffn_type: "swiglu"               # 前馈网络类型："swiglu" 或 "standard"，指定为 "moe" 以启用 MoE FFN
+
+moe:
+  num_experts: 8                   # 路由专家数量
+  num_shared_experts: 1            # 共享专家数量
+  top_k: 2                         # 每个 token 激活的专家数
+  expert_intermediate_size: 1536   # 每个路由专家的中间维度（可与 architecture.intermediate_size 不同）
+  shared_expert_intermediate_size: 3072  # 共享专家的中间维度（通常较大）
+  load_balancing_loss_weight: 0.01  # 负载均衡损失系数，用于鼓励专家负载均衡
+  router_z_loss_weight: 0.001       # 路由器 z-loss 系数（可选，DeepSeek-V3 用于稳定训练）
+
+regularization:
+  attention_dropout: 0.0           # 注意力权重上的dropout概率，预训练通常为0
+  hidden_dropout: 0.0              # 残差连接后的dropout概率
+  embedding_dropout: 0.0           # 嵌入层后的dropout概率

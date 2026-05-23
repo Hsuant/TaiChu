@@ -1,0 +1,39 @@
+# ============================================================================
+# TaiChu 小型语言模型配置文件 (参数量 ~50M)
+# 项目名称: TaiChu (太初)
+# ============================================================================
+
+# 模型名称与基础信息
+model_name: "TaiChu-50M"           # 模型标识名称，用于日志与保存
+
+# 模型架构超参数
+vocab_size: 151665
+hidden_size: 384
+num_layers: 13
+num_attention_heads: 12
+num_key_value_heads: 4
+intermediate_size: 1664
+max_position_embeddings: 2048
+rope_theta: 10000.0
+rms_norm_eps: 1.0e-6
+tie_word_embeddings: true
+
+# 激活函数与前馈类型
+hidden_act: "silu"
+ffn_type: "swiglu"
+
+# MoE 配置（此处未启用，保留默认值）
+moe:
+  num_experts: 8
+  num_shared_experts: 1
+  top_k: 2
+  expert_intermediate_size: 1536
+  shared_expert_intermediate_size: 3072
+  load_balancing_loss_weight: 0.01
+  router_z_loss_weight: 0.001
+
+# 正则化（预训练阶段建议均为 0）
+regularization:
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  embedding_dropout: 0.0
