@@ -139,112 +139,138 @@ class TaiChuTrainer:
 
     def train(self) -> None:
         """执行主训练循环。"""
-        self.model.train()
-        self.start_time = time.time()
-        self.log_manager.info("训练开始")
+        try:
+            self.model.train()
+            self.start_time = time.time()
+            self.log_manager.info("训练开始")
 
-        # 数据迭代器
-        train_iter = iter(self.train_loader)
-        accumulated_loss = 0.0          # 累积的原始损失（未除累积步数）
-        samples_processed = 0           # 当前累积步内处理的样本数
-        micro_step = 0                  # 当前累积步内已处理的微批次计数
+            # 数据迭代器
+            train_iter = iter(self.train_loader)
+            accumulated_loss = 0.0          # 累积的原始损失（未除累积步数）
+            samples_processed = 0           # 当前累积步内处理的样本数
+            micro_step = 0                  # 当前累积步内已处理的微批次计数
 
-        while self.global_step < self.max_steps:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(self.train_loader)
-                batch = next(train_iter)
+            while self.global_step < self.max_steps:
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(self.train_loader)
+                    batch = next(train_iter)
 
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
 
-            # 前向传播（混合精度）
-            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
-                out = self.model(input_ids, labels=labels)
-                loss = out.loss
-                loss = loss.mean() / self.gradient_accumulation_steps   # 缩放损失
+                # 前向传播（混合精度）
+                with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
+                    out = self.model(input_ids, labels=labels)
+                    loss = out.loss
+                    loss = loss.mean() / self.gradient_accumulation_steps   # 缩放损失
 
-            # 反向传播
-            self.scaler.scale(loss).backward()
-            accumulated_loss += loss.item() * self.gradient_accumulation_steps   # 恢复原始损失
-            samples_processed += input_ids.size(0)
-            micro_step += 1
+                # 反向传播
+                self.scaler.scale(loss).backward()
+                accumulated_loss += loss.item() * self.gradient_accumulation_steps   # 恢复原始损失
+                samples_processed += input_ids.size(0)
+                micro_step += 1
 
-            # 达到梯度累积步数，执行参数更新
-            if micro_step == self.gradient_accumulation_steps:
-                # 梯度裁剪（防止梯度爆炸）
-                if self.use_amp:
-                    self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # 达到梯度累积步数，执行参数更新
+                if micro_step == self.gradient_accumulation_steps:
+                    # 梯度裁剪（防止梯度爆炸）
+                    if self.use_amp:
+                        self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                # 优化器步进
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.scheduler.step()
+                    # 优化器步进
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.scheduler.step()
 
-                # 更新全局步数
-                self.global_step += 1
-                avg_loss = accumulated_loss / self.gradient_accumulation_steps
+                    # 更新全局步数
+                    self.global_step += 1
+                    avg_loss = accumulated_loss / self.gradient_accumulation_steps
 
-                # 记录训练指标
-                if self.global_step % self.train_log_interval == 0:
-                    self._log_training(avg_loss, samples_processed)
+                    # 记录训练指标
+                    if self.global_step % self.train_log_interval == 0:
+                        self._log_training(avg_loss, samples_processed)
 
-                # 日志记录完毕再梯度清零
-                self.optimizer.zero_grad()
+                    # 日志记录完毕再梯度清零
+                    self.optimizer.zero_grad()
 
-                # 重置累积计数器
-                accumulated_loss = 0.0
-                samples_processed = 0
-                micro_step = 0
+                    # 重置累积计数器
+                    accumulated_loss = 0.0
+                    samples_processed = 0
+                    micro_step = 0
 
-                # 验证
-                if self.global_step % self.eval_interval == 0:
-                    self.log_manager.info("验证开始")
-                    val_loss = self._evaluate(
-                        generate_prompts=self.generation_prompts,
-                        num_generate_tokens=self.num_generate_tokens,
-                    )
-                    if val_loss < self.best_val_loss:
-                        self.best_val_loss = val_loss
-                    self.checkpoint_manager.save_best(
-                        self.model,
-                        metrics={"val_loss": val_loss},
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        scaler=self.scaler,
-                        global_step=self.global_step,
-                    )
-                    self.log_manager.info(
-                        f"当前最佳验证损失: {self.checkpoint_manager.best_metric_value:.4f}"
-                    )
+                    # 验证
+                    if self.global_step % self.eval_interval == 0:
+                        self.log_manager.info("验证开始")
+                        val_loss = self._evaluate(
+                            generate_prompts=self.generation_prompts,
+                            num_generate_tokens=self.num_generate_tokens,
+                        )
+                        if val_loss < self.best_val_loss:
+                            self.best_val_loss = val_loss
+                        self.checkpoint_manager.save_best(
+                            self.model,
+                            metrics={"val_loss": val_loss},
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            scaler=self.scaler,
+                            global_step=self.global_step,
+                        )
+                        self.log_manager.info(
+                            f"当前最佳验证损失: {self.checkpoint_manager.best_metric_value:.4f}"
+                        )
 
-                # 定期保存检查点
-                if self.global_step % self.save_interval == 0:
-                    self.checkpoint_manager.save(
-                        f"checkpoint-{self.global_step}.pt",
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        scaler=self.scaler,
-                        global_step=self.global_step,
-                        metrics={"val_loss": val_loss if 'val_loss' in locals() else self.best_val_loss},
-                    )
+                    # 定期保存检查点
+                    if self.global_step % self.save_interval == 0:
+                        self.checkpoint_manager.save(
+                            f"checkpoint-{self.global_step}.pt",
+                            model=self.model,
+                            optimizer=self.optimizer,
+                            scheduler=self.scheduler,
+                            scaler=self.scaler,
+                            global_step=self.global_step,
+                            metrics={"val_loss": val_loss if 'val_loss' in locals() else self.best_val_loss},
+                        )
 
-        # 训练结束，保存最终模型
+            # 训练结束，保存最终模型
+            self.checkpoint_manager.save(
+                "final_model.pt",
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                global_step=self.global_step,
+            )
+            self.log_manager.info("训练完成!")
+            if self.swanlab_logger:
+                self.swanlab_logger.finish()
+            self.log_manager.close()
+        except KeyboardInterrupt:
+            self.log_manager.info("训练被用户中断 (Ctrl+C)，正在保存检查点并退出...")
+            self._save_interrupted_checkpoint()
+        except Exception as e:
+            self.log_manager.error(f"训练过程中发生异常: {type(e).__name__}: {e}")
+            self.log_manager.error("正在保存紧急检查点...", exc_info=True)  # exc_info 会记录完整堆栈到日志文件
+            self._save_interrupted_checkpoint()
+            raise  # 保留原始异常，但会打印简洁信息（已记录堆栈到日志）
+        finally:
+            if self.swanlab_logger:
+                self.swanlab_logger.finish()
+            self.log_manager.close()
+
+    def _save_interrupted_checkpoint(self) -> None:
+        """保存中断/异常时的检查点。"""
         self.checkpoint_manager.save(
-            "final_model.pt",
+            f"checkpoint-emergency-step{self.global_step}.pt",
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             scaler=self.scaler,
             global_step=self.global_step,
+            metrics={"val_loss": self.best_val_loss},
         )
-        self.log_manager.info("训练完成!")
-        if self.swanlab_logger:
-            self.swanlab_logger.finish()
-        self.log_manager.close()
+        self.log_manager.info(f"紧急检查点已保存至 step {self.global_step}")
 
     def _log_training(self, loss: float, samples: int) -> None:
         """记录训练指标到 TensorBoard 和日志文件。

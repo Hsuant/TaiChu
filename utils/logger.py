@@ -170,21 +170,26 @@ class LogManager:
         if self.writer is not None:
             self.writer.add_graph(model, input_tensor)
 
-    def info(self, msg: str) -> None:
+    def info(self, msg: str, **kwargs) -> None:
         """输出 INFO 日志。"""
-        self.logger.info(msg)
+        self.logger.info(msg, **kwargs)
 
-    def warning(self, msg: str) -> None:
+    def warning(self, msg: str, **kwargs) -> None:
         """输出 WARNING 日志。"""
-        self.logger.warning(msg)
+        self.logger.warning(msg, **kwargs)
 
-    def error(self, msg: str) -> None:
-        """输出 ERROR 日志。"""
-        self.logger.error(msg)
+    def error(self, msg: str, exc_info: bool = False, **kwargs) -> None:
+        """输出 ERROR 日志。
 
-    def debug(self, msg: str) -> None:
+        Args:
+            msg: 日志消息。
+            exc_info: 是否记录异常信息（True 时在日志中输出完整堆栈）。
+        """
+        self.logger.error(msg, exc_info=exc_info, **kwargs)
+
+    def debug(self, msg: str, **kwargs) -> None:
         """输出 DEBUG 日志。"""
-        self.logger.debug(msg)
+        self.logger.debug(msg, **kwargs)
 
     def close(self) -> None:
         """关闭所有资源。"""
