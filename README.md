@@ -123,7 +123,7 @@ train_tokenizer(
 from utils.config_loader import load_model_config
 from model.model import TaiChuModel
 
-config = load_model_config("configs/TaiChu_50m.yaml")
+config = load_model_config("configs/TaiChu_77M.yaml")
 model = TaiChuModel(config)
 ```
 
