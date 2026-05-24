@@ -57,10 +57,38 @@ training:
 evaluating:
   eval_interval: 100
   log_interval: 10
-  prompts: # 用于生成的提示词列表
-    - "人工智能的未来是"
-    - "深度学习之所以强大是因为"
-    - "春天很美丽草原上有"
+  prompts: # 20个覆盖多维度能力的生成前缀（无指令，适合基座模型）
+    # 常识与事实知识
+    - "The capital of France is"                          # 地理知识
+    - "水在标准大气压下的沸点是"                               # 中文物理常识
+    - "The process of photosynthesis converts"            # 生物知识
+    - "Albert Einstein is best known for"                 # 历史/人物
+    # 逻辑推理与因果关系
+    - "If you drop a glass on a concrete floor, it"       # 物理因果
+    - "All mammals have hair. A whale is a mammal, so"    # 三段论推理
+    - "因为下雨，所以地面"                                    # 中文因果
+    # 数学与代码
+    - "The derivative of x^3 is"                          # 数学
+    - "The output of `2 + 3 * 4` is"                      # 算术表达式
+    # 叙事与创造性写作
+    - "Once upon a time in a distant galaxy,"             # 故事开头（英文）
+    - "深夜，一只猫悄悄地爬上了"                               # 中文叙事
+    - "She looked out the window and saw"                 # 情景描写
+    # 多语言（根据模型语料比例选择）
+    - "Le futur de l'intelligence artificielle est"       # 法语
+    - "Der Prozess des maschinellen Lernens beginnt mit"  # 德语
+    - "Deep learning is powerful because"                 # 英文
+    - "人工智能的未来是"                                     # 中文
+    # 列表/枚举与结构化输出
+    - "The three primary colors are"                      # 简单枚举
+    - "为了保持健康，你应该"                                  # 建议列表
+    - "Steps to solve a quadratic equation: first"        # 过程描述
+    # 对话式/角色模拟（无指令形式，仅自然前缀）
+    - "User: What's the weather like today?\nAssistant:"  # 对话延续（测试角色一致性）
+    - "客服：您好，请问有什么可以帮您？\n客户："                  # 中文客服场景
+    # 抽象与哲学
+    - "Consciousness is often defined as"                 # 抽象定义
+    - "时间就像"                                            # 比喻类
   num_generate_tokens: 50   # 每个提示生成的 token 数量
 
 # SwanLab 实验跟踪配置
