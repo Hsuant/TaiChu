@@ -34,6 +34,7 @@ from typing import List, Optional
 from utils.config_loader import load_model_config, load_pretrain_config
 from utils.train_utils import set_seed, get_device, get_cosine_lr_lambda
 from utils.logger import LogManager
+from utils.swanlab_logger import SwanLabLogger
 from utils.checkpoint import CheckpointManager
 from utils.model_utils import ModelInspector
 from dataset.llm_dataset import build_dataloader
@@ -71,6 +72,7 @@ class TaiChuTrainer:
         global_rank: int = 0,
         generation_prompts: Optional[List[str]] = None,
         num_generate_tokens: int = 50,
+        swanlab_logger: Optional[SwanLabLogger] = None,
     ):
         """初始化训练器。
 
@@ -91,14 +93,15 @@ class TaiChuTrainer:
             save_interval: 每隔多少步保存一次常规检查点。
             train_log_interval: 每隔多少步记录一次训练日志。
             eval_log_interval: 每隔多少步记录一次评估日志。
+            generation_prompts: 测试Prompts列表
+            num_generate_tokens: 测试生成token长度
+            swanlab_logger: SwanLab 日志记录器实例（仅主进程启用）。
             device: 当前设备。
             use_amp: 是否启用混合精度。
             dtype: 混合精度数据类型（'bfloat16' 或 'float16'）。
             local_rank: 当前进程的本地 Rank（用于设备设置）。
             max_seq_len: 最大序列长度，用于计算 tokens/s。
             global_rank: 全局 Rank（0 为主进程）。
-            generation_prompts: 测试Prompts列表
-            num_generate_tokens: 测试生成token长度
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -117,6 +120,7 @@ class TaiChuTrainer:
         self.eval_log_interval = eval_log_interval
         self.generation_prompts = generation_prompts
         self.num_generate_tokens = num_generate_tokens
+        self.swanlab_logger = swanlab_logger
         self.device = device
         self.use_amp = use_amp
         self.dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
@@ -237,7 +241,9 @@ class TaiChuTrainer:
             scaler=self.scaler,
             global_step=self.global_step,
         )
-        self.log_manager.info("训练完成。")
+        self.log_manager.info("训练完成!")
+        if self.swanlab_logger:
+            self.swanlab_logger.finish()
         self.log_manager.close()
 
     def _log_training(self, loss: float, samples: int) -> None:
@@ -284,6 +290,17 @@ class TaiChuTrainer:
         grad_max = grad_info.get("grad_max", 0.0)
 
         # 记录标量：训练损失、困惑度、学习率、吞吐量
+
+        # 构造指标字典
+        metrics = {
+            "train/loss": loss,
+            "train/perplexity": ppl,
+            "train/lr": lr,
+            "train/tokens_per_sec": tokens_per_sec,
+            "train/grad_norm": grad_norm,
+            "train/grad_max": grad_max,
+        }
+
         # 构建单行日志（控制台/文件）
         log_line = (
             f"Step {self.global_step} | "
@@ -291,6 +308,10 @@ class TaiChuTrainer:
             f"tok/s={tokens_per_sec:.0f} | grad_norm={grad_norm:.4f} | grad_max={grad_max:.4f}"
         )
         self.log_manager.logger.info(log_line)
+
+        # 记录到 SwanLab
+        if self.swanlab_logger:
+            self.swanlab_logger.log_metrics(metrics, step=self.global_step)
 
         # 更新 LogManager 内部步数（供其他可能调用）
         self.log_manager.set_step(self.global_step)
@@ -386,6 +407,12 @@ class TaiChuTrainer:
                     f"[生成测试] 提示: {prompt}\n生成结果: {generated_text}\n{'-' * 60}"
                 )
 
+                # 记录到 SwanLab（文本）
+                if self.swanlab_logger:
+                    self.swanlab_logger.log_text(
+                        f"generation/prompt_{idx}", generated_text, step=self.global_step
+                    )
+
         # 恢复训练模式
         self.model.train()
 
@@ -396,6 +423,11 @@ class TaiChuTrainer:
             self.log_manager.logger.info(
                 f"Step {self.global_step} - val/loss={avg_loss:.4f} | val/ppl={ppl:.2f}"
             )
+
+            # 记录到 SwanLab
+            if self.swanlab_logger:
+                val_metrics = {"val/loss": avg_loss, "val/perplexity": ppl}
+                self.swanlab_logger.log_metrics(val_metrics, step=self.global_step)
 
         return avg_loss
 
@@ -506,6 +538,46 @@ def main() -> None:
         best_metric_mode="min",
     )
 
+    # 12. SwanLab 日志记录器（仅主进程且配置启用）
+    swanlab_logger = None
+    use_swanlab = pretrain_cfg.swanlab.use_swanlab
+    if use_swanlab and is_main:
+        # 收集超参数配置
+        swanlab_config = {
+            "model_name": model_cfg.model_name,
+            "batch_size": pretrain_cfg.training.batch_size,
+            "gradient_accumulation_steps": pretrain_cfg.training.gradient_accumulation_steps,
+            "learning_rate": pretrain_cfg.optimizer.learning_rate,
+            "weight_decay": pretrain_cfg.optimizer.weight_decay,
+            "warmup_steps": pretrain_cfg.scheduler.warmup_steps,
+            "max_steps": pretrain_cfg.scheduler.max_steps,
+            "min_lr_ratio": pretrain_cfg.scheduler.min_lr_ratio,
+            "max_seq_length": pretrain_cfg.data.max_seq_length,
+            "use_mixed_precision": use_amp,
+            "dtype": pretrain_cfg.training.dtype,
+            "seed": pretrain_cfg.training.seed,
+        }
+        # 添加模型参数量（如果在前面已计算）
+        if 'total_params' in locals():
+            swanlab_config["total_params"] = total_params
+        if 'trainable_params' in locals():
+            swanlab_config["trainable_params"] = trainable_params
+
+        # 设置环境变量或模式（如果需要）
+        if pretrain_cfg.swanlab.swanlab_mode:
+            os.environ["SWANLAB_MODE"] = pretrain_cfg.swanlab.swanlab_mode
+
+        swanlab_logger = SwanLabLogger(
+            project=pretrain_cfg.swanlab.swanlab_project,
+            experiment_name=pretrain_cfg.swanlab.swanlab_experiment_name,
+            config=swanlab_config,
+            log_dir=pretrain_cfg.swanlab.swanlab_log_dir,
+            disabled=False,
+            global_rank=global_rank,
+        )
+        log_manager.info(
+            f"SwanLab 已启用，项目: {pretrain_cfg.swanlab.swanlab_project}，实验: {pretrain_cfg.swanlab.swanlab_experiment_name or 'auto'}")
+
     # 12. 恢复训练（如果指定）
     resume_step = 0
     best_val_loss_restored = None
@@ -543,6 +615,7 @@ def main() -> None:
         eval_log_interval=pretrain_cfg.evaluating.log_interval,
         generation_prompts=pretrain_cfg.evaluating.prompts,
         num_generate_tokens=pretrain_cfg.evaluating.num_generate_tokens,
+        swanlab_logger=swanlab_logger,
         device=device,
         use_amp=use_amp,
         dtype=pretrain_cfg.training.dtype,

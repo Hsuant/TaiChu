@@ -62,3 +62,11 @@ evaluating:
     - "深度学习之所以强大是因为"
     - "春天很美丽草原上有"
   num_generate_tokens: 50   # 每个提示生成的 token 数量
+
+# SwanLab 实验跟踪配置
+swanlab:
+  use_swanlab: true                     # 是否启用 SwanLab
+  swanlab_project: "TaiChu-Pretrain"    # 项目名称
+  swanlab_experiment_name: "TaiChu_77M_Pretrain"  # 实验名称，可选
+  swanlab_log_dir: "./swanlogs"         # 本地日志目录
+  swanlab_mode: "cloud"                 # 可选 "cloud" 或 "local"

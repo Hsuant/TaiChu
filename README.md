@@ -182,6 +182,21 @@ cd TaiChu
 pip install -r requirements.txt
 ```
 
+### 配置实验监控
+
+使用 SwanLab 可视化训练过程（损失曲线、学习率、梯度等）：
+
+```bash
+# 安装 SwanLab
+pip install swanlab
+
+# 登录并输入你的 API Key（从 https://swanlab.cn 获取）
+swanlab login
+```
+
+> 提示：如果仅作测试或无需云端记录，可跳过此步骤。训练脚本会自动检测 `swanlab` 是否可用。
+
+
 ### 训练你的第一个模型
 
 ```bash

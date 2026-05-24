@@ -69,6 +69,14 @@ class EvaluatingConfig:
     prompts: Optional[List[str]] = None
     num_generate_tokens: int = 50
 
+@dataclass
+class SwanLabLoggingConfig:
+    """SwanLab 实验跟踪配置"""
+    use_swanlab: bool = True
+    swanlab_project: str = "TaiChu-Project"
+    swanlab_experiment_name: str = "TaiChu_Experiment_Name"
+    swanlab_log_dir: str = "./swanlogs"
+    swanlab_mode: str = "cloud"  # 可选 "cloud" 或 "local"
 
 @dataclass
 class PretrainConfig:
@@ -78,6 +86,7 @@ class PretrainConfig:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluating: EvaluatingConfig = field(default_factory=EvaluatingConfig)
+    swanlab: SwanLabLoggingConfig = field(default_factory=SwanLabLoggingConfig)
 
 
 # ==================== 加载函数 ====================
@@ -114,10 +123,12 @@ def load_pretrain_config(yaml_path: str) -> PretrainConfig:
     train = TrainingConfig(**raw.get('training', {}))
     train.local_rank = int(os.environ.get('LOCAL_RANK', -1))
     eval_cfg = EvaluatingConfig(**raw.get('evaluating', {}))
+    swanlab_cfg = SwanLabLoggingConfig(**raw.get('swanlab', {}))
     return PretrainConfig(
         optimizer=optim,
         scheduler=sched,
         data=data,
         training=train,
         evaluating=eval_cfg,
+        swanlab=swanlab_cfg,
     )
