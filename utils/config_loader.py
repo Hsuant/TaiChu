@@ -65,6 +65,7 @@ class TrainingConfig:
 class EvaluatingConfig:
     """验证与生成测试配置。"""
     eval_interval: int = 1000
+    log_interval: int = 10
     prompts: Optional[List[str]] = None
     num_generate_tokens: int = 50
 

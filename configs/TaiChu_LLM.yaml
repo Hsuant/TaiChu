@@ -8,7 +8,7 @@ model_name: "TaiChu-50M"           # 模型标识名称，用于日志与保存
 
 # 模型架构超参数
 architecture:
-  vocab_size: 50304                # 词表大小，通常取2的幂次方倍数以优化嵌入矩阵计算
+  vocab_size: 50257                # 词表大小，通常取2的幂次方倍数以优化嵌入矩阵计算,GPT-2
   hidden_size: 768                 # 隐藏层维度（d_model），Transformer主干的特征宽度
   num_layers: 12                   # Transformer解码器层数（仅decoder堆叠）
   num_attention_heads: 12          # 注意力头数，需能被hidden_size整除

@@ -9,7 +9,7 @@ optimizer:
 
 scheduler:
   warmup_steps: 1000
-  max_steps: 100000
+  max_steps: 150000
   min_lr_ratio: 0.1
 
 data:
@@ -30,17 +30,33 @@ data:
 training:
   batch_size: 1
   gradient_accumulation_steps: 1
-  max_steps: 100000
+  max_steps: 150000
   save_interval: 5000
   log_interval: 10
-  output_dir: "./checkpoints/TaiChu_pretrain"
+  output_dir: "./checkpoints/TaiChu_77M_pretrain"
   use_mixed_precision: false
   dtype: "bfloat16"
   seed: 42
+  # 设备选择配置：
+  #
+  # 【自动模式（推荐）】-1
+  #   - 若有 CUDA GPU：使用 cuda:0（第一块 GPU）
+  #   - 若多卡训练（torchrun）：自动继承环境变量 LOCAL_RANK，每个进程使用对应 GPU
+  #   - 若无 CUDA：回退 CPU
+  #
+  # 【手动指定 GPU 编号】0, 1, 2, ...
+  #   - 强制使用 cuda:N（前提是该编号 GPU 存在且 CUDA 可用）
+  #   - 若 CUDA 不可用，则自动降级为 CPU
+  #
+  # 【强制 CPU 训练】任意值 + 环境变量
+  #   - 仅设置 local_rank 无法强制 CPU，需配合：export CUDA_VISIBLE_DEVICES=""
+  #   - 此时无论 local_rank 为何值，device 均为 cpu
+  local_rank: -1
 
 # 测试配置
 evaluating:
-  eval_interval: 200
+  eval_interval: 100
+  log_interval: 10
   prompts: # 用于生成的提示词列表
     - "人工智能的未来是"
     - "深度学习之所以强大是因为"

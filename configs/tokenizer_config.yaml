@@ -15,7 +15,7 @@ pre_tokenizer:
 
 # BPE 训练器配置
 trainer:
-  vocab_size: 50304                    # 词表大小，可根据需求调整（如 64000）
+  vocab_size: 50257                    # 词表大小，可根据需求调整（如 64000）
   min_frequency: 2                     # 低频词阈值，建议设为 2 或 3，过滤掉低频稀有词
   limit_alphabet: 1000                 # 建议设为 1000，覆盖绝大多数字符的同时控制内存
   show_progress: true
