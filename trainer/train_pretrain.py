@@ -61,7 +61,8 @@ class TaiChuTrainer:
         max_steps: int = 100000,
         eval_interval: int = 1000,
         save_interval: int = 5000,
-        log_interval: int = 10,
+        train_log_interval: int = 10,
+        eval_log_interval: int = 10,
         device: torch.device = torch.device("cpu"),
         use_amp: bool = False,
         dtype: str = "bfloat16",
@@ -88,7 +89,8 @@ class TaiChuTrainer:
             max_steps: 总训练步数。
             eval_interval: 每隔多少步进行一次验证。
             save_interval: 每隔多少步保存一次常规检查点。
-            log_interval: 每隔多少步记录一次训练日志。
+            train_log_interval: 每隔多少步记录一次训练日志。
+            eval_log_interval: 每隔多少步记录一次评估日志。
             device: 当前设备。
             use_amp: 是否启用混合精度。
             dtype: 混合精度数据类型（'bfloat16' 或 'float16'）。
@@ -110,8 +112,9 @@ class TaiChuTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_steps = max_steps
         self.save_interval = save_interval
-        self.log_interval = log_interval
         self.eval_interval = eval_interval
+        self.train_log_interval = train_log_interval
+        self.eval_log_interval = eval_log_interval
         self.generation_prompts = generation_prompts
         self.num_generate_tokens = num_generate_tokens
         self.device = device
@@ -134,7 +137,7 @@ class TaiChuTrainer:
         """执行主训练循环。"""
         self.model.train()
         self.start_time = time.time()
-        self.log_manager.info("训练开始。")
+        self.log_manager.info("训练开始")
 
         # 数据迭代器
         train_iter = iter(self.train_loader)
@@ -181,7 +184,7 @@ class TaiChuTrainer:
                 avg_loss = accumulated_loss / self.gradient_accumulation_steps
 
                 # 记录训练指标
-                if self.global_step % self.log_interval == 0:
+                if self.global_step % self.train_log_interval == 0:
                     self._log_training(avg_loss, samples_processed)
 
                 # 日志记录完毕再梯度清零
@@ -194,6 +197,7 @@ class TaiChuTrainer:
 
                 # 验证
                 if self.global_step % self.eval_interval == 0:
+                    self.log_manager.info("验证开始")
                     val_loss = self._evaluate(
                         generate_prompts=self.generation_prompts,
                         num_generate_tokens=self.num_generate_tokens,
@@ -273,21 +277,23 @@ class TaiChuTrainer:
         # 保存当前时间和步数，供下一次计算使用
         self.last_log_time = current_time
         self.last_log_step = self.global_step
-        # ---------------------------------------------------------
 
-        # 将当前全局步数设为日志记录的横坐标
-        self.log_manager.set_step(self.global_step)
+        # 获取梯度统计信息（梯度范数、最大值、最小值等）
+        grad_info = ModelInspector.gradient_summary(self.model) or {}
+        grad_norm = grad_info.get("grad_norm", 0.0)
+        grad_max = grad_info.get("grad_max", 0.0)
 
         # 记录标量：训练损失、困惑度、学习率、吞吐量
-        self.log_manager.log_scalar("train/loss", loss)
-        self.log_manager.log_scalar("train/ppl", ppl)
-        self.log_manager.log_scalar("train/lr", lr)
-        self.log_manager.log_scalar("train/tokens_per_sec", tokens_per_sec)
+        # 构建单行日志（控制台/文件）
+        log_line = (
+            f"Step {self.global_step} | "
+            f"loss={loss:.4f} | ppl={ppl:.2f} | lr={lr:.2e} | "
+            f"tok/s={tokens_per_sec:.0f} | grad_norm={grad_norm:.4f} | grad_max={grad_max:.4f}"
+        )
+        self.log_manager.logger.info(log_line)
 
-        # 记录梯度统计信息（梯度范数、最大值、最小值等）
-        grad_info = ModelInspector.gradient_summary(self.model)
-        if grad_info:
-            self.log_manager.log_scalars("train/grad", grad_info)
+        # 更新 LogManager 内部步数（供其他可能调用）
+        self.log_manager.set_step(self.global_step)
 
     @torch.no_grad()
     def _evaluate(self, generate_prompts: list = None, num_generate_tokens: int = 50) -> float:
@@ -305,6 +311,11 @@ class TaiChuTrainer:
         total_loss = 0.0
         total_tokens = 0
 
+        # 用于中间输出的变量
+        batch_cnt = 0
+        accum_loss = 0.0
+        accum_tokens = 0
+
         for batch in self.val_loader:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
@@ -314,6 +325,23 @@ class TaiChuTrainer:
             batch_tokens = input_ids.numel()
             total_loss += loss.item() * batch_tokens
             total_tokens += batch_tokens
+
+            # 累积中间输出数据
+            accum_loss += loss.item() * batch_tokens
+            accum_tokens += batch_tokens
+            batch_cnt += 1
+
+            # 每隔 val_log_interval 个 batch 输出一次中间结果（仅主进程）
+            if self.global_rank == 0 and self.eval_log_interval > 0 and batch_cnt % self.eval_log_interval == 0:
+                local_avg_loss = accum_loss / accum_tokens
+                local_ppl = math.exp(local_avg_loss) if local_avg_loss < 100 else float("inf")
+                self.log_manager.logger.info(
+                    f"[Eval] Step {self.global_step} (batch {batch_cnt}/{len(self.val_loader)}) | "
+                    f"loss={local_avg_loss:.4f} | ppl={local_ppl:.2f}"
+                )
+                # 重置窗口累积器，使下一个窗口独立
+                accum_loss = 0.0
+                accum_tokens = 0
 
         # 分布式聚合
         if self.device.type == 'cuda' and torch.distributed.is_initialized():
@@ -364,9 +392,10 @@ class TaiChuTrainer:
         # 3. 记录损失指标(仅主进程)
         if self.global_rank == 0:
             self.log_manager.set_step(self.global_step)
-            self.log_manager.log_scalar("val/loss", avg_loss)
             ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
-            self.log_manager.log_scalar("val/ppl", ppl)
+            self.log_manager.logger.info(
+                f"Step {self.global_step} - val/loss={avg_loss:.4f} | val/ppl={ppl:.2f}"
+            )
 
         return avg_loss
 
@@ -509,8 +538,9 @@ def main() -> None:
         init_step=resume_step,
         max_steps=pretrain_cfg.scheduler.max_steps,
         save_interval=pretrain_cfg.training.save_interval,
-        log_interval=pretrain_cfg.training.log_interval,
         eval_interval=pretrain_cfg.evaluating.eval_interval,
+        train_log_interval=pretrain_cfg.training.log_interval,
+        eval_log_interval=pretrain_cfg.evaluating.log_interval,
         generation_prompts=pretrain_cfg.evaluating.prompts,
         num_generate_tokens=pretrain_cfg.evaluating.num_generate_tokens,
         device=device,
