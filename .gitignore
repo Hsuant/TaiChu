@@ -3,5 +3,4 @@ pytest_cache/
 __pycache__/
 logs/
 /checkpoints/
-/dataset/
 /swanlogs/
