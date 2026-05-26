@@ -70,6 +70,15 @@ class EvaluatingConfig:
     num_generate_tokens: int = 50
 
 @dataclass
+class EarlyStoppingConfig:
+    """早停配置。"""
+    enabled: bool = False
+    monitor: str = "val_loss"
+    patience: int = 5
+    min_delta: float = 1e-4
+    mode: str = "min"               # 优化方向，'min' 或 'max'
+
+@dataclass
 class SwanLabLoggingConfig:
     """SwanLab 实验跟踪配置"""
     use_swanlab: bool = True
@@ -86,6 +95,7 @@ class PretrainConfig:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     evaluating: EvaluatingConfig = field(default_factory=EvaluatingConfig)
+    early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     swanlab: SwanLabLoggingConfig = field(default_factory=SwanLabLoggingConfig)
 
 
@@ -123,6 +133,7 @@ def load_pretrain_config(yaml_path: str) -> PretrainConfig:
     train = TrainingConfig(**raw.get('training', {}))
     train.local_rank = int(os.environ.get('LOCAL_RANK', -1))
     eval_cfg = EvaluatingConfig(**raw.get('evaluating', {}))
+    early_stop_cfg = EarlyStoppingConfig(**raw.get('early_stopping', {}))
     swanlab_cfg = SwanLabLoggingConfig(**raw.get('swanlab', {}))
     return PretrainConfig(
         optimizer=optim,
@@ -130,5 +141,6 @@ def load_pretrain_config(yaml_path: str) -> PretrainConfig:
         data=data,
         training=train,
         evaluating=eval_cfg,
+        early_stopping=early_stop_cfg,
         swanlab=swanlab_cfg,
     )

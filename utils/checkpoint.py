@@ -136,6 +136,7 @@ class CheckpointManager:
         scheduler: Optional[LRScheduler] = None,
         scaler: Optional[Any] = None,
         global_step: int = 0,
+        **kwargs
     ) -> Optional[str]:
         """根据指标保存最佳模型。
 
@@ -148,6 +149,7 @@ class CheckpointManager:
             scheduler: 调度器。
             scaler: 混合精度缩放器。
             global_step: 全局步数。
+            **kwargs: 额外状态（如 early_stopping_state）
 
         Returns:
             若保存成功则返回文件路径，否则返回 None。
@@ -169,6 +171,7 @@ class CheckpointManager:
                 scaler=scaler,
                 global_step=global_step,
                 metrics=metrics,
+                **kwargs,
             )
         return None
 
@@ -180,7 +183,7 @@ class CheckpointManager:
         scheduler: Optional[LRScheduler] = None,
         scaler: Optional[Any] = None,
         map_location: str = "cpu",
-    ) -> Tuple[int, Optional[float]]:
+    ) -> Tuple[int, Optional[float], Dict[str, Any]]:
         """从检查点文件恢复训练状态。
 
         Args:
@@ -192,7 +195,10 @@ class CheckpointManager:
             map_location: 设备映射。
 
         Returns:
-            (global_step, best_metric_value): 恢复后的全局步数与最佳指标值。
+            (global_step, best_metric_value, checkpoint):
+            - 恢复后的全局步数
+            - 最佳指标值
+            - 原始检查点字典（用于恢复额外状态，如早停计数器）
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"检查点文件不存在: {filepath}")
@@ -208,7 +214,7 @@ class CheckpointManager:
             self.best_metric_value = checkpoint["best_metric_value"]
         global_step = checkpoint.get("global_step", 0)
         best_metric_value = checkpoint.get("best_metric_value", None)
-        return global_step, best_metric_value
+        return global_step, best_metric_value, checkpoint
 
     def get_latest_checkpoint(self) -> Optional[str]:
         """获取最新的检查点文件路径。
