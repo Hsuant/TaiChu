@@ -64,6 +64,12 @@ class TaiChuTrainer:
         save_interval: int = 5000,
         train_log_interval: int = 10,
         eval_log_interval: int = 10,
+        early_stop_enabled: bool = False,
+        early_stop_monitor: str = "val_loss",
+        early_stop_patience: int = 5,
+        early_stop_min_delta: float = 1e-4,
+        early_stop_mode: str = "min",
+        swanlab_logger: Optional[SwanLabLogger] = None,
         device: torch.device = torch.device("cpu"),
         use_amp: bool = False,
         dtype: str = "bfloat16",
@@ -72,7 +78,6 @@ class TaiChuTrainer:
         global_rank: int = 0,
         generation_prompts: Optional[List[str]] = None,
         num_generate_tokens: int = 50,
-        swanlab_logger: Optional[SwanLabLogger] = None,
     ):
         """初始化训练器。
 
@@ -93,8 +98,11 @@ class TaiChuTrainer:
             save_interval: 每隔多少步保存一次常规检查点。
             train_log_interval: 每隔多少步记录一次训练日志。
             eval_log_interval: 每隔多少步记录一次评估日志。
-            generation_prompts: 测试Prompts列表
-            num_generate_tokens: 测试生成token长度
+            early_stop_enabled: 是否启用早停机制。
+            early_stop_monitor: 监控的验证指标名称（如 'val_loss'）。
+            early_stop_patience: 早停耐心值，连续无改善的验证次数上限。
+            early_stop_min_delta: 判断是否改善的最小绝对变化量。
+            early_stop_mode: 指标优化模式，'min' 表示越小越好，'max' 表示越大越好。
             swanlab_logger: SwanLab 日志记录器实例（仅主进程启用）。
             device: 当前设备。
             use_amp: 是否启用混合精度。
@@ -102,6 +110,8 @@ class TaiChuTrainer:
             local_rank: 当前进程的本地 Rank（用于设备设置）。
             max_seq_len: 最大序列长度，用于计算 tokens/s。
             global_rank: 全局 Rank（0 为主进程）。
+            generation_prompts: 测试Prompts列表
+            num_generate_tokens: 测试生成token长度
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -132,6 +142,18 @@ class TaiChuTrainer:
         self.global_step = init_step          # 恢复的步数
         self.best_val_loss = float("inf")     # 最佳验证损失
 
+        # 初始化早停实例（仅当启用时）
+        self.early_stopping = None
+        if early_stop_enabled:
+            from utils.early_stopping import EarlyStopping
+            self.early_stopping = EarlyStopping(
+                monitor=early_stop_monitor,
+                patience=early_stop_patience,
+                min_delta=early_stop_min_delta,
+                mode=early_stop_mode,
+            )
+        self.early_stopped = False  # 标记是否因早停而退出训练
+
         # 用于计算 tokens_per_sec 的时间窗口
         self.start_time = 0.0                 # 训练开始时间（秒）
         self.last_log_time = None  # 上次记录日志的时间戳
@@ -150,7 +172,7 @@ class TaiChuTrainer:
             samples_processed = 0           # 当前累积步内处理的样本数
             micro_step = 0                  # 当前累积步内已处理的微批次计数
 
-            while self.global_step < self.max_steps:
+            while self.global_step < self.max_steps and not self.early_stopped:
                 try:
                     batch = next(train_iter)
                 except StopIteration:
@@ -209,6 +231,11 @@ class TaiChuTrainer:
                         )
                         if val_loss < self.best_val_loss:
                             self.best_val_loss = val_loss
+
+                        # 保存最佳模型（同时附带早停状态）
+                        extra_state = {}
+                        if self.early_stopping is not None:
+                            extra_state["early_stopping_state"] = self.early_stopping.state_dict()
                         self.checkpoint_manager.save_best(
                             self.model,
                             metrics={"val_loss": val_loss},
@@ -221,8 +248,34 @@ class TaiChuTrainer:
                             f"当前最佳验证损失: {self.checkpoint_manager.best_metric_value:.4f}"
                         )
 
-                    # 定期保存检查点
+                        # 早停检查（如果启用）
+                        if self.early_stopping is not None:
+                            stop = self.early_stopping.step(val_loss, self.global_step)
+                            if stop:
+                                self.log_manager.info(
+                                    f"早停触发于步数 {self.global_step}，"
+                                    f"最佳分数 {self.early_stopping.best_score:.4f} "
+                                    f"于步数 {self.early_stopping.best_step}"
+                                )
+                                self.early_stopped = True
+                                # 保存早停专用检查点，便于后续分析或恢复
+                                self.checkpoint_manager.save(
+                                    f"early_stop_step{self.global_step}.pt",
+                                    model=self.model,
+                                    optimizer=self.optimizer,
+                                    scheduler=self.scheduler,
+                                    scaler=self.scaler,
+                                    global_step=self.global_step,
+                                    metrics={"val_loss": val_loss},
+                                    early_stopping_state=self.early_stopping.state_dict(),
+                                )
+                                break  # 立即终止训练循环
+
+                    # 定期保存检查点（同时保存早停状态）
                     if self.global_step % self.save_interval == 0:
+                        extra = {}
+                        if self.early_stopping is not None:
+                            extra["early_stopping_state"] = self.early_stopping.state_dict()
                         self.checkpoint_manager.save(
                             f"checkpoint-{self.global_step}.pt",
                             model=self.model,
@@ -464,11 +517,102 @@ def main() -> None:
     parser.add_argument("--model_config", type=str, required=True, help="模型结构 YAML 配置")
     parser.add_argument("--pretrain_config", type=str, required=True, help="预训练超参 YAML 配置")
     parser.add_argument("--resume", type=str, default=None, help="恢复检查点文件路径")
+
+    # ========== 模型结构覆盖参数 ==========
+    parser.add_argument("--model_name", type=str, default=None, help="覆盖模型名称")
+    parser.add_argument("--hidden_size", type=int, default=None, help="覆盖隐藏层维度")
+    parser.add_argument("--num_layers", type=int, default=None, help="覆盖 Transformer 层数")
+    parser.add_argument("--num_heads", type=int, default=None, help="覆盖注意力头数")
+    parser.add_argument("--vocab_size", type=int, default=None, help="覆盖词表大小")
+    parser.add_argument("--max_seq_len", type=int, default=None, help="覆盖最大序列长度")
+    parser.add_argument("--dropout", type=float, default=None, help="覆盖 dropout 比率")
+    # MoE 相关参数（若有）
+    parser.add_argument("--num_experts", type=int, default=None, help="覆盖专家数量")
+    parser.add_argument("--top_k", type=int, default=None, help="覆盖路由 top-k")
+
+    # ========== 新增：训练超参数覆盖 ==========
+    parser.add_argument("--batch_size", type=int, default=None, help="覆盖全局批次大小（每卡）")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="覆盖梯度累积步数")
+    parser.add_argument("--learning_rate", type=float, default=None, help="覆盖学习率")
+    parser.add_argument("--weight_decay", type=float, default=None, help="覆盖权重衰减")
+    parser.add_argument("--warmup_steps", type=int, default=None, help="覆盖预热步数")
+    parser.add_argument("--max_steps", type=int, default=None, help="覆盖总训练步数")
+    parser.add_argument("--min_lr_ratio", type=float, default=None, help="覆盖最小学习率比例")
+    parser.add_argument("--use_mixed_precision", action="store_true", default=None, help="是否启用混合精度（覆盖配置）")
+    parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"], help="混合精度类型")
+    parser.add_argument("--seed", type=int, default=None, help="覆盖随机种子")
+    parser.add_argument("--save_interval", type=int, default=None, help="覆盖保存间隔步数")
+    parser.add_argument("--eval_interval", type=int, default=None, help="覆盖验证间隔步数")
+    parser.add_argument("--log_interval", type=int, default=None, help="覆盖训练日志间隔步数")
+
+    # 早停参数覆盖
+    parser.add_argument("--early_stop_enabled", action="store_true", default=None, help="启用早停")
+    parser.add_argument("--early_stop_patience", type=int, default=None, help="早停耐心值")
+    parser.add_argument("--early_stop_min_delta", type=float, default=None, help="早停最小改善阈值")
+
     args = parser.parse_args()
 
     # 1. 加载配置
     model_cfg = load_model_config(args.model_config)
     pretrain_cfg = load_pretrain_config(args.pretrain_config)
+
+    # 覆盖模型配置
+    if args.model_name is not None:
+        model_cfg.model_name = args.model_name
+    if args.hidden_size is not None:
+        model_cfg.hidden_size = args.hidden_size
+    if args.num_layers is not None:
+        model_cfg.num_layers = args.num_layers
+    if args.num_heads is not None:
+        model_cfg.num_heads = args.num_heads
+    if args.vocab_size is not None:
+        model_cfg.vocab_size = args.vocab_size
+    if args.max_seq_len is not None:
+        model_cfg.max_seq_len = args.max_seq_len
+        # 同时需要覆盖数据配置中的 max_seq_length
+        pretrain_cfg.data.max_seq_length = args.max_seq_len
+    if args.dropout is not None:
+        model_cfg.dropout = args.dropout
+    if args.num_experts is not None:
+        model_cfg.num_experts = args.num_experts
+    if args.top_k is not None:
+        model_cfg.top_k = args.top_k
+
+    # 覆盖训练超参数
+    if args.batch_size is not None:
+        pretrain_cfg.training.batch_size = args.batch_size
+    if args.gradient_accumulation_steps is not None:
+        pretrain_cfg.training.gradient_accumulation_steps = args.gradient_accumulation_steps
+    if args.learning_rate is not None:
+        pretrain_cfg.optimizer.learning_rate = args.learning_rate
+    if args.weight_decay is not None:
+        pretrain_cfg.optimizer.weight_decay = args.weight_decay
+    if args.warmup_steps is not None:
+        pretrain_cfg.scheduler.warmup_steps = args.warmup_steps
+    if args.max_steps is not None:
+        pretrain_cfg.scheduler.max_steps = args.max_steps
+    if args.min_lr_ratio is not None:
+        pretrain_cfg.scheduler.min_lr_ratio = args.min_lr_ratio
+    if args.use_mixed_precision is not None:
+        pretrain_cfg.training.use_mixed_precision = args.use_mixed_precision
+    if args.dtype is not None:
+        pretrain_cfg.training.dtype = args.dtype
+    if args.seed is not None:
+        pretrain_cfg.training.seed = args.seed
+    if args.save_interval is not None:
+        pretrain_cfg.training.save_interval = args.save_interval
+    if args.eval_interval is not None:
+        pretrain_cfg.evaluating.eval_interval = args.eval_interval
+    if args.log_interval is not None:
+        pretrain_cfg.training.log_interval = args.log_interval
+
+    # 覆盖早停配置
+    if args.early_stop_enabled is not None:
+        pretrain_cfg.early_stopping.enabled = args.early_stop_enabled
+    if args.early_stop_patience is not None:
+        pretrain_cfg.early_stopping.patience = args.early_stop_patience
+    if args.early_stop_min_delta is not None:
+        pretrain_cfg.early_stopping.min_delta = args.early_stop_min_delta
 
     # 2. 获取分布式信息
     local_rank = pretrain_cfg.training.local_rank
@@ -609,7 +753,7 @@ def main() -> None:
     best_val_loss_restored = None
     if args.resume:
         log_manager.info(f"从检查点恢复: {args.resume}")
-        resume_step, best_val_loss_restored = checkpoint_manager.load(
+        resume_step, best_val_loss_restored, checkpoint = checkpoint_manager.load(
             args.resume,
             model=model,
             optimizer=optimizer,
@@ -620,6 +764,8 @@ def main() -> None:
         # 设置调度器的 last_epoch（避免循环调用 step）
         scheduler.last_epoch = resume_step - 1 if resume_step > 0 else -1
         log_manager.info(f"恢复至全局步数: {resume_step}")
+    else:
+        checkpoint = None  # 无恢复时初始化为空
 
     # 13. 构建 Trainer 并开始训练
     trainer = TaiChuTrainer(
@@ -639,8 +785,11 @@ def main() -> None:
         eval_interval=pretrain_cfg.evaluating.eval_interval,
         train_log_interval=pretrain_cfg.training.log_interval,
         eval_log_interval=pretrain_cfg.evaluating.log_interval,
-        generation_prompts=pretrain_cfg.evaluating.prompts,
-        num_generate_tokens=pretrain_cfg.evaluating.num_generate_tokens,
+        early_stop_enabled=pretrain_cfg.early_stopping.enabled,
+        early_stop_monitor=pretrain_cfg.early_stopping.monitor,
+        early_stop_patience=pretrain_cfg.early_stopping.patience,
+        early_stop_min_delta=pretrain_cfg.early_stopping.min_delta,
+        early_stop_mode=pretrain_cfg.early_stopping.mode,
         swanlab_logger=swanlab_logger,
         device=device,
         use_amp=use_amp,
@@ -648,9 +797,27 @@ def main() -> None:
         local_rank=local_rank,
         max_seq_len=pretrain_cfg.data.max_seq_length,
         global_rank=global_rank,
+        generation_prompts=pretrain_cfg.evaluating.prompts,
+        num_generate_tokens=pretrain_cfg.evaluating.num_generate_tokens,
     )
+    # 恢复最佳验证损失（如果检查点中有记录）
     if best_val_loss_restored is not None:
         trainer.best_val_loss = best_val_loss_restored
+
+    # 恢复早停状态（如果检查点中包含且早停已启用）
+    if (trainer.early_stopping is not None and checkpoint is not None
+            and "early_stopping_state" in checkpoint):
+        early_state = checkpoint["early_stopping_state"]
+        trainer.early_stopping.load_state_dict(early_state)
+        # 具体列出早停状态数据
+        log_manager.info(
+            f"已恢复早停状态: counter={early_state.get('counter', 0)}, "
+            f"best_score={early_state.get('best_score', None)}, "
+            f"best_step={early_state.get('best_step', 0)}, "
+            f"early_stop={early_state.get('early_stop', False)}"
+        )
+
+    # 启动训练
     trainer.train()
 
 
