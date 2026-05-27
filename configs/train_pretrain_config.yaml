@@ -7,10 +7,25 @@ optimizer:
   beta2: 0.95
   epsilon: 1.0e-8
 
+# ============================================================
+# scheduler.max_steps 计算公式：
+#
+#   max_steps = target_total_tokens / (batch_size * grad_acc * world_size * max_seq_len)
+#
+# 其中：
+#   - target_total_tokens : 希望模型见到的总 token 数（例如 100e9）
+#   - batch_size          : 每个 GPU 的 micro-batch 大小（training.batch_size）
+#   - grad_acc            : 梯度累积步数（training.gradient_accumulation_steps）
+#   - world_size          : GPU 数量（由 torchrun 自动决定）
+#   - max_seq_len         : 最大序列长度（data.max_seq_length）
+#
+# 示例：target_total_tokens=100B, batch_size=4, grad_acc=8, world_size=4, seq_len=2048
+#   => max_steps = 100e9 / (4*8*4*2048) ≈ 381,470
+# ============================================================
 scheduler:
-  warmup_steps: 1000
-  max_steps: 150000
-  min_lr_ratio: 0.1
+  warmup_steps: 1000        # 预热步数，建议为 max_steps 的 1%~5%
+  max_steps: 150000         # 总训练步数
+  min_lr_ratio: 0.1         # 最终学习率比例
 
 data:
   # 训练数据文件列表（支持通配符）
@@ -30,7 +45,6 @@ data:
 training:
   batch_size: 1
   gradient_accumulation_steps: 1
-  max_steps: 150000
   save_interval: 5000
   log_interval: 10
   output_dir: "./checkpoints/TaiChu_77M_pretrain"
