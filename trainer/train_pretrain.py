@@ -530,7 +530,7 @@ def main() -> None:
     parser.add_argument("--num_experts", type=int, default=None, help="覆盖专家数量")
     parser.add_argument("--top_k", type=int, default=None, help="覆盖路由 top-k")
 
-    # ========== 新增：训练超参数覆盖 ==========
+    # ========== 训练超参数覆盖 ==========
     parser.add_argument("--batch_size", type=int, default=None, help="覆盖全局批次大小（每卡）")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="覆盖梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=None, help="覆盖学习率")
