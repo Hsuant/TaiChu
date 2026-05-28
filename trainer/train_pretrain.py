@@ -658,7 +658,8 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=None, help="覆盖路由 top-k")
 
     # ========== 训练超参数覆盖 ==========
-    parser.add_argument("--batch_size", type=int, default=None, help="覆盖全局批次大小（每卡）")
+    parser.add_argument("--train_batch_size", type=int, default=None, help="覆盖训练阶段批次大小（每卡）")
+    parser.add_argument("--eval_batch_size", type=int, default=None, help="覆盖验证阶段批次大小")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
@@ -706,7 +707,9 @@ def main() -> None:
 
     # 覆盖训练超参数
     if args.batch_size is not None:
-        pretrain_cfg.training.batch_size = args.batch_size
+        pretrain_cfg.training.batch_size = args.train_batch_size
+    if args.eval_batch_size is not None:
+        pretrain_cfg.evaluating.batch_size = args.eval_batch_size
     if args.gradient_accumulation_steps is not None:
         pretrain_cfg.training.gradient_accumulation_steps = args.gradient_accumulation_steps
     if args.learning_rate is not None:
@@ -804,7 +807,7 @@ def main() -> None:
     val_loader = build_dataloader(
         pretrain_cfg.data, tokenizer,
         split="val",
-        batch_size=pretrain_cfg.training.batch_size,
+        batch_size=pretrain_cfg.evaluating.batch_size,
         rank=global_rank,
         world_size=world_size,
         pin_memory=pin_memory,

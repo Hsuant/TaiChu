@@ -64,6 +64,7 @@ class TrainingConfig:
 @dataclass
 class EvaluatingConfig:
     """验证与生成测试配置。"""
+    batch_size: int = 10
     eval_interval: int = 1000
     log_interval: int = 10
     prompts: Optional[List[str]] = None
