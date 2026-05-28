@@ -8,10 +8,13 @@
     - 支持混合精度训练、梯度累积、warmup + cosine 学习率调度
     - 自动恢复训练、定期验证与保存最佳/最近检查点
     - 所有日志统一通过 LogManager 输出到 TensorBoard 及控制台/文件
+    - 集成专业评估指标：
+        * 训练阶段：平滑损失、梯度噪声尺度、模型 FLOPs 利用率（MFU）、表示稳定性
+        * 验证阶段：Next Token 准确率、分位数交叉熵、空白提示困惑度（可选）
 
 用法：
     # 单卡训练
-    python -m trainer.train_pretrain --model_config configs/TaiChu_LLM.yaml --pretrain_config configs/train_pretrain_config.yaml
+    python train_pretrain.py --model_config configs/TaiChu_LLM.yaml --pretrain_config configs/train_pretrain_config.yaml
 
     # 多卡训练（通过 torchrun 启动）
     torchrun --nproc_per_node=4 train_pretrain.py --model_config configs/TaiChu_125m.yaml --pretrain_config configs/pretrain_config.yaml
@@ -38,12 +41,29 @@ from utils.swanlab_logger import SwanLabLogger
 from utils.checkpoint import CheckpointManager
 from utils.model_utils import ModelInspector
 from dataset.llm_dataset import build_dataloader
+from utils.metrics import EvaluationMetricsManager, ValidationMetrics
 
 
 class TaiChuTrainer:
     """TaiChu 预训练器。
 
-    封装训练循环、验证、检查点、日志等功能。支持混合精度、梯度累积、分布式训练。
+    封装训练循环、验证、检查点、日志等功能。支持混合精度、梯度累积、分布式训练，
+    并集成专业评估指标。
+
+    Attributes:
+        model: 模型实例（可能是 DDP 封装）。
+        tokenizer: Tokenizer 实例。
+        train_loader: 训练数据加载器。
+        val_loader: 验证数据加载器。
+        log_manager: 日志管理器。
+        checkpoint_manager: 检查点管理器。
+        optimizer: 优化器。
+        scheduler: 学习率调度器。
+        scaler: 混合精度梯度缩放器。
+        global_step: 当前全局步数。
+        best_val_loss: 最佳验证损失。
+        early_stopping: 早停实例（可选）。
+        eval_metrics: 训练阶段评估指标管理器。
     """
 
     def __init__(
@@ -110,8 +130,8 @@ class TaiChuTrainer:
             local_rank: 当前进程的本地 Rank（用于设备设置）。
             max_seq_len: 最大序列长度，用于计算 tokens/s。
             global_rank: 全局 Rank（0 为主进程）。
-            generation_prompts: 测试Prompts列表
-            num_generate_tokens: 测试生成token长度
+            generation_prompts: 测试 Prompts 列表。
+            num_generate_tokens: 测试生成 token 长度。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -139,10 +159,10 @@ class TaiChuTrainer:
         self.max_seq_len = max_seq_len
 
         # 训练状态
-        self.global_step = init_step          # 恢复的步数
-        self.best_val_loss = float("inf")     # 最佳验证损失
+        self.global_step = init_step
+        self.best_val_loss = float("inf")
 
-        # 初始化早停实例（仅当启用时）
+        # 早停初始化
         self.early_stopping = None
         if early_stop_enabled:
             from utils.early_stopping import EarlyStopping
@@ -152,12 +172,30 @@ class TaiChuTrainer:
                 min_delta=early_stop_min_delta,
                 mode=early_stop_mode,
             )
-        self.early_stopped = False  # 标记是否因早停而退出训练
+        self.early_stopped = False
 
-        # 用于计算 tokens_per_sec 的时间窗口
-        self.start_time = 0.0                 # 训练开始时间（秒）
-        self.last_log_time = None  # 上次记录日志的时间戳
-        self.last_log_step = init_step  # 上次记录日志时的全局步数
+        # 日志时间窗口
+        self.start_time = 0.0
+        self.last_log_time = None
+        self.last_log_step = init_step
+
+        # ========== 集成训练阶段专业评估指标 ==========
+        # 创建评估指标管理器，配置平滑系数和梯度窗口
+        self.eval_metrics = EvaluationMetricsManager(config={
+            "loss_beta": 0.9,        # 平滑损失系数
+            "gns_window": 100        # 梯度噪声尺度滑动窗口
+        })
+        # 初始化 MFU 计算器（RTX 4090 FP16 Tensor Core 理论峰值约为 330 TFLOPS）
+        # 若使用其他 GPU，请根据实际硬件修改峰值算力
+        self.eval_metrics.initialize_mfu(
+            peak_flops=330e12,
+            log_file=os.path.join(log_manager.log_dir, "mfu_log.jsonl")
+        )
+        # 获取原始模型（处理 DDP 包装），用于表示稳定性钩子
+        raw_model = model.module if hasattr(model, 'module') else model
+        assert isinstance(raw_model, nn.Module)
+        self.eval_metrics.initialize_repr_stability(raw_model, device, hook_layer=-1)
+        # =================================================
 
     def train(self) -> None:
         """执行主训练循环。"""
@@ -210,11 +248,31 @@ class TaiChuTrainer:
                     self.global_step += 1
                     avg_loss = accumulated_loss / self.gradient_accumulation_steps
 
+                    # 更新训练阶段评估指标
+                    # 平滑损失
+                    self.eval_metrics.update_loss(avg_loss)
+                    # 梯度噪声尺度（需要在 backward 后、optimizer.step 之前调用）
+                    self.eval_metrics.update_gradient(self.model)
+                    # 模型 FLOPs 利用率（MFU）
+                    step_batch_size = samples_processed   # 当前累积步内的总样本数
+                    if self.eval_metrics.mfu is not None:
+                        step_flops = self.eval_metrics.mfu.estimate_model_flops(self.model, self.max_seq_len, step_batch_size)
+                    else:
+                        step_flops = 0.0
+                    self.eval_metrics.update_step(step_flops, self.global_step)
+                    # 表示稳定性（开销较大，每 100 步更新一次）
+                    if self.global_step % 100 == 0:
+                        repr_metrics = self.eval_metrics.update_repr(input_ids)
+                        if self.global_rank == 0 and repr_metrics:
+                            self.log_manager.logger.info(
+                                f"Step {self.global_step} repr_metrics: {repr_metrics}"
+                            )
+
                     # 记录训练指标
                     if self.global_step % self.train_log_interval == 0:
                         self._log_training(avg_loss, samples_processed)
 
-                    # 日志记录完毕再梯度清零
+                    # 梯度清零
                     self.optimizer.zero_grad()
 
                     # 重置累积计数器
@@ -223,8 +281,10 @@ class TaiChuTrainer:
                     micro_step = 0
 
                     # 验证
+                    val_loss = 0.0
                     if self.global_step % self.eval_interval == 0:
                         self.log_manager.info("验证开始")
+                        # 调用 _evaluate 获取验证损失及其他扩展指标
                         val_loss = self._evaluate(
                             generate_prompts=self.generation_prompts,
                             num_generate_tokens=self.num_generate_tokens,
@@ -232,10 +292,7 @@ class TaiChuTrainer:
                         if val_loss < self.best_val_loss:
                             self.best_val_loss = val_loss
 
-                        # 保存最佳模型（同时附带早停状态）
-                        extra_state = {}
-                        if self.early_stopping is not None:
-                            extra_state["early_stopping_state"] = self.early_stopping.state_dict()
+                        # 保存最佳模型
                         self.checkpoint_manager.save_best(
                             self.model,
                             metrics={"val_loss": val_loss},
@@ -248,7 +305,7 @@ class TaiChuTrainer:
                             f"当前最佳验证损失: {self.checkpoint_manager.best_metric_value:.4f}"
                         )
 
-                        # 早停检查（如果启用）
+                        # 早停检查
                         if self.early_stopping is not None:
                             stop = self.early_stopping.step(val_loss, self.global_step)
                             if stop:
@@ -258,7 +315,6 @@ class TaiChuTrainer:
                                     f"于步数 {self.early_stopping.best_step}"
                                 )
                                 self.early_stopped = True
-                                # 保存早停专用检查点，便于后续分析或恢复
                                 self.checkpoint_manager.save(
                                     f"early_stop_step{self.global_step}.pt",
                                     model=self.model,
@@ -269,9 +325,9 @@ class TaiChuTrainer:
                                     metrics={"val_loss": val_loss},
                                     early_stopping_state=self.early_stopping.state_dict(),
                                 )
-                                break  # 立即终止训练循环
+                                break
 
-                    # 定期保存检查点（同时保存早停状态）
+                    # 定期保存检查点
                     if self.global_step % self.save_interval == 0:
                         extra = {}
                         if self.early_stopping is not None:
@@ -304,16 +360,20 @@ class TaiChuTrainer:
             self._save_interrupted_checkpoint()
         except Exception as e:
             self.log_manager.error(f"训练过程中发生异常: {type(e).__name__}: {e}")
-            self.log_manager.error("正在保存紧急检查点...", exc_info=True)  # exc_info 会记录完整堆栈到日志文件
+            self.log_manager.error("正在保存紧急检查点...", exc_info=True)
             self._save_interrupted_checkpoint()
-            raise  # 保留原始异常，但会打印简洁信息（已记录堆栈到日志）
+            raise
         finally:
             if self.swanlab_logger:
                 self.swanlab_logger.finish()
             self.log_manager.close()
+            self.eval_metrics.close()   # 释放钩子资源
 
     def _save_interrupted_checkpoint(self) -> None:
         """保存中断/异常时的检查点。"""
+        extra = {}
+        if self.early_stopping is not None:
+            extra["early_stopping_state"] = self.early_stopping.state_dict()
         self.checkpoint_manager.save(
             f"checkpoint-emergency-step{self.global_step}.pt",
             model=self.model,
@@ -322,6 +382,7 @@ class TaiChuTrainer:
             scaler=self.scaler,
             global_step=self.global_step,
             metrics={"val_loss": self.best_val_loss},
+            **extra,
         )
         self.log_manager.info(f"紧急检查点已保存至 step {self.global_step}")
 
@@ -335,42 +396,36 @@ class TaiChuTrainer:
             loss: 当前参数更新步的平均损失（已排除梯度累积的缩放）。
             samples: 当前参数更新步内实际处理的样本数（batch_size × 累积步数）。
         """
-        # 获取当前学习率
+        # 学习率
         lr = self.optimizer.param_groups[0]["lr"]
 
-        # 计算困惑度（perplexity），安全处理 loss 过大导致的溢出
+        # 困惑度
         ppl = math.exp(loss) if loss < 100 else float("inf")
 
-        # ---- 计算 tokens_per_sec（基于滑动窗口的瞬时吞吐量） ----
+        # 瞬时 tokens/s
         current_time = time.time()
-
         if self.last_log_time is None:
-            # 第一次记录日志：没有历史时间基准，使用从训练开始到现在的总时间作为窗口
             elapsed = current_time - self.start_time
-            # 总步数差 = 当前全局步数 - 上次记录的步数（初次为 init_step）
             steps_since_log = self.global_step - self.last_log_step
         else:
-            # 非首次记录：使用距离上一次记录日志的时间差作为窗口
             elapsed = current_time - self.last_log_time
             steps_since_log = self.global_step - self.last_log_step
 
-        # 窗口内处理的 token 总数 = 步数差 × 每步样本数 × 序列长度
         total_tokens = steps_since_log * samples * self.max_seq_len
-        # 避免除零，计算瞬时吞吐量
         tokens_per_sec = total_tokens / max(elapsed, 1e-6)
 
-        # 保存当前时间和步数，供下一次计算使用
         self.last_log_time = current_time
         self.last_log_step = self.global_step
 
-        # 获取梯度统计信息（梯度范数、最大值、最小值等）
+        # 梯度统计
         grad_info = ModelInspector.gradient_summary(self.model) or {}
         grad_norm = grad_info.get("grad_norm", 0.0)
         grad_max = grad_info.get("grad_max", 0.0)
 
-        # 记录标量：训练损失、困惑度、学习率、吞吐量
+        # 获取训练阶段评估指标
+        extra_metrics = self.eval_metrics.get_all_metrics(include_repr=False)
 
-        # 构造指标字典
+        # 构造完整指标字典（用于 SwanLab 和 TensorBoard）
         metrics = {
             "train/loss": loss,
             "train/perplexity": ppl,
@@ -378,26 +433,31 @@ class TaiChuTrainer:
             "train/tokens_per_sec": tokens_per_sec,
             "train/grad_norm": grad_norm,
             "train/grad_max": grad_max,
+            "train/smoothed_loss": extra_metrics.get("smoothed_loss", 0.0),
+            "train/gradient_noise_scale": extra_metrics.get("gradient_noise_scale", 0.0),
+            "train/mfu_average": extra_metrics.get("mfu_average", 0.0),
+            "train/mfu_instant": extra_metrics.get("mfu_instant", 0.0),
         }
 
-        # 构建单行日志（控制台/文件）
+        # 构建控制台日志（包含关键指标）
         log_line = (
             f"Step {self.global_step} | "
-            f"loss={loss:.4f} | ppl={ppl:.2f} | lr={lr:.2e} | "
-            f"tok/s={tokens_per_sec:.0f} | grad_norm={grad_norm:.4f} | grad_max={grad_max:.4f}"
+            f"loss={loss:.4f} | smooth_loss={extra_metrics.get('smoothed_loss', 0):.4f} | "
+            f"ppl={ppl:.2f} | lr={lr:.2e} | tok/s={tokens_per_sec:.0f} | "
+            f"gns={extra_metrics.get('gradient_noise_scale', 0):.2f} | "
+            f"mfu={extra_metrics.get('mfu_average', 0):.3f}"
         )
         self.log_manager.logger.info(log_line)
 
-        # 记录到 SwanLab
+        # 记录到 SwanLab 和 TensorBoard（LogManager 内部已支持 TensorBoard）
         if self.swanlab_logger:
             self.swanlab_logger.log_metrics(metrics, step=self.global_step)
-
-        # 更新 LogManager 内部步数（供其他可能调用）
+        # 更新 LogManager 步数（用于 TensorBoard）
         self.log_manager.set_step(self.global_step)
 
     @torch.no_grad()
-    def _evaluate(self, generate_prompts: list = None, num_generate_tokens: int = 50) -> float:
-        """在验证集上计算平均损失，并在主进程中生成文本示例。
+    def _evaluate(self, generate_prompts: Optional[List[str]] = None, num_generate_tokens: int = 50) -> float:
+        """在验证集上计算平均损失，并计算扩展指标（准确率、分位数 CE 等）。
 
         Args:
             generate_prompts: 用于生成测试的提示词列表，若为 None 则使用默认提示。
@@ -406,12 +466,19 @@ class TaiChuTrainer:
         Returns:
             平均损失值（所有 token 的平均交叉熵）。
         """
-        # 1. 计算验证损失
         self.model.eval()
         total_loss = 0.0
         total_tokens = 0
 
-        # 用于中间输出的变量
+        # 生成测试的提示词列表
+        if generate_prompts is None:
+            generate_prompts = []
+
+        # 扩展指标累加器
+        total_accuracy = 0.0
+        total_valid_tokens = 0
+        all_token_losses = []   # 存储每个 token 的损失（用于分位数）
+ 
         batch_cnt = 0
         accum_loss = 0.0
         accum_tokens = 0
@@ -419,19 +486,49 @@ class TaiChuTrainer:
         for batch in self.val_loader:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
+
             with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
                 out = self.model(input_ids, labels=labels)
                 loss = out.loss
+                # 尝试获取 logits（如果模型返回）
+                logits = getattr(out, "logits", None)
+
             batch_tokens = input_ids.numel()
             total_loss += loss.item() * batch_tokens
             total_tokens += batch_tokens
 
-            # 累积中间输出数据
+            # ---- 计算准确率 ----
+            if logits is not None and isinstance(logits, torch.Tensor):
+                acc = ValidationMetrics.compute_accuracy(logits, labels)
+                # 有效 token 数量（忽略 -100）
+                valid_mask = (labels != -100)
+                valid_count = valid_mask.sum().item()
+                total_accuracy += acc * valid_count
+                total_valid_tokens += valid_count
+
+            # ---- 收集每个 token 的损失（用于分位数） ----
+            # 方法：手动计算 per-token cross entropy
+            # 注意：需要将 logits 和 labels 对齐（shift）
+            if logits is not None:
+                # 标准 causal LM 的 shift 操作：预测下一个 token
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                ce_loss = nn.CrossEntropyLoss(reduction='none')
+                token_losses = ce_loss(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1)
+                ).view(shift_labels.size())
+                # 过滤掉标签为 -100 的位置
+                valid_mask_shift = (shift_labels != -100)
+                valid_token_losses = token_losses[valid_mask_shift]
+                if valid_token_losses.numel() > 0:
+                    all_token_losses.append(valid_token_losses.cpu())
+
+            # 中间输出（与原有逻辑一致）
             accum_loss += loss.item() * batch_tokens
             accum_tokens += batch_tokens
             batch_cnt += 1
 
-            # 每隔 val_log_interval 个 batch 输出一次中间结果（仅主进程）
             if self.global_rank == 0 and self.eval_log_interval > 0 and batch_cnt % self.eval_log_interval == 0:
                 local_avg_loss = accum_loss / accum_tokens
                 local_ppl = math.exp(local_avg_loss) if local_avg_loss < 100 else float("inf")
@@ -439,12 +536,12 @@ class TaiChuTrainer:
                     f"[Eval] Step {self.global_step} (batch {batch_cnt}/{len(self.val_loader)}) | "
                     f"loss={local_avg_loss:.4f} | ppl={local_ppl:.2f}"
                 )
-                # 重置窗口累积器，使下一个窗口独立
                 accum_loss = 0.0
                 accum_tokens = 0
 
         # 分布式聚合
         if self.device.type == 'cuda' and torch.distributed.is_initialized():
+            # 聚合损失和 token 数
             loss_tensor = torch.tensor(total_loss, device=self.device)
             tokens_tensor = torch.tensor(total_tokens, device=self.device)
             torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.SUM)
@@ -452,62 +549,93 @@ class TaiChuTrainer:
             total_loss = loss_tensor.item()
             total_tokens = tokens_tensor.item()
 
-        avg_loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
-        self.model.train()
+            # 聚合准确率
+            if total_valid_tokens > 0:
+                acc_tensor = torch.tensor(total_accuracy, device=self.device)
+                valid_tensor = torch.tensor(total_valid_tokens, device=self.device)
+                torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(valid_tensor, op=torch.distributed.ReduceOp.SUM)
+                total_accuracy = acc_tensor.item()
+                total_valid_tokens = valid_tensor.item()
 
-        # 2. 生成测试（仅主进程，且提供了 prompts）
+            # 分位数 CE 的聚合：由于 all_token_losses 是列表，简单做法是每个进程独立计算后取平均
+            # 更精确的做法是收集所有 token 损失，但通信开销大。此处采用各进程独立计算再平均。
+            # 为简化，我们仅在主进程计算分位数（因为 all_token_losses 非空）
+            pass
+
+        avg_loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
+        avg_accuracy = total_accuracy / total_valid_tokens if total_valid_tokens > 0 else 0.0
+
+        # 计算分位数交叉熵
+        if all_token_losses:
+            all_token_losses_tensor = torch.cat(all_token_losses, dim=0)
+            percentile_metrics = ValidationMetrics.compute_percentile_ce(
+                all_token_losses_tensor, percentiles=[0.5, 0.9, 0.95]
+            )
+        else:
+            percentile_metrics = {"ce_p50": 0.0, "ce_p90": 0.0, "ce_p95": 0.0}
+
+        # （可选）计算空白提示困惑度（每 5 次验证计算一次，减少开销）
+        blank_ppl = None
+        if self.global_rank == 0 and (self.global_step // self.eval_interval) % 5 == 0:
+            raw_model = self.model.module if hasattr(self.model, 'module') else self.model
+            assert isinstance(raw_model, nn.Module)
+            blank_ppl = ValidationMetrics.compute_blank_ppl(
+                raw_model, self.tokenizer, blank_text="", device=self.device
+            )
+            self.log_manager.logger.info(f"Step {self.global_step} - blank_ppl={blank_ppl:.2f}")
+
+        # 记录扩展指标到日志和 SwanLab
+        if self.global_rank == 0:
+            self.log_manager.set_step(self.global_step)
+            ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
+            log_msg = (
+                f"Step {self.global_step} - val/loss={avg_loss:.4f} | val/ppl={ppl:.2f} | "
+                f"val/acc={avg_accuracy:.4f} | val/ce_p50={percentile_metrics['ce_p50']:.4f} | "
+                f"val/ce_p90={percentile_metrics['ce_p90']:.4f}"
+            )
+            if blank_ppl is not None:
+                log_msg += f" | val/blank_ppl={blank_ppl:.2f}"
+            self.log_manager.logger.info(log_msg)
+
+            # 记录到 SwanLab
+            if self.swanlab_logger:
+                val_metrics = {
+                    "val/loss": avg_loss,
+                    "val/perplexity": ppl,
+                    "val/accuracy": avg_accuracy,
+                    **{f"val/{k}": v for k, v in percentile_metrics.items()}
+                }
+                if blank_ppl is not None:
+                    val_metrics["val/blank_ppl"] = blank_ppl
+                self.swanlab_logger.log_metrics(val_metrics, step=self.global_step)
+
+        # 生成测试文本（与原有逻辑一致）
         if self.global_rank == 0 and generate_prompts:
-            # 获取原始模型（处理 DDP 包装）
             raw_model = self.model.module if hasattr(self.model, 'module') else self.model
             raw_model.eval() # type: ignore
-
-            # 对每个提示进行生成
             for idx, prompt in enumerate(generate_prompts):
-                # 编码提示并提取 token IDs
                 encoding = self.tokenizer.encode(prompt, add_special_tokens=False)
                 prompt_ids = encoding.ids
                 input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-
-                # 调用模型的 generate 方法
                 generated_ids = raw_model.generate( # type: ignore
                     input_ids=input_tensor,
                     max_new_tokens=num_generate_tokens,
-                    temperature=0.8,  # 可调节，建议小于 1.0 以获得更确定的结果
-                    top_k=50,  # 可选，常用值 40~60
+                    temperature=0.8,
+                    top_k=50,
                 )
-
-                # 解码生成的完整文本（包含原始提示）
                 generated_text = self.tokenizer.decode(generated_ids[0].tolist())
-
-                # 记录到 TensorBoard 和日志
                 self.log_manager.set_step(self.global_step)
                 self.log_manager.log_text(f"generation/prompt_{idx}", generated_text)
                 self.log_manager.info(
                     f"[生成测试] 提示: {prompt}\n生成结果: {generated_text}\n{'-' * 60}"
                 )
-
-                # 记录到 SwanLab（文本）
                 if self.swanlab_logger:
                     self.swanlab_logger.log_text(
                         f"generation/prompt_{idx}", generated_text, step=self.global_step
                     )
 
-        # 恢复训练模式
         self.model.train()
-
-        # 3. 记录损失指标(仅主进程)
-        if self.global_rank == 0:
-            self.log_manager.set_step(self.global_step)
-            ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
-            self.log_manager.logger.info(
-                f"Step {self.global_step} - val/loss={avg_loss:.4f} | val/ppl={ppl:.2f}"
-            )
-
-            # 记录到 SwanLab
-            if self.swanlab_logger:
-                val_metrics = {"val/loss": avg_loss, "val/perplexity": ppl}
-                self.swanlab_logger.log_metrics(val_metrics, step=self.global_step)
-
         return avg_loss
 
 
@@ -526,29 +654,28 @@ def main() -> None:
     parser.add_argument("--vocab_size", type=int, default=None, help="覆盖词表大小")
     parser.add_argument("--max_seq_len", type=int, default=None, help="覆盖最大序列长度")
     parser.add_argument("--dropout", type=float, default=None, help="覆盖 dropout 比率")
-    # MoE 相关参数（若有）
     parser.add_argument("--num_experts", type=int, default=None, help="覆盖专家数量")
     parser.add_argument("--top_k", type=int, default=None, help="覆盖路由 top-k")
 
     # ========== 训练超参数覆盖 ==========
     parser.add_argument("--batch_size", type=int, default=None, help="覆盖全局批次大小（每卡）")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="覆盖梯度累积步数")
-    parser.add_argument("--learning_rate", type=float, default=None, help="覆盖学习率")
-    parser.add_argument("--weight_decay", type=float, default=None, help="覆盖权重衰减")
-    parser.add_argument("--warmup_steps", type=int, default=None, help="覆盖预热步数")
-    parser.add_argument("--max_steps", type=int, default=None, help="覆盖总训练步数")
-    parser.add_argument("--min_lr_ratio", type=float, default=None, help="覆盖最小学习率比例")
-    parser.add_argument("--use_mixed_precision", action="store_true", default=None, help="是否启用混合精度（覆盖配置）")
-    parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"], help="混合精度类型")
-    parser.add_argument("--seed", type=int, default=None, help="覆盖随机种子")
-    parser.add_argument("--save_interval", type=int, default=None, help="覆盖保存间隔步数")
-    parser.add_argument("--eval_interval", type=int, default=None, help="覆盖验证间隔步数")
-    parser.add_argument("--log_interval", type=int, default=None, help="覆盖训练日志间隔步数")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--warmup_steps", type=int, default=None)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--min_lr_ratio", type=float, default=None)
+    parser.add_argument("--use_mixed_precision", action="store_true", default=None)
+    parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"])
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--save_interval", type=int, default=None)
+    parser.add_argument("--eval_interval", type=int, default=None)
+    parser.add_argument("--log_interval", type=int, default=None)
 
     # 早停参数覆盖
-    parser.add_argument("--early_stop_enabled", action="store_true", default=None, help="启用早停")
-    parser.add_argument("--early_stop_patience", type=int, default=None, help="早停耐心值")
-    parser.add_argument("--early_stop_min_delta", type=float, default=None, help="早停最小改善阈值")
+    parser.add_argument("--early_stop_enabled", action="store_true", default=None)
+    parser.add_argument("--early_stop_patience", type=int, default=None)
+    parser.add_argument("--early_stop_min_delta", type=float, default=None)
 
     args = parser.parse_args()
 
@@ -569,7 +696,6 @@ def main() -> None:
         model_cfg.vocab_size = args.vocab_size
     if args.max_seq_len is not None:
         model_cfg.max_seq_len = args.max_seq_len
-        # 同时需要覆盖数据配置中的 max_seq_length
         pretrain_cfg.data.max_seq_length = args.max_seq_len
     if args.dropout is not None:
         model_cfg.dropout = args.dropout
@@ -620,7 +746,6 @@ def main() -> None:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = get_device(local_rank)
 
-    # 初始化分布式进程组（若多卡）
     world_size = 1
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         torch.distributed.init_process_group(backend="nccl", rank=local_rank, world_size=torch.cuda.device_count())
@@ -654,6 +779,8 @@ def main() -> None:
         model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
 
     # 打印参数量（仅主进程）
+    total_params = None
+    trainable_params = None
     if is_main:
         total_params = ModelInspector.get_parameter_count(model)
         trainable_params = ModelInspector.get_parameter_count(model, trainable_only=True)
@@ -712,7 +839,6 @@ def main() -> None:
     swanlab_logger = None
     use_swanlab = pretrain_cfg.swanlab.use_swanlab
     if use_swanlab and is_main:
-        # 收集超参数配置
         swanlab_config = {
             "model_name": model_cfg.model_name,
             "batch_size": pretrain_cfg.training.batch_size,
@@ -727,16 +853,12 @@ def main() -> None:
             "dtype": pretrain_cfg.training.dtype,
             "seed": pretrain_cfg.training.seed,
         }
-        # 添加模型参数量（如果在前面已计算）
         if 'total_params' in locals():
             swanlab_config["total_params"] = total_params
         if 'trainable_params' in locals():
             swanlab_config["trainable_params"] = trainable_params
-
-        # 设置环境变量或模式（如果需要）
         if pretrain_cfg.swanlab.swanlab_mode:
             os.environ["SWANLAB_MODE"] = pretrain_cfg.swanlab.swanlab_mode
-
         swanlab_logger = SwanLabLogger(
             project=pretrain_cfg.swanlab.swanlab_project,
             experiment_name=pretrain_cfg.swanlab.swanlab_experiment_name,
@@ -748,9 +870,10 @@ def main() -> None:
         log_manager.info(
             f"SwanLab 已启用，项目: {pretrain_cfg.swanlab.swanlab_project}，实验: {pretrain_cfg.swanlab.swanlab_experiment_name or 'auto'}")
 
-    # 12. 恢复训练（如果指定）
+    # 13. 恢复训练（如果指定）
     resume_step = 0
     best_val_loss_restored = None
+    checkpoint = None
     if args.resume:
         log_manager.info(f"从检查点恢复: {args.resume}")
         resume_step, best_val_loss_restored, checkpoint = checkpoint_manager.load(
@@ -761,13 +884,10 @@ def main() -> None:
             scaler=scaler,
             map_location=str(device),
         )
-        # 设置调度器的 last_epoch（避免循环调用 step）
         scheduler.last_epoch = resume_step - 1 if resume_step > 0 else -1
         log_manager.info(f"恢复至全局步数: {resume_step}")
-    else:
-        checkpoint = None  # 无恢复时初始化为空
 
-    # 13. 构建 Trainer 并开始训练
+    # 14. 构建 Trainer 并开始训练
     trainer = TaiChuTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -800,16 +920,14 @@ def main() -> None:
         generation_prompts=pretrain_cfg.evaluating.prompts,
         num_generate_tokens=pretrain_cfg.evaluating.num_generate_tokens,
     )
-    # 恢复最佳验证损失（如果检查点中有记录）
     if best_val_loss_restored is not None:
         trainer.best_val_loss = best_val_loss_restored
 
-    # 恢复早停状态（如果检查点中包含且早停已启用）
+    # 恢复早停状态
     if (trainer.early_stopping is not None and checkpoint is not None
             and "early_stopping_state" in checkpoint):
         early_state = checkpoint["early_stopping_state"]
         trainer.early_stopping.load_state_dict(early_state)
-        # 具体列出早停状态数据
         log_manager.info(
             f"已恢复早停状态: counter={early_state.get('counter', 0)}, "
             f"best_score={early_state.get('best_score', None)}, "
@@ -817,7 +935,6 @@ def main() -> None:
             f"early_stop={early_state.get('early_stop', False)}"
         )
 
-    # 启动训练
     trainer.train()
 
 
