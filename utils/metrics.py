@@ -574,6 +574,14 @@ class ValidationMetrics:
         # 对空白文本进行编码，不添加特殊 token（或根据 tokenizer 习惯）
         encoding = tokenizer.encode(blank_text, add_special_tokens=True)
         input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=device)
+
+        # 防止空序列导致 reshape 错误
+        if input_ids.numel() == 0 or input_ids.size(1) == 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("Blank text tokenized to empty sequence. Returning inf PPL.")
+            return float('inf')
+
         # 标签与输入相同（用于计算交叉熵）
         labels = input_ids.clone()
         with torch.no_grad():
