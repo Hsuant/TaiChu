@@ -706,7 +706,7 @@ def main() -> None:
         model_cfg.top_k = args.top_k
 
     # 覆盖训练超参数
-    if args.batch_size is not None:
+    if args.train_batch_size is not None:
         pretrain_cfg.training.batch_size = args.train_batch_size
     if args.eval_batch_size is not None:
         pretrain_cfg.evaluating.batch_size = args.eval_batch_size
