@@ -14,16 +14,19 @@
 
 用法：
     # 单卡训练
-    python train_pretrain.py --model_config configs/TaiChu_LLM.yaml --pretrain_config configs/train_pretrain_config.yaml
+    python ./trainer/train_pretrain.py --model_config configs/TaiChu_LLM.yaml --pretrain_config configs/train_pretrain_config.yaml
 
     # 多卡训练（通过 torchrun 启动）
     torchrun --nproc_per_node=4 train_pretrain.py --model_config configs/TaiChu_125m.yaml --pretrain_config configs/pretrain_config.yaml
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import math
 import time
-import os
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler
@@ -35,7 +38,7 @@ from tokenizers import Tokenizer
 from typing import List, Optional
 
 from utils.config_loader import load_model_config, load_pretrain_config
-from utils.train_utils import set_seed, get_device, get_cosine_lr_lambda
+from utils.train_utils import set_seed, get_device, get_cosine_lr_lambda, get_experiment_dir
 from utils.logger import LogManager
 from utils.swanlab_logger import SwanLabLogger
 from utils.checkpoint import CheckpointManager
@@ -316,7 +319,7 @@ class TaiChuTrainer:
                                 )
                                 self.early_stopped = True
                                 self.checkpoint_manager.save(
-                                    f"early_stop_step{self.global_step}.pt",
+                                    f"checkpoints/early_stop_step{self.global_step}.pt",
                                     model=self.model,
                                     optimizer=self.optimizer,
                                     scheduler=self.scheduler,
@@ -333,7 +336,7 @@ class TaiChuTrainer:
                         if self.early_stopping is not None:
                             extra["early_stopping_state"] = self.early_stopping.state_dict()
                         self.checkpoint_manager.save(
-                            f"checkpoint-{self.global_step}.pt",
+                            f"checkpoints/checkpoint-{self.global_step}.pt",
                             model=self.model,
                             optimizer=self.optimizer,
                             scheduler=self.scheduler,
@@ -344,7 +347,7 @@ class TaiChuTrainer:
 
             # 训练结束，保存最终模型
             self.checkpoint_manager.save(
-                "final_model.pt",
+                "final_models/final_model.pt",
                 model=self.model,
                 optimizer=self.optimizer,
                 scheduler=self.scheduler,
@@ -375,7 +378,7 @@ class TaiChuTrainer:
         if self.early_stopping is not None:
             extra["early_stopping_state"] = self.early_stopping.state_dict()
         self.checkpoint_manager.save(
-            f"checkpoint-emergency-step{self.global_step}.pt",
+            f"checkpoints/checkpoint-emergency-step{self.global_step}.pt",
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
@@ -658,13 +661,13 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=None, help="覆盖路由 top-k")
 
     # ========== 训练超参数覆盖 ==========
+    parser.add_argument("--target_tokens", type=int, default=None, help="覆盖目标总 token 数")
     parser.add_argument("--train_batch_size", type=int, default=None, help="覆盖训练阶段批次大小（每卡）")
     parser.add_argument("--eval_batch_size", type=int, default=None, help="覆盖验证阶段批次大小")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--warmup_ratio", type=float, default=None, help="覆盖预热步数占总步数的比例")
     parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--warmup_steps", type=int, default=None)
-    parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--min_lr_ratio", type=float, default=None)
     parser.add_argument("--use_mixed_precision", action="store_true", default=None)
     parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"])
@@ -684,6 +687,7 @@ def main() -> None:
     model_cfg = load_model_config(args.model_config)
     pretrain_cfg = load_pretrain_config(args.pretrain_config)
 
+    # 2. 覆盖配置
     # 覆盖模型配置
     if args.model_name is not None:
         model_cfg.model_name = args.model_name
@@ -706,6 +710,8 @@ def main() -> None:
         model_cfg.top_k = args.top_k
 
     # 覆盖训练超参数
+    if args.target_tokens is not None:
+        pretrain_cfg.training.target_tokens = args.target_tokens
     if args.train_batch_size is not None:
         pretrain_cfg.training.batch_size = args.train_batch_size
     if args.eval_batch_size is not None:
@@ -716,10 +722,8 @@ def main() -> None:
         pretrain_cfg.optimizer.learning_rate = args.learning_rate
     if args.weight_decay is not None:
         pretrain_cfg.optimizer.weight_decay = args.weight_decay
-    if args.warmup_steps is not None:
-        pretrain_cfg.scheduler.warmup_steps = args.warmup_steps
-    if args.max_steps is not None:
-        pretrain_cfg.scheduler.max_steps = args.max_steps
+    if args.warmup_ratio is not None:
+        pretrain_cfg.scheduler.warmup_ratio = args.warmup_ratio
     if args.min_lr_ratio is not None:
         pretrain_cfg.scheduler.min_lr_ratio = args.min_lr_ratio
     if args.use_mixed_precision is not None:
@@ -743,7 +747,7 @@ def main() -> None:
     if args.early_stop_min_delta is not None:
         pretrain_cfg.early_stopping.min_delta = args.early_stop_min_delta
 
-    # 2. 获取分布式信息
+    # 3. 分布式初始化
     local_rank = pretrain_cfg.training.local_rank
     if local_rank == -1:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -751,26 +755,45 @@ def main() -> None:
 
     world_size = 1
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        torch.distributed.init_process_group(backend="nccl", rank=local_rank, world_size=torch.cuda.device_count())
+        torch.distributed.init_process_group(
+            backend="nccl", rank=local_rank, world_size=torch.cuda.device_count()
+        )
         world_size = torch.distributed.get_world_size()
         global_rank = torch.distributed.get_rank()
     else:
         global_rank = 0
 
-    # 3. 设置随机种子（每个进程不同，避免数据重复）
+    # 4. 设置随机种子（不同进程不同，避免数据重复）
     base_seed = pretrain_cfg.training.seed
     set_seed(base_seed + global_rank)
 
-    # 4. 日志管理器（仅主进程写入 TensorBoard 和文件）
+    # 5. 生成实验目录
+    # 生成唯一的实验目录
+    base_output_dir = pretrain_cfg.training.output_dir  # 默认 "./experiments"
+    experiment_name = pretrain_cfg.training.experiment_name  # 从 YAML 读取，可能为空
+    model_name = model_cfg.model_name
+    experiment_dir = get_experiment_dir(base_output_dir, experiment_name, model_name)
+
+    # 创建子目录
+    best_dir = os.path.join(experiment_dir, "best_models")
+    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+    final_dir = os.path.join(experiment_dir, "final_models")
+    log_dir = os.path.join(experiment_dir, "logs")
+    for d in [best_dir, checkpoint_dir, final_dir, log_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    # 6. 日志管理器（仅主进程写入 TensorBoard 和文件）
     is_main = (global_rank == 0)
     log_manager = LogManager(
-        log_dir=pretrain_cfg.training.output_dir,
+        log_dir=log_dir,
         tensorboard=is_main,
         log_file="training.log" if is_main else None,
         console_level=20,  # INFO
     )
+    if is_main:
+        log_manager.info(f"实验目录: {experiment_dir}")
 
-    # 5. 构建模型
+    # 7. 构建模型
     model = TaiChuModel(model_cfg)
     model.to(device)
 
@@ -790,10 +813,10 @@ def main() -> None:
         log_manager.info(f"模型参数量: {total_params:,} (可训练: {trainable_params:,})")
         log_manager.info(f"模型大小: {ModelInspector.get_model_size_mb(model):.2f} MB")
 
-    # 6. 加载 tokenizer
+    # 8. 加载 tokenizer
     tokenizer = Tokenizer.from_file(pretrain_cfg.data.tokenizer_path)
 
-    # 7. 数据集
+    # 9. 构建数据集
     log_manager.info("构建数据集...")
     pin_memory = torch.cuda.is_available()
     train_loader = build_dataloader(
@@ -813,43 +836,63 @@ def main() -> None:
         pin_memory=pin_memory,
     )
 
-    # 8. 优化器
+    # 10. 优化器
     optimizer = model.configure_optimizers(pretrain_cfg.optimizer)
 
-    # 9. 学习率调度器（warmup + cosine）
+    # 11. 动态计算 max_steps（基于 target_tokens）
+    target_tokens = pretrain_cfg.training.target_tokens
+    per_gpu_batch = pretrain_cfg.training.batch_size
+    grad_accum = pretrain_cfg.training.gradient_accumulation_steps
+    global_batch_size = per_gpu_batch * grad_accum * world_size
+    tokens_per_step = global_batch_size * pretrain_cfg.data.max_seq_length
+    max_steps = math.ceil(target_tokens / tokens_per_step)
+
+    warmup_ratio = pretrain_cfg.scheduler.warmup_ratio
+    warmup_steps = max(1, int(max_steps * warmup_ratio))
+
+    log_manager.info(f"目标总 token 数: {target_tokens:,}")
+    log_manager.info(
+        f"全局 batch size: {global_batch_size} (每卡 {per_gpu_batch} × 累积 {grad_accum} × 节点数 {world_size})")
+    log_manager.info(f"每步消耗 token 数: {tokens_per_step:,}")
+    log_manager.info(f"动态计算 max_steps = {max_steps}, warmup_steps = {warmup_steps}")
+
+    # 12. 学习率调度器（warmup + cosine）
     lr_lambda = get_cosine_lr_lambda(
-        warmup_steps=pretrain_cfg.scheduler.warmup_steps,
-        max_steps=pretrain_cfg.scheduler.max_steps,
+        warmup_steps=warmup_steps,
+        max_steps=max_steps,
         min_lr_ratio=pretrain_cfg.scheduler.min_lr_ratio,
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # 10. 混合精度
+    # 13. 混合精度
     use_amp = pretrain_cfg.training.use_mixed_precision and torch.cuda.is_available()
     if use_amp and not torch.cuda.is_available():
         log_manager.warning("CUDA 不可用，已自动禁用混合精度训练")
     scaler = GradScaler('cuda', enabled=use_amp) if use_amp else GradScaler('cpu', enabled=False)
 
-    # 11. 检查点管理器
+    # 14. 检查点管理器
     checkpoint_manager = CheckpointManager(
         output_dir=pretrain_cfg.training.output_dir,
         keep_last_n=3,
         best_metric_name="val_loss",
         best_metric_mode="min",
+        best_subdir="best_models",
     )
 
-    # 12. SwanLab 日志记录器（仅主进程且配置启用）
+    # 15. SwanLab 日志记录器（仅主进程且配置启用）
     swanlab_logger = None
     use_swanlab = pretrain_cfg.swanlab.use_swanlab
     if use_swanlab and is_main:
         swanlab_config = {
             "model_name": model_cfg.model_name,
+            "target_tokens": target_tokens,
             "batch_size": pretrain_cfg.training.batch_size,
             "gradient_accumulation_steps": pretrain_cfg.training.gradient_accumulation_steps,
             "learning_rate": pretrain_cfg.optimizer.learning_rate,
             "weight_decay": pretrain_cfg.optimizer.weight_decay,
-            "warmup_steps": pretrain_cfg.scheduler.warmup_steps,
-            "max_steps": pretrain_cfg.scheduler.max_steps,
+            "warmup_ratio": warmup_ratio,
+            "warmup_steps": warmup_steps,
+            "max_steps": max_steps,
             "min_lr_ratio": pretrain_cfg.scheduler.min_lr_ratio,
             "max_seq_length": pretrain_cfg.data.max_seq_length,
             "use_mixed_precision": use_amp,
@@ -862,6 +905,7 @@ def main() -> None:
             swanlab_config["trainable_params"] = trainable_params
         if pretrain_cfg.swanlab.swanlab_mode:
             os.environ["SWANLAB_MODE"] = pretrain_cfg.swanlab.swanlab_mode
+
         swanlab_logger = SwanLabLogger(
             project=pretrain_cfg.swanlab.swanlab_project,
             experiment_name=pretrain_cfg.swanlab.swanlab_experiment_name,
@@ -873,7 +917,7 @@ def main() -> None:
         log_manager.info(
             f"SwanLab 已启用，项目: {pretrain_cfg.swanlab.swanlab_project}，实验: {pretrain_cfg.swanlab.swanlab_experiment_name or 'auto'}")
 
-    # 13. 恢复训练（如果指定）
+    # 16. 恢复训练（如果指定）
     resume_step = 0
     best_val_loss_restored = None
     checkpoint = None
@@ -890,7 +934,7 @@ def main() -> None:
         scheduler.last_epoch = resume_step - 1 if resume_step > 0 else -1
         log_manager.info(f"恢复至全局步数: {resume_step}")
 
-    # 14. 构建 Trainer 并开始训练
+    # 17. 构建 Trainer 并开始训练
     trainer = TaiChuTrainer(
         model=model,
         tokenizer=tokenizer,
@@ -903,7 +947,7 @@ def main() -> None:
         scaler=scaler,
         gradient_accumulation_steps=pretrain_cfg.training.gradient_accumulation_steps,
         init_step=resume_step,
-        max_steps=pretrain_cfg.scheduler.max_steps,
+        max_steps=max_steps,
         save_interval=pretrain_cfg.training.save_interval,
         eval_interval=pretrain_cfg.evaluating.eval_interval,
         train_log_interval=pretrain_cfg.training.log_interval,
