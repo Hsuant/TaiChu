@@ -93,23 +93,32 @@ class GradientNoiseScale:
     Batch Size 调度。计算公式：GNS = (‖g_batch‖²) / (σ_g²)。
 
     Attributes:
-        window_size: 用于估计梯度方差的滑动窗口大小。
-        grad_norms: 梯度范数平方的滑动窗口列表。
-        current_gns: 当前估计的梯度噪声尺度。
+        window_size: 保留历史梯度范数的滑动窗口大小（用于可选统计）。
+        ema_beta: EMA 平滑系数，值越大对历史依赖越强，建议 0.99。
+        grad_norms: 历史梯度范数平方列表（保留最近 window_size 个）。
+        ema_mean: 梯度范数平方的 EMA 均值。
+        ema_var: 梯度范数平方的 EMA 方差。
+        current_gns: 当前步的梯度噪声尺度。
     """
 
-    def __init__(self, window_size: int = 100):
+    def __init__(self, window_size: int = 100, ema_beta: float = 0.99):
         """初始化梯度噪声尺度计算器。
 
         Args:
             window_size: 滑动窗口大小，用于计算梯度方差。
+            ema_beta: 指数加权移动平均的平滑系数，通常取 0.99 或 0.999。
         """
         self.window_size = window_size
+        self.ema_beta = ema_beta
         self.grad_norms: List[float] = []
         self.current_gns: Optional[float] = None
+        self.ema_mean: Optional[float] = None
+        self.ema_var: Optional[float] = None
 
     def update(self, model: nn.Module) -> float:
         """基于模型所有可训练参数的梯度更新 GNS 估计。
+        使用 EMA 在线更新均值和方差，避免滑动窗口内数值相同时分母为零。
+        添加 epsilon 防止除零，并对结果设置上限 1e6。
 
         注意：调用本方法前必须完成 backward()，否则梯度不存在。
 
@@ -117,8 +126,9 @@ class GradientNoiseScale:
             model: 已完成反向传播的模型（含有 .grad）。
 
         Returns:
-            当前估计的梯度噪声尺度值。
+            当前估计的梯度噪声尺度值（截断至 1e6）。
         """
+        # 计算当前步的梯度范数平方
         grad_norm_sq = 0.0
         param_grads = [p.grad for p in model.parameters() if p.grad is not None]
         if not param_grads:
@@ -126,19 +136,35 @@ class GradientNoiseScale:
         for grad in param_grads:
             grad_norm_sq += (grad.norm(2).item()) ** 2
 
+        # 保存到历史列表（可选）
         self.grad_norms.append(grad_norm_sq)
         if len(self.grad_norms) > self.window_size:
             self.grad_norms.pop(0)
 
-        if len(self.grad_norms) >= 2:
-            mean_norm = sum(self.grad_norms) / len(self.grad_norms)
-            grad_norm_variance = sum((n - mean_norm) ** 2 for n in self.grad_norms) / len(self.grad_norms)
-            if grad_norm_variance > 1e-12:
-                self.current_gns = grad_norm_sq / grad_norm_variance
-            else:
-                self.current_gns = float("inf")
+        # 更新 EMA 均值和方差（使用 Welford 在线算法改进版）
+        if self.ema_mean is None:
+            self.ema_mean = grad_norm_sq
+            self.ema_var = 0.0
         else:
-            self.current_gns = float("inf")
+            # 更新 EMA 均值
+            self.ema_mean = self.ema_beta * self.ema_mean + (1 - self.ema_beta) * grad_norm_sq
+            # 更新 EMA 二阶矩：E[x^2] = var + mean^2
+            old_e2 = self.ema_var + self.ema_mean ** 2  # 注意：此处应使用更新前的均值和方差
+            # 更正确的方式：先暂存旧值
+            old_mean = self.ema_mean
+            old_var = self.ema_var
+            new_mean = self.ema_beta * old_mean + (1 - self.ema_beta) * grad_norm_sq
+            new_e2 = self.ema_beta * (old_var + old_mean ** 2) + (1 - self.ema_beta) * grad_norm_sq ** 2
+            self.ema_mean = new_mean
+            self.ema_var = max(new_e2 - new_mean ** 2, 1e-12)  # 保证方差非负
+
+        # 计算 GNS，添加 epsilon 防止分母为零
+        epsilon = 1e-8
+        self.current_gns = grad_norm_sq / (self.ema_var + epsilon)
+
+        # 截断上限，避免日志中出现过大数值或 inf
+        self.current_gns = min(self.current_gns, 1e6)
+
         return self.current_gns
 
     def get_metrics(self) -> Dict[str, float]:

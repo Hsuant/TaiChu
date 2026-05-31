@@ -237,18 +237,27 @@ class TaiChuTrainer:
 
                 # 达到梯度累积步数，执行参数更新
                 if micro_step == self.gradient_accumulation_steps:
-                    # 梯度裁剪（防止梯度爆炸）
+                    # 取消 AMP 缩放，恢复原始梯度
                     if self.use_amp:
                         self.scaler.unscale_(self.optimizer)
+
+                    # 更新梯度噪声尺度（裁剪前，使用原始梯度）
+                    self.eval_metrics.update_gradient(self.model)
+
+                    # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
                     # 优化器步进
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    self.scheduler.step()
 
                     # 更新全局步数
                     self.global_step += 1
+
+                    # 学习率调度器更新
+                    self.scheduler.step()
+
+                    # 计算平均损失
                     avg_loss = accumulated_loss / self.gradient_accumulation_steps
 
                     # 更新训练阶段评估指标
