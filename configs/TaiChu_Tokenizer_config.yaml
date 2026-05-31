@@ -1,0 +1,198 @@
+# ============================================================================
+# TaiChu Tokenizer 训练配置文件
+# 兼容 HuggingFace tokenizers 库，支持 Byte-Level BPE。
+# ============================================================================
+
+# ---------------------------- 数据配置 ----------------------------
+data:
+  # 训练文件列表（支持绝对路径或相对路径）
+  files:
+    - "./TaiChu/merge_wiki_ch.jsonl"
+
+  # 数据集遍历次数（通常设为 1，避免过拟合）
+  epoch: 1
+
+  # JSON 对象中存储文本的字段名
+  text_key: "text"
+
+  # 是否将连续汉字拆分为单字（强烈建议开启，大幅降低内存且不影响质量）
+  split_chinese: true
+
+  # 中文分词模型（可选 "jieba" 或 pkuseg 的 "mixed"/"news"/"default"）
+  seg_model: "jieba"
+
+  # 单条文本的最大字节长度，超过此长度将被截断（防止异常长文本拖慢训练）
+  max_text_length: 2000000  # 2 MB
+
+  # 数据预取使用的进程数（根据 CPU 核心数调整，0 表示自动使用全部核心）
+  num_workers: 8
+
+  # 多进程模式下每个任务包含的行数（块大小）
+  # 推荐 1000~10000：块越小内存越稳但进程通信开销略增，块越大吞吐量越高但主进程内存稍增
+  chunk_size: 5000
+
+  # 是否跳过空文本或仅包含空白字符的文本
+  skip_empty: true
+
+# ---------------------------- 规范化器配置 ----------------------------
+# 规范化器在预分词之前执行，用于清洗文本、统一字符表示。
+# 支持 none（跳过规范化）或 sequence（组合多个步骤）。
+normalizer:
+  type: "sequence"             # 组合多个规范化步骤
+  steps:
+    - type: "nfkc"             # Unicode NFKC 标准化，统一全角/半角、连字等
+    - type: "replace"          # 将多个连续空白字符（空格、制表符等）替换为单个空格
+      pattern: "\\s+"
+      content: " "
+    - type: "strip"            # 去除首尾空格
+
+# ---------------------------- 预分词器配置 ----------------------------
+pre_tokenizer:
+  type: "bytelevel"            # Byte-Level BPE，鲁棒性强，可直接处理任意字节
+  add_prefix_space: false      # 不在文本前添加空格
+  use_regex: true              # 使用 GPT-2 风格的正则模式进行初始分词
+  digit_split: true            # 启用数字拆分
+  max_digit_group: 3           # 最大数字分组（3 位千分位风格）
+
+# ---------------------------- BPE 训练器配置 ----------------------------
+trainer:
+  vocab_size: 64000            # 目标词表大小
+  min_frequency: 2             # 最低词频，过滤出现次数低于该值的 token（减少噪声）
+  show_progress: true          # 显示训练进度条
+  # 特殊 token 列表：这些 token 会被直接加入词表，且不会被 BPE 拆分
+  special_tokens:
+    - "<|endoftext|>"          # 文档结束标记
+    - "<|im_start|>"           # 消息起始
+    - "<|im_end|>"             # 消息结束（同时复用为 pad_token）
+    - "<|think|>"              # 思考内容开始
+    - "<|/think|>"             # 思考内容结束
+    - "<unk>"                  # 未登录词标记
+
+# ---------------------------- Chat Template（Jinja2） ----------------------------
+# 模板功能概述
+# ============================================
+# 用于 Transformers 库的 apply_chat_template 方法
+# 模板引擎：Jinja2
+# 格式规范：ChatML 对话格式
+#
+# 支持的角色
+# --------------------------------------------
+# - system     : 系统消息
+# - user       : 用户输入
+# - assistant  : 模型回复
+#
+# 扩展字段
+# --------------------------------------------
+# - reasoning_content : 模型的思考过程，位于 assistant 消息中
+#                       输出时以 <|think|> 标签包裹
+#
+# 特性
+# --------------------------------------------
+# - 支持多轮对话
+# - 支持系统消息
+# - 支持思考标签输出
+#
+# 设计原则与实现
+# --------------------------------------------
+# 1. 覆盖边界情况：确保处理 system 角色的多种表达、空消息、列表与字典格式等内容类型。
+#    最终返回一个符合预期的字符串，具备更高的工程鲁棒性。
+# 2. 避免格式错误：增加 token 过滤和格式化有效性检查，防止生成异常输出。
+# 3. 逻辑清晰：Jinja 模板与核心逻辑分离，基于 OpenChat 等的实现，将可视化与渲染分开，
+#    使代码易于理解和维护。
+# 4. 内置注释：帮助团队快速理解和维护。
+chat_template: |
+  {#- 
+    初始化命名空间，用于标记会话中图像的数量。这是一个为将来可能的扩展预留的计数器，
+    在不支持多模态的当前场景下，它主要用于占位，但保留了与官方模板结构的一致性。
+  #}
+  {%- set image_count = namespace(value=0) -%}
+
+  {#- 
+    处理系统提示（System Prompt）。
+    1. 如果 messages 的第一条消息是 'system' 角色，则其内容将被格式化为系统提示。
+    2. 否则，若定义了 default_system_message（通过 kwargs 传入），将使用其内容。
+    3. 系统消息在对话历史的顶部是唯一且必须的，格式为 `<|im_start|>system\n{content}<|im_end|>\n`。
+    4. 若同时存在两种定义，将优先使用第一条消息。
+  #}
+  {%- if messages[0]['role'] == 'system' -%}
+      {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' -}}
+      {#- 设置变量以指示系统消息已处理 #}
+      {%- set system_processed = true -%}
+      {#- 从剩余消息列表开始循环 #}
+      {%- set loop_messages = messages[1:] -%}
+  {%- elif default_system_message is defined -%}
+      {{- '<|im_start|>system\n' + default_system_message + '<|im_end|>\n' -}}
+      {%- set system_processed = true -%}
+      {%- set loop_messages = messages -%}
+  {%- else -%}
+      {#- 无系统消息，从原始消息列表开始循环 #}
+      {%- set loop_messages = messages -%}
+  {%- endif -%}
+
+  {#-
+    遍历并格式化除系统消息之外的所有消息。
+    核心逻辑：对每条消息，根据其角色（user 或 assistant），使用对应的标记进行包装。
+  #}
+  {%- for message in loop_messages -%}
+      {#- 
+        内容检查与智能过滤。 
+        确保 message 中的 content 字段既不是 None，也不是空列表或空字典。
+        如果 content 为空或无效，则跳过该条消息的处理，防止因无效输入导致模板渲染失败。
+      #}
+      {%- if message.get('content') is none or message.content|length == 0 -%}
+          {%- continue -%}
+      {%- endif -%}
+      
+      {#-
+        按角色类型格式化消息。
+        此处的逻辑保证了每条消息的边界都被正确闭合，避免输出格式混乱。
+      #}
+      {%- if message['role'] == 'user' -%}
+          {#- 
+            对用户内容进行过滤。当用户输入为空时，会自动跳过该消息，
+            避免生成无内容的 '<|im_start|>user\n<|im_end|>' 等无效标记对。 
+          #}
+          {{- '<|im_start|>user\n' -}}
+          {#- 
+            处理用户输入的内容格式。
+            确保将用户输入的内容渲染为字符串，并正确闭合。 
+          #}
+          {{- message['content'] | string -}}
+          {{- '<|im_end|>\n' -}}
+          
+      {%- elif message['role'] == 'assistant' -%}
+          {{- '<|im_start|>assistant\n' -}}
+          {#- 
+            支持 reasoning_content 标签。
+            如果助手消息中包含 'reasoning_content' 字段（通常用于展示模型的思考过程），
+            则以 '<|think|>' 和 '<|/think|>' 包裹并渲染。 
+          #}
+          {%- if message.get('reasoning_content') -%}
+              {#- 非空检查，防止输出空的 think 标签。 #}
+              {%- if message['reasoning_content'] | trim -%}
+                  {{- '<|think|>' + message['reasoning_content'] + '<|/think|>\n' -}}
+              {%- endif -%}
+          {%- endif -%}
+          {#- 输出助手消息的主要内容 #}
+          {{- message['content'] -}}
+          {{- '<|im_end|>\n' -}}
+          
+      {%- endif -%}
+  {%- endfor -%}
+
+  {#-
+    为响应（Generation）添加起始提示。
+    仅在需要时添加。这意味着模板在多数情况下会输出历史的完整格式，
+    但在推理时，通过额外输出 '<|im_start|>assistant\n' 提示模型开始生成回复。
+  #}
+  {%- if add_generation_prompt -%}
+      {{- '<|im_start|>assistant\n' -}}
+  {%- endif -%}
+
+# ---------------------------- 解码器配置 ----------------------------
+decoder:
+  type: "bytelevel"            # 与预分词器保持一致，确保编码解码可逆
+
+# ---------------------------- 保存路径 ----------------------------
+save:
+  directory: "./taichu_tokenizer"  # 输出目录，将生成 tokenizer.json 等文件
