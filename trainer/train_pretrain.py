@@ -37,7 +37,7 @@ from model.model import TaiChuModel
 from tokenizers import Tokenizer
 from typing import List, Optional
 
-from utils.config_loader import load_model_config, load_pretrain_config
+from utils.config_loader import load_model_config, load_pretrain_config, parse_tokens_string
 from utils.train_utils import set_seed, get_device, get_cosine_lr_lambda, get_experiment_dir
 from utils.logger import LogManager
 from utils.swanlab_logger import SwanLabLogger
@@ -711,7 +711,7 @@ def main() -> None:
 
     # 覆盖训练超参数
     if args.target_tokens is not None:
-        pretrain_cfg.training.target_tokens = args.target_tokens
+        pretrain_cfg.training.target_tokens = parse_tokens_string(args.target_tokens)
     if args.train_batch_size is not None:
         pretrain_cfg.training.batch_size = args.train_batch_size
     if args.eval_batch_size is not None:

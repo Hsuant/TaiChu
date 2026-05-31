@@ -151,15 +151,16 @@ def load_pretrain_config(yaml_path: str) -> PretrainConfig:
     sched = SchedulerConfig(**raw.get('scheduler', {}))
     data = DataConfig(**raw.get('data', {}))
 
-    train = TrainingConfig(**raw.get('training', {}))
-    train.local_rank = int(os.environ.get('LOCAL_RANK', -1))
-    train_dict = raw.get('training', {}).copy()
-    if 'target_tokens' in train_dict:
-        train_dict['target_tokens'] = parse_tokens_string(train_dict['target_tokens'])
+    train_raw = raw.get('training', {}).copy()
+    if 'target_tokens' in train_raw:
+        train_raw['target_tokens'] = parse_tokens_string(train_raw['target_tokens'])
+
+    # 处理 local_rank
+    train_raw['local_rank'] = int(os.environ.get('LOCAL_RANK', -1))
+    train = TrainingConfig(**train_raw)
 
     eval_cfg = EvaluatingConfig(**raw.get('evaluating', {}))
     early_stop_cfg = EarlyStoppingConfig(**raw.get('early_stopping', {}))
-
     swanlab_cfg = SwanLabLoggingConfig(**raw.get('swanlab', {}))
 
     return PretrainConfig(
