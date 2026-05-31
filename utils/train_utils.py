@@ -4,6 +4,8 @@
 """
 
 import os
+from datetime import datetime
+
 import math
 import random
 import numpy as np
@@ -128,3 +130,33 @@ def get_cosine_lr_lambda(
         progress = float(current_step - warmup_steps) / float(max(1, max_steps - warmup_steps))
         return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
     return lr_lambda
+
+
+def get_experiment_dir(base_dir: str, experiment_name: str = "", model_name: str = "") -> str:
+    """生成唯一的实验目录，若已存在则自动添加后缀 _1, _2...
+
+    Args:
+        base_dir: 基础根目录（如 "./experiments"）
+        experiment_name: 用户指定的实验名，为空时自动生成
+        model_name: 模型名称，用于自动生成默认实验名
+
+    Returns:
+        唯一的实验目录绝对路径
+    """
+    if not experiment_name:
+        # 默认名称：模型名 + 时间戳
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_name = f"{model_name}_{timestamp}" if model_name else f"TaiChu_{timestamp}"
+
+    exp_dir = os.path.join(base_dir, experiment_name)
+    if not os.path.exists(exp_dir):
+        return exp_dir
+
+    # 目录已存在，尝试添加后缀
+    counter = 1
+    while True:
+        new_name = f"{experiment_name}_{counter}"
+        new_dir = os.path.join(base_dir, new_name)
+        if not os.path.exists(new_dir):
+            return new_dir
+        counter += 1
