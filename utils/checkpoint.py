@@ -31,6 +31,7 @@ class CheckpointManager:
         keep_last_n: int = 3,
         best_metric_name: str = "val_loss",
         best_metric_mode: str = "min",
+        best_subdir: str = "",
     ):
         """初始化检查点管理器。
 
@@ -39,9 +40,11 @@ class CheckpointManager:
             keep_last_n: 保留最近几个检查点，超过则删除最旧的。
             best_metric_name: 最佳模型评估指标名称。
             best_metric_mode: 指标优化方向，'min' 或 'max'。
+            best_subdir: 最佳模型权重存放子目录
         """
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
+        self.best_subdir = best_subdir
         self.keep_last_n = keep_last_n
         self.best_metric_name = best_metric_name
         self.best_metric_mode = best_metric_mode
@@ -96,6 +99,7 @@ class CheckpointManager:
         scaler: Optional[Any] = None,
         global_step: int = 0,
         metrics: Optional[Dict[str, float]] = None,
+        managed: bool = True,
         **kwargs,
     ) -> str:
         """保存检查点。
@@ -108,24 +112,28 @@ class CheckpointManager:
             scaler: 混合精度缩放器。
             global_step: 全局步数。
             metrics: 评估指标。
+            managed: 是否将此检查点纳入滚动删除管理（默认 True）。
+                 设为 False 时，文件不会被自动删除，也不计入最近检查点列表。
             kwargs: 其他自定义状态。
 
         Returns:
             实际保存的文件路径。
         """
         filepath = os.path.join(self.output_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         state = self._build_state(model, optimizer, scheduler, scaler, global_step, metrics, **kwargs)
         # 保存当前最佳指标值以便恢复
         state["best_metric_value"] = self.best_metric_value
         torch.save(state, filepath)
 
         # 维护 saved_checkpoints 列表
-        self.saved_checkpoints.append(filepath)
-        # 如果超出保留数量，删除旧检查点
-        if self.keep_last_n > 0 and len(self.saved_checkpoints) > self.keep_last_n:
-            old_file = self.saved_checkpoints.pop(0)
-            if os.path.exists(old_file):
-                os.remove(old_file)
+        if managed:
+            self.saved_checkpoints.append(filepath)
+            # 如果超出保留数量，删除旧检查点
+            if self.keep_last_n > 0 and len(self.saved_checkpoints) > self.keep_last_n:
+                old_file = self.saved_checkpoints.pop(0)
+                if os.path.exists(old_file):
+                    os.remove(old_file)
         return filepath
 
     def save_best(
@@ -163,14 +171,20 @@ class CheckpointManager:
         )
         if is_better:
             self.best_metric_value = current_val
+            # 构建完整保存路径
+            if self.best_subdir:
+                best_filename = os.path.join(self.best_subdir, "best_model.pt")
+            else:
+                best_filename = "best_model.pt"
             return self.save(
-                "best_model.pt",
+                filename=best_filename,
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 scaler=scaler,
                 global_step=global_step,
                 metrics=metrics,
+                managed=False,
                 **kwargs,
             )
         return None
