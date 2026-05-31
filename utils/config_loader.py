@@ -29,8 +29,7 @@ class OptimizerConfig:
 @dataclass
 class SchedulerConfig:
     """学习率调度参数。"""
-    warmup_steps: int = 1000
-    max_steps: int = 100000
+    warmup_ratio: float = 0.02
     min_lr_ratio: float = 0.1
 
 
@@ -50,12 +49,13 @@ class DataConfig:
 @dataclass
 class TrainingConfig:
     """训练循环配置。"""
+    target_tokens: int = 2000000000
     batch_size: int = 8
     gradient_accumulation_steps: int = 4
-    max_steps: int = 100000
     save_interval: int = 5000
     log_interval: int = 10
-    output_dir: str = "./checkpoints"
+    output_dir: str = "./experiments"
+    experiment_name: str = ""
     use_mixed_precision: bool = True
     dtype: str = "bfloat16"
     seed: int = 42
@@ -99,6 +99,25 @@ class PretrainConfig:
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     swanlab: SwanLabLoggingConfig = field(default_factory=SwanLabLoggingConfig)
 
+# ==================== 解析函数 ====================
+def parse_tokens_string(value) -> int:
+    """将 "5.6B", "100M", "1.2T" 等字符串转换为整数 token 数。
+    支持 B (10^9), M (10^6), T (10^12)，忽略大小写。
+    """
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        value = value.strip().upper()
+        if value.endswith('B'):
+            return int(float(value[:-1]) * 1e9)
+        elif value.endswith('M'):
+            return int(float(value[:-1]) * 1e6)
+        elif value.endswith('T'):
+            return int(float(value[:-1]) * 1e12)
+        else:
+            # 纯数字字符串
+            return int(float(value))
+    raise ValueError(f"无法解析 target_tokens: {value}")
 
 # ==================== 加载函数 ====================
 def load_model_config(yaml_path: str) -> ModelConfig:
@@ -131,11 +150,18 @@ def load_pretrain_config(yaml_path: str) -> PretrainConfig:
     optim = OptimizerConfig(**raw.get('optimizer', {}))
     sched = SchedulerConfig(**raw.get('scheduler', {}))
     data = DataConfig(**raw.get('data', {}))
+
     train = TrainingConfig(**raw.get('training', {}))
     train.local_rank = int(os.environ.get('LOCAL_RANK', -1))
+    train_dict = raw.get('training', {}).copy()
+    if 'target_tokens' in train_dict:
+        train_dict['target_tokens'] = parse_tokens_string(train_dict['target_tokens'])
+
     eval_cfg = EvaluatingConfig(**raw.get('evaluating', {}))
     early_stop_cfg = EarlyStoppingConfig(**raw.get('early_stopping', {}))
+
     swanlab_cfg = SwanLabLoggingConfig(**raw.get('swanlab', {}))
+
     return PretrainConfig(
         optimizer=optim,
         scheduler=sched,
