@@ -1,6 +1,5 @@
 pytest_cache/
 .pytest_cache/
 __pycache__/
-logs/
-/checkpoints/
 /swanlogs/
+/experiments/
