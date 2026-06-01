@@ -295,6 +295,7 @@ class ModelFlopsUtilization:
         total_flops: 累计 FLOPs 总量。
         start_time: 训练开始时间戳。
         last_step_time: 上一步更新时间戳。
+        last_mfu_instant: 最近一次瞬时 MFU
     """
 
     def __init__(self, peak_flops: float, log_file: Optional[str] = None):
@@ -314,6 +315,7 @@ class ModelFlopsUtilization:
         if self.log_file:
             import os
             os.makedirs(os.path.dirname(self.log_file) or '.', exist_ok=True)
+        self.last_mfu_instant: float = 0.0
 
     def start(self) -> None:
         """开始计时（在训练循环开始前调用）。"""
@@ -352,6 +354,7 @@ class ModelFlopsUtilization:
             if elapsed > 0:
                 avg_mfu = self.total_flops / (self.peak_flops * elapsed)
                 metrics["mfu_average"] = avg_mfu
+                self.last_mfu_instant = avg_mfu
 
         if self.last_step_time is not None and step > 0:
             step_elapsed = current_time - self.last_step_time
@@ -375,11 +378,13 @@ class ModelFlopsUtilization:
                 - mfu_average: 平均 MFU
                 - total_flops: 累计 FLOPs（TFLOPS）
                 - peak_flops: 理论峰值算力（TFLOPs/秒）
+                - mfu_instant: 上一次瞬时 AVG MFU
         """
         metrics = {
             "mfu_average": 0.0,
             "total_flops": self.total_flops / 1e12,
             "peak_flops": self.peak_flops / 1e12,
+            "mfu_instant": self.last_mfu_instant,
         }
         if self.start_time is not None:
             elapsed = time.time() - self.start_time
@@ -532,24 +537,37 @@ class ValidationMetrics:
     def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
         """计算 next token 预测准确率（argmax 与 label 匹配的比例）。
 
-        注意：labels 中可能包含 -100（忽略的 token），计算时会自动跳过。
+        对于因果语言模型，logits 中位置 i 预测的是下一个 token (i+1)，
+        因此需要将 logits 与 labels 进行 shift 对齐：
+            - shift_logits = logits[:, :-1, :]
+            - shift_labels = labels[:, 1:]
 
         Args:
             logits: 模型输出的 logits，形状 [batch_size, seq_len, vocab_size]。
-            labels: 标签，形状 [batch_size, seq_len]。
+            labels: 标签，形状 [batch_size, seq_len]，其中 -100 表示忽略该位置。
 
         Returns:
-            准确率（0~1 之间）。
+            准确率（0~1 之间的浮点数）。如果没有有效 token，返回 0.0。
         """
         if logits is None or labels is None:
             return 0.0
-        # 取每个位置预测概率最高的 token
-        preds = torch.argmax(logits, dim=-1)  # [batch_size, seq_len]
-        # 创建有效位置掩码（忽略 -100）
-        valid_mask = labels != -100
+
+        # 1. 对齐预测目标：预测下一个 token
+        shift_logits = logits[..., :-1, :].contiguous()  # [b, s-1, v]
+        shift_labels = labels[..., 1:].contiguous()  # [b, s-1]
+
+        # 2. 创建有效位置掩码（忽略 -100）
+        valid_mask = shift_labels != -100
         if not valid_mask.any():
             return 0.0
-        correct = (preds == labels) & valid_mask
+
+        # 3. 取预测概率最高的 token ID
+        preds = torch.argmax(shift_logits, dim=-1)  # [b, s-1]
+
+        # 4. 计算正确预测数
+        correct = (preds == shift_labels) & valid_mask
+
+        # 5. 返回准确率
         accuracy = correct.sum().item() / valid_mask.sum().item()
         return accuracy
 
@@ -582,38 +600,45 @@ class ValidationMetrics:
                           max_length: int = 50, device: torch.device = torch.device("cpu")) -> float:
         """计算空白提示的困惑度（Blank PPL）。
 
-        空白提示可以是空字符串或仅包含起始标记的序列，用于评估模型在没有
-        有用上下文时的“默认”行为。过高的空白 PPL 可能指示模型过度拟合
-        特定模式或训练数据存在偏差。
+        空白提示评估模型在没有有用上下文时的“默认”行为。
+        本方法严格按照原有逻辑实现：
+            - 对空白文本进行编码（添加特殊 token）
+            - 若编码后的序列为空，返回 inf
+            - 否则计算模型在完整序列上的交叉熵损失，并取指数得到困惑度
+
+        注意：原有方法中 max_length 参数未被使用，此处保持原有行为（忽略该参数）。
 
         Args:
             model: 模型实例（已 eval 模式）。
             tokenizer: tokenizer 实例。
             blank_text: 空白提示文本，默认为空字符串。
-            max_length: 生成/评估的最大长度（此处仅计算给定文本的损失）。
-            device: 设备。
+            max_length: 保留参数，原有实现中未使用（为保持接口兼容）。
+            device: 计算设备。
 
         Returns:
-            困惑度值（perplexity）。
+            困惑度值（perplexity）。若损失超过 100，返回 inf 以避免数值溢出。
         """
         model.eval()
-        # 对空白文本进行编码，不添加特殊 token（或根据 tokenizer 习惯）
+        # 编码空白文本，通常会自动添加 BOS/EOS 等特殊 token
         encoding = tokenizer.encode(blank_text, add_special_tokens=True)
         input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=device)
 
-        # 防止空序列导致 reshape 错误
+        # 原有空序列检查：若序列为空，返回 inf
         if input_ids.numel() == 0 or input_ids.size(1) == 0:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning("Blank text tokenized to empty sequence. Returning inf PPL.")
             return float('inf')
 
-        # 标签与输入相同（用于计算交叉熵）
+        # 标签与输入相同（模型内部会自动 shift）
         labels = input_ids.clone()
+
         with torch.no_grad():
             outputs = model(input_ids, labels=labels)
             loss = outputs.loss
-        ppl = math.exp(loss.item()) if loss.item() < 100 else float("inf")
+
+        # 数值稳定性处理：损失过大时返回 inf（原有逻辑）
+        if loss.item() >= 100:
+            return float('inf')
+
+        ppl = math.exp(loss.item())
         return ppl
 
     @staticmethod

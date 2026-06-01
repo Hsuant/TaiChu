@@ -29,8 +29,11 @@ class OptimizerConfig:
 @dataclass
 class SchedulerConfig:
     """学习率调度参数。"""
-    warmup_ratio: float = 0.02
-    min_lr_ratio: float = 0.1
+    warmup_ratio: float = 0.01
+    stable_ratio: float = 0.8
+    max_steps: int = 100000
+    min_lr_ratio: float = 0.0
+    decay_type: str = "cosine"
 
 
 @dataclass

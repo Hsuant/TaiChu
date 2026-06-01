@@ -38,7 +38,7 @@ from tokenizers import Tokenizer
 from typing import List, Optional
 
 from utils.config_loader import load_model_config, load_pretrain_config, parse_tokens_string
-from utils.train_utils import set_seed, get_device, get_cosine_lr_lambda, get_experiment_dir
+from utils.train_utils import set_seed, get_device, get_wsd_lr_lambda, get_experiment_dir
 from utils.logger import LogManager
 from utils.swanlab_logger import SwanLabLogger
 from utils.checkpoint import CheckpointManager
@@ -511,9 +511,11 @@ class TaiChuTrainer:
 
             # ---- 计算准确率 ----
             if logits is not None and isinstance(logits, torch.Tensor):
+                # 直接调用 ValidationMetrics.compute_accuracy，函数内部已完成 shift 对齐
                 acc = ValidationMetrics.compute_accuracy(logits, labels)
-                # 有效 token 数量（忽略 -100）
-                valid_mask = (labels != -100)
+                # 获取该 batch 的有效 token 数量（需使用 shift 后的 labels）
+                shift_labels = labels[..., 1:].contiguous()
+                valid_mask = (shift_labels != -100)
                 valid_count = valid_mask.sum().item()
                 total_accuracy += acc * valid_count
                 total_valid_tokens += valid_count
@@ -670,25 +672,28 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=None, help="覆盖路由 top-k")
 
     # ========== 训练超参数覆盖 ==========
-    parser.add_argument("--target_tokens", type=int, default=None, help="覆盖目标总 token 数")
-    parser.add_argument("--train_batch_size", type=int, default=None, help="覆盖训练阶段批次大小（每卡）")
-    parser.add_argument("--eval_batch_size", type=int, default=None, help="覆盖验证阶段批次大小")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
-    parser.add_argument("--learning_rate", type=float, default=None)
-    parser.add_argument("--warmup_ratio", type=float, default=None, help="覆盖预热步数占总步数的比例")
-    parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--min_lr_ratio", type=float, default=None)
-    parser.add_argument("--use_mixed_precision", action="store_true", default=None)
-    parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"])
-    parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--save_interval", type=int, default=None)
-    parser.add_argument("--eval_interval", type=int, default=None)
-    parser.add_argument("--log_interval", type=int, default=None)
+    parser.add_argument("--target_tokens", type=str, default=None, help="覆盖目标总 token 数，支持数字或带单位的字符串，如 2500000000, '2.5B', '100M', '1.2T'")
+    parser.add_argument("--train_batch_size", type=int, default=None, help="覆盖训练阶段每卡的批次大小（如 8）")
+    parser.add_argument("--eval_batch_size", type=int, default=None, help="覆盖验证阶段的批次大小（如 16）")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="覆盖梯度累积步数，用于模拟更大的全局批次（如 4）")
+    parser.add_argument("--learning_rate", type=float, default=None, help="覆盖峰值学习率（如 3e-4）")
+    parser.add_argument("--warmup_ratio", type=float, default=None, help="覆盖预热步数占总训练步数的比例（如 0.01 表示 1%）")
+    parser.add_argument("--stable_ratio", type=float, default=None, help="覆盖 WSD 调度中恒定阶段占总步数的比例（如 0.8 表示 80%，推荐 0.7~0.8）")
+    parser.add_argument("--weight_decay", type=float, default=None, help="覆盖权重衰减系数（如 0.1）")
+    parser.add_argument("--min_lr_ratio", type=float, default=None, help="覆盖最终学习率相对于峰值学习率的比例（WSD 衰减终点，推荐 0.0）")
+    parser.add_argument("--decay_type", type=str, default=None, choices=["cosine", "linear"], help="覆盖 WSD 衰减阶段的曲线类型：cosine（余弦，推荐）或 linear（线性）")
+    parser.add_argument("--use_mixed_precision", action="store_true", default=None, help="启用混合精度训练（实际生效还依赖 --dtype 参数）")
+    parser.add_argument("--dtype", type=str, default=None, choices=["bfloat16", "float16"], help="混合精度数据类型：bfloat16（推荐 Ampere 及以上 GPU）或 float16")
+    parser.add_argument("--seed", type=int, default=None, help="覆盖随机种子（不同进程会自动偏移）")
+    parser.add_argument("--save_interval", type=int, default=None, help="覆盖常规检查点保存间隔（步数）")
+    parser.add_argument("--eval_interval", type=int, default=None, help="覆盖验证间隔（步数）")
+    parser.add_argument("--log_interval", type=int, default=None, help="覆盖训练日志打印间隔（步数）")
 
     # 早停参数覆盖
-    parser.add_argument("--early_stop_enabled", action="store_true", default=None)
-    parser.add_argument("--early_stop_patience", type=int, default=None)
-    parser.add_argument("--early_stop_min_delta", type=float, default=None)
+    # ========== 早停参数覆盖 ==========
+    parser.add_argument("--early_stop_enabled", action="store_true", default=None, help="启用早停机制（若未指定，则使用配置文件中的值）")
+    parser.add_argument("--early_stop_patience", type=int, default=None, help="早停耐心值，连续无改善的验证次数上限（如 5）")
+    parser.add_argument("--early_stop_min_delta", type=float, default=None, help="判定改善的最小绝对变化量（如 1e-4）")
 
     args = parser.parse_args()
 
@@ -733,8 +738,12 @@ def main() -> None:
         pretrain_cfg.optimizer.weight_decay = args.weight_decay
     if args.warmup_ratio is not None:
         pretrain_cfg.scheduler.warmup_ratio = args.warmup_ratio
+    if args.stable_ratio is not None:
+        pretrain_cfg.scheduler.stable_ratio = args.stable_ratio
     if args.min_lr_ratio is not None:
         pretrain_cfg.scheduler.min_lr_ratio = args.min_lr_ratio
+    if args.decay_type is not None:
+        pretrain_cfg.scheduler.decay_type = args.decay_type
     if args.use_mixed_precision is not None:
         pretrain_cfg.training.use_mixed_precision = args.use_mixed_precision
     if args.dtype is not None:
@@ -866,12 +875,41 @@ def main() -> None:
     log_manager.info(f"动态计算 max_steps = {max_steps}, warmup_steps = {warmup_steps}")
 
     # 12. 学习率调度器（warmup + cosine）
-    lr_lambda = get_cosine_lr_lambda(
+    # 12.1. 读取调度配置
+    warmup_ratio = pretrain_cfg.scheduler.warmup_ratio
+    stable_ratio = getattr(pretrain_cfg.scheduler, 'stable_ratio', 0.0)
+    min_lr_ratio = pretrain_cfg.scheduler.min_lr_ratio
+    decay_type = getattr(pretrain_cfg.scheduler, 'decay_type', 'cosine')
+
+    # 12.2. 计算各阶段步数（与动态 max_steps 保持一致）
+    warmup_steps = max(1, int(max_steps * warmup_ratio))
+    stable_steps = int(max_steps * stable_ratio)
+
+    # 若 warmup + stable 超过总步数，则自动裁剪 stable 阶段
+    if warmup_steps + stable_steps >= max_steps:
+        stable_steps = max(0, max_steps - warmup_steps - 1)  # 至少留 1 步给衰减
+        log_manager.warning(
+            f"warmup_ratio + stable_ratio 超出 1.0，已自动裁剪 stable_steps 为 {stable_steps}"
+        )
+
+    # 12.3. 创建 WSD 学习率 lambda 函数
+    lr_lambda = get_wsd_lr_lambda(
         warmup_steps=warmup_steps,
+        stable_steps=stable_steps,
         max_steps=max_steps,
-        min_lr_ratio=pretrain_cfg.scheduler.min_lr_ratio,
+        min_lr_ratio=min_lr_ratio,
+        decay_type=decay_type,
     )
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # 12.4. 记录调度策略详情
+    log_manager.info(
+        f"WSD 调度: warmup={warmup_steps} 步 ({warmup_ratio:.1%}), "
+        f"stable={stable_steps} 步 ({stable_ratio:.1%}), "
+        f"decay={max_steps - warmup_steps - stable_steps} 步, "
+        f"min_lr_ratio={min_lr_ratio}, decay_type={decay_type}"
+    )
 
     # 13. 混合精度
     use_amp = pretrain_cfg.training.use_mixed_precision and torch.cuda.is_available()

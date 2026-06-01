@@ -9,7 +9,9 @@ optimizer:
 
 scheduler:
   warmup_ratio: 0.01          # 预热步数占总步数的比例（1%）
-  min_lr_ratio: 0.1           # 最终学习率比例
+  stable_ratio: 0.75          # 恒定阶段 80%（WSD 核心）[0.7,0.85]
+  min_lr_ratio: 0.0           # 最终学习率比例,推荐衰减至 0，完全退火
+  decay_type: "cosine"        # 余弦衰减，可选 "linear" "cosine"
 
 data:
   # 训练数据文件列表（支持通配符）
@@ -27,7 +29,7 @@ data:
   num_workers: 2
 
 training:
-  target_tokens: "12B"      # 总训练 token 数（不变量），最优训练 token 数 ≈ 20 × 参数量,1B=10^9, 遵循 Chinchilla 定律
+  target_tokens: "5.2B"      # 总训练 token 数（不变量），最优训练 token 数 ≈ 20 × 参数量,1B=10^9, 遵循 Chinchilla 定律
   batch_size: 1
   gradient_accumulation_steps: 1
   save_interval: 5000

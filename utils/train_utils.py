@@ -131,6 +131,99 @@ def get_cosine_lr_lambda(
         return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
     return lr_lambda
 
+def get_wsd_lr_lambda(
+    warmup_steps: int,
+    stable_steps: int,
+    max_steps: int,
+    min_lr_ratio: float = 0.0,
+    decay_type: str = "cosine",
+) -> Callable[[int], float]:
+    """生成 WSD（预热-恒定-衰减）学习率缩放因子 lambda 函数。
+
+    WSD 调度将训练分为三个阶段：
+    1. 预热阶段：学习率从 0 线性增加到 1.0（相对于峰值学习率）。
+    2. 恒定阶段：学习率保持为 1.0，给予模型充分的探索空间。
+    3. 衰减阶段：学习率从 1.0 平滑衰减至 min_lr_ratio。
+
+    这种设计已被 DeepSeek-V3 等前沿模型验证，能够在稳定阶段
+    维持高学习率跨越鞍点，并在衰减阶段通过极限退火显著降低最终损失。
+
+    Args:
+        warmup_steps: 预热步数，学习率从 0 线性增加至 1.0 所需的步数。
+        stable_steps: 恒定阶段步数，此期间学习率保持 1.0。
+        max_steps: 总训练步数，用于确定衰减阶段的长度。
+        min_lr_ratio: 最终学习率相对于峰值学习率的比例，通常设为 0.0 以实现
+            完全退火，也可以设为一个小值（如 0.05）以防止学习率绝对为零。
+        decay_type: 衰减阶段的衰减方式，目前支持 "cosine"（余弦衰减）与
+            "linear"（线性衰减）。默认为 "cosine"。
+
+    Returns:
+        一个可调用对象，接收当前步数（int），返回学习率缩放因子（float）。
+        缩放因子乘以优化器中的峰值学习率即可得到当前实际学习率。
+
+    Raises:
+        ValueError: 如果 decay_type 不是支持的类型。
+    """
+    # 确保分母不为零，避免除零错误
+    warmup_steps = max(0, warmup_steps)
+    stable_steps = max(0, stable_steps)
+    # 衰减阶段步数：总步数减去预热和恒定阶段步数，至少为 0
+    decay_steps = max(0, max_steps - warmup_steps - stable_steps)
+
+    # 预热阶段结束步数（不含）
+    warmup_end = warmup_steps
+    # 恒定阶段结束步数（不含）
+    stable_end = warmup_steps + stable_steps
+
+    # 根据衰减类型选择衰减计算函数
+    if decay_type == "cosine":
+        def decay_fn(progress: float) -> float:
+            """余弦衰减函数，平滑下降。"""
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+    elif decay_type == "linear":
+        def decay_fn(progress: float) -> float:
+            """线性衰减函数，均匀下降。"""
+            return 1.0 - progress
+    else:
+        raise ValueError(f"不支持的衰减类型: {decay_type}，可选 'cosine' 或 'linear'")
+
+    def lr_lambda(current_step: int) -> float:
+        """根据当前步数计算学习率缩放因子。
+
+        Args:
+            current_step: 当前训练步数，从 0 开始计数。
+
+        Returns:
+            学习率缩放因子，范围在 [min_lr_ratio, 1.0] 之间。
+        """
+        # 转换为浮点数，避免整数运算误差
+        step = float(current_step)
+
+        # 阶段 1：线性预热
+        if step < warmup_end:
+            # 如果预热步数为 0，此分支不会进入，直接跳到恒定阶段
+            return step / max(1.0, float(warmup_steps))
+
+        # 阶段 2：恒定学习率
+        if step < stable_end:
+            return 1.0
+
+        # 阶段 3：学习率衰减
+        # 如果当前步数已经超过总步数，则返回最小学习率（确保不会低于最小值）
+        if step >= max_steps:
+            return min_lr_ratio
+
+        # 衰减进度：0 表示衰减刚开始，1 表示衰减结束
+        progress = (step - float(stable_end)) / max(1.0, float(decay_steps))
+        # 保证 progress 在 [0, 1] 范围内
+        progress = min(max(progress, 0.0), 1.0)
+
+        # 获取衰减系数（范围 0~1）
+        decay_coef = decay_fn(progress)
+        # 缩放到 [min_lr_ratio, 1.0] 区间
+        return min_lr_ratio + (1.0 - min_lr_ratio) * decay_coef
+
+    return lr_lambda
 
 def get_experiment_dir(base_dir: str, experiment_name: str = "", model_name: str = "") -> str:
     """生成唯一的实验目录，若已存在则自动添加后缀 _1, _2...
