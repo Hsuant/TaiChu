@@ -129,15 +129,29 @@ class CausalSelfAttention(nn.Module):
 
         # ========== 5. GQA 扩展：将 K,V 扩展至与 Q 相同头数 ==========
         if self.num_key_value_groups > 1:
-            # 通过 unsqueeze 增加一个维度，然后 expand 复制，最后 reshape 合并到头维度
-            # 步骤：(batch, total_len, num_kv_heads, head_dim)
-            #   -> unsqueeze(3) 得到 (batch, total_len, num_kv_heads, 1, head_dim)
-            #   -> expand 得到 (batch, total_len, num_kv_heads, num_key_value_groups, head_dim)
-            #   -> reshape 得到 (batch, total_len, num_attention_heads, head_dim)
-            k = k.unsqueeze(3).expand(-1, -1, -1, self.num_key_value_groups, -1)
-            k = k.reshape(batch_size, -1, self.num_attention_heads, self.head_dim)
-            v = v.unsqueeze(3).expand(-1, -1, -1, self.num_key_value_groups, -1)
-            v = v.reshape(batch_size, -1, self.num_attention_heads, self.head_dim)
+            # ================================================================
+            #  GQA (分组查询注意力) 扩展：将键（K）和值（V）从较少的头数
+            #  复制到与查询（Q）相同的头数，以便进行多头注意力计算。
+            #
+            #  输入形状：
+            #    k, v: (batch_size, total_len, num_key_value_heads, head_dim)
+            #  输出形状：
+            #    k, v: (batch_size, total_len, num_attention_heads, head_dim)
+            #
+            #  工作原理：
+            #    repeat_interleave 沿指定维度（dim=2，即头维度）按顺序重复
+            #    每个头的数据。例如 num_kv_heads=2，num_key_value_groups=4，
+            #    则每个头会连续重复 4 次，得到 8 个查询头所需的 K/V。
+            #
+            #  后续步骤：
+            #    紧随其后的 transpose(1, 2) 将形状转换为
+            #    (batch_size, num_attention_heads, total_len, head_dim)，
+            #    正好适配 scaled_dot_product_attention 的输入要求。由于
+            #    repeat_interleave 产出的张量已连续，transpose 虽然会改变
+            #    步长，但后续计算仍能高效进行（SDPA 后端会自动处理布局）。
+            # ================================================================
+            k = k.repeat_interleave(self.num_key_value_groups, dim=2)  # 显式复制，无隐式拷贝
+            v = v.repeat_interleave(self.num_key_value_groups, dim=2)
 
         # ========== 6. 转换为 (batch, num_heads, seq_len, head_dim) 以适配 SDPA ==========
         # SDPA 要求输入形状为 (batch, num_heads, seq_len, head_dim)
@@ -172,10 +186,14 @@ class CausalSelfAttention(nn.Module):
                                  device=k.device).unsqueeze(0)   # (1, total_len)
             causal_mask_bool = k_pos > q_pos                     # (seq_len_q, total_len)
 
-            # 转换为加性掩码（0 表示允许，-inf 表示屏蔽）
-            causal_mask = torch.zeros(seq_len_q, total_len,
-                                      device=q.device, dtype=q.dtype)
-            causal_mask.masked_fill_(causal_mask_bool, float("-inf"))
+            # 使用 torch.where 直接生成加性因果掩码：
+            # 当 k_pos > q_pos 时（键位置在查询位置之后）→ 填充 -inf（屏蔽）
+            # 否则 → 填充 0.0（允许关注）
+            causal_mask = torch.where(
+                k_pos > q_pos,
+                torch.tensor(float("-inf"), device=q.device, dtype=q.dtype),
+                torch.tensor(0.0, device=q.device, dtype=q.dtype),
+            )  # 结果形状 (seq_len_q, total_len)
 
             # 将因果掩码与外部掩码（如 padding mask）相加
             # 先将 causal_mask 扩展为 (1, 1, seq_len_q, total_len) 以便广播
