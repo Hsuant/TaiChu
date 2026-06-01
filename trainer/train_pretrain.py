@@ -231,6 +231,7 @@ class TaiChuTrainer:
 
                 # 反向传播
                 self.scaler.scale(loss).backward()
+                torch.compiler.cudagraph_mark_step_begin()
                 accumulated_loss += loss.item() * self.gradient_accumulation_steps   # 恢复原始损失
                 samples_processed += input_ids.size(0)
                 micro_step += 1
@@ -495,63 +496,64 @@ class TaiChuTrainer:
         accum_loss = 0.0
         accum_tokens = 0
 
-        for batch in self.val_loader:
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+        with torch.compiler.set_stance("force_eager"):  # 临时回退到 eager 模式，完全避免 CUDA Graph 问题
+            for batch in self.val_loader:
+                input_ids = batch["input_ids"].to(self.device)
+                labels = batch["labels"].to(self.device)
 
-            with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
-                out = self.model(input_ids, labels=labels)
-                loss = out.loss
-                # 尝试获取 logits（如果模型返回）
-                logits = getattr(out, "logits", None)
+                with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
+                    out = self.model(input_ids, labels=labels)
+                    loss = out.loss
+                    # 尝试获取 logits（如果模型返回）
+                    logits = getattr(out, "logits", None)
 
-            batch_tokens = input_ids.numel()
-            total_loss += loss.item() * batch_tokens
-            total_tokens += batch_tokens
+                batch_tokens = input_ids.numel()
+                total_loss += loss.item() * batch_tokens
+                total_tokens += batch_tokens
 
-            # ---- 计算准确率 ----
-            if logits is not None and isinstance(logits, torch.Tensor):
-                # 直接调用 ValidationMetrics.compute_accuracy，函数内部已完成 shift 对齐
-                acc = ValidationMetrics.compute_accuracy(logits, labels)
-                # 获取该 batch 的有效 token 数量（需使用 shift 后的 labels）
-                shift_labels = labels[..., 1:].contiguous()
-                valid_mask = (shift_labels != -100)
-                valid_count = valid_mask.sum().item()
-                total_accuracy += acc * valid_count
-                total_valid_tokens += valid_count
+                # ---- 计算准确率 ----
+                if logits is not None and isinstance(logits, torch.Tensor):
+                    # 直接调用 ValidationMetrics.compute_accuracy，函数内部已完成 shift 对齐
+                    acc = ValidationMetrics.compute_accuracy(logits, labels)
+                    # 获取该 batch 的有效 token 数量（需使用 shift 后的 labels）
+                    shift_labels = labels[..., 1:].contiguous()
+                    valid_mask = (shift_labels != -100)
+                    valid_count = valid_mask.sum().item()
+                    total_accuracy += acc * valid_count
+                    total_valid_tokens += valid_count
 
-            # ---- 收集每个 token 的损失（用于分位数） ----
-            # 方法：手动计算 per-token cross entropy
-            # 注意：需要将 logits 和 labels 对齐（shift）
-            if logits is not None:
-                # 标准 causal LM 的 shift 操作：预测下一个 token
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                ce_loss = nn.CrossEntropyLoss(reduction='none')
-                token_losses = ce_loss(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1)
-                ).view(shift_labels.size())
-                # 过滤掉标签为 -100 的位置
-                valid_mask_shift = (shift_labels != -100)
-                valid_token_losses = token_losses[valid_mask_shift]
-                if valid_token_losses.numel() > 0:
-                    all_token_losses.append(valid_token_losses.cpu())
+                # ---- 收集每个 token 的损失（用于分位数） ----
+                # 方法：手动计算 per-token cross entropy
+                # 注意：需要将 logits 和 labels 对齐（shift）
+                if logits is not None:
+                    # 标准 causal LM 的 shift 操作：预测下一个 token
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    ce_loss = nn.CrossEntropyLoss(reduction='none')
+                    token_losses = ce_loss(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    ).view(shift_labels.size())
+                    # 过滤掉标签为 -100 的位置
+                    valid_mask_shift = (shift_labels != -100)
+                    valid_token_losses = token_losses[valid_mask_shift]
+                    if valid_token_losses.numel() > 0:
+                        all_token_losses.append(valid_token_losses.cpu())
 
-            # 中间输出（与原有逻辑一致）
-            accum_loss += loss.item() * batch_tokens
-            accum_tokens += batch_tokens
-            batch_cnt += 1
+                # 中间输出（与原有逻辑一致）
+                accum_loss += loss.item() * batch_tokens
+                accum_tokens += batch_tokens
+                batch_cnt += 1
 
-            if self.global_rank == 0 and self.eval_log_interval > 0 and batch_cnt % self.eval_log_interval == 0:
-                local_avg_loss = accum_loss / accum_tokens
-                local_ppl = math.exp(local_avg_loss) if local_avg_loss < 100 else float("inf")
-                self.log_manager.logger.info(
-                    f"[Eval] Step {self.global_step} (batch {batch_cnt}/{len(self.val_loader)}) | "
-                    f"loss={local_avg_loss:.4f} | ppl={local_ppl:.2f}"
-                )
-                accum_loss = 0.0
-                accum_tokens = 0
+                if self.global_rank == 0 and self.eval_log_interval > 0 and batch_cnt % self.eval_log_interval == 0:
+                    local_avg_loss = accum_loss / accum_tokens
+                    local_ppl = math.exp(local_avg_loss) if local_avg_loss < 100 else float("inf")
+                    self.log_manager.logger.info(
+                        f"[Eval] Step {self.global_step} (batch {batch_cnt}/{len(self.val_loader)}) | "
+                        f"loss={local_avg_loss:.4f} | ppl={local_ppl:.2f}"
+                    )
+                    accum_loss = 0.0
+                    accum_tokens = 0
 
         # 分布式聚合
         if self.device.type == 'cuda' and torch.distributed.is_initialized():
@@ -628,26 +630,27 @@ class TaiChuTrainer:
         if self.global_rank == 0 and generate_prompts:
             raw_model = self.model.module if hasattr(self.model, 'module') else self.model
             raw_model.eval() # type: ignore
-            for idx, prompt in enumerate(generate_prompts):
-                encoding = self.tokenizer.encode(prompt, add_special_tokens=False)
-                prompt_ids = encoding.ids
-                input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-                generated_ids = raw_model.generate( # type: ignore
-                    input_ids=input_tensor,
-                    max_new_tokens=num_generate_tokens,
-                    temperature=0.8,
-                    top_k=50,
-                )
-                generated_text = self.tokenizer.decode(generated_ids[0].tolist())
-                self.log_manager.set_step(self.global_step)
-                self.log_manager.log_text(f"generation/prompt_{idx}", generated_text)
-                self.log_manager.info(
-                    f"[生成测试] 提示: {prompt}\n生成结果: {generated_text}\n{'-' * 60}"
-                )
-                if self.swanlab_logger:
-                    self.swanlab_logger.log_text(
-                        f"generation/prompt_{idx}", generated_text, step=self.global_step
+            with torch.compiler.set_stance("force_eager"):
+                for idx, prompt in enumerate(generate_prompts):
+                    encoding = self.tokenizer.encode(prompt, add_special_tokens=False)
+                    prompt_ids = encoding.ids
+                    input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+                    generated_ids = raw_model.generate( # type: ignore
+                        input_ids=input_tensor,
+                        max_new_tokens=num_generate_tokens,
+                        temperature=0.8,
+                        top_k=50,
                     )
+                    generated_text = self.tokenizer.decode(generated_ids[0].tolist())
+                    self.log_manager.set_step(self.global_step)
+                    self.log_manager.log_text(f"generation/prompt_{idx}", generated_text)
+                    self.log_manager.info(
+                        f"[生成测试] 提示: {prompt}\n生成结果: {generated_text}\n{'-' * 60}"
+                    )
+                    if self.swanlab_logger:
+                        self.swanlab_logger.log_text(
+                            f"generation/prompt_{idx}", generated_text, step=self.global_step
+                        )
 
         self.model.train()
         return avg_loss
@@ -655,6 +658,11 @@ class TaiChuTrainer:
 
 def main() -> None:
     """主函数：解析参数、构建配置、启动训练。"""
+    # 设置 CUDA 内存分配策略，减少显存碎片
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    # TF32加速
+    torch.set_float32_matmul_precision('highest')
+
     parser = argparse.ArgumentParser(description="TaiChu 预训练")
     parser.add_argument("--model_config", type=str, required=True, help="模型结构 YAML 配置")
     parser.add_argument("--pretrain_config", type=str, required=True, help="预训练超参 YAML 配置")
@@ -817,6 +825,11 @@ def main() -> None:
 
     if is_main:
         log_manager.info(f"模型配置: {model_cfg.model_name}")
+
+    # 编译模型
+    model = torch.compile(model, dynamic=True, mode="reduce-overhead")
+    if is_main:
+        log_manager.info("已启用 torch.compile 动态编译优化（dynamic=True）")
 
     # 封装 DDP
     if world_size > 1:

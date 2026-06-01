@@ -252,40 +252,42 @@ class TaiChuModel(nn.Module):
         generated = input_ids
         past_key_values = None  # 初始无缓存
 
-        for _ in range(max_new_tokens):
-            # 首次推理输入完整序列，之后只输入最后一个生成的 token
-            if past_key_values is None:
-                cur_input = generated
-            else:
-                cur_input = generated[:, -1:]
+        # 强制使用 eager 模式，确保每次 forward 都不会触发 CUDA Graph 的内存复用冲突
+        with torch.compiler.set_stance("force_eager"):
+            for _ in range(max_new_tokens):
+                # 首次推理输入完整序列，之后只输入最后一个生成的 token
+                if past_key_values is None:
+                    cur_input = generated
+                else:
+                    cur_input = generated[:, -1:]
 
-            # 调用统一 forward，启用缓存
-            output = self.forward(
-                cur_input,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-            logits = output.logits
-            past_key_values = output.past_key_values  # 类型与 past_key_values 一致
+                # 调用统一 forward，启用缓存
+                output = self.forward(
+                    cur_input,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
+                logits = output.logits
+                past_key_values = output.past_key_values  # 类型与 past_key_values 一致
 
-            # 取最后一个位置的 logits（用于预测下一个 token）
-            next_token_logits = logits[:, -1, :] / temperature
+                # 取最后一个位置的 logits（用于预测下一个 token）
+                next_token_logits = logits[:, -1, :] / temperature
 
-            # 可选的 top‑k 过滤
-            if top_k is not None:
-                v, _ = torch.topk(next_token_logits, top_k)
-                next_token_logits[next_token_logits < v[:, [-1]]] = -float("Inf")
+                # 可选的 top‑k 过滤
+                if top_k is not None:
+                    v, _ = torch.topk(next_token_logits, top_k)
+                    next_token_logits[next_token_logits < v[:, [-1]]] = -float("Inf")
 
-            # 计算概率并采样
-            probs = F.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)  # (batch, 1)
+                # 计算概率并采样
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # (batch, 1)
 
-            # 追加到生成序列
-            generated = torch.cat([generated, next_token], dim=-1)
+                # 追加到生成序列
+                generated = torch.cat([generated, next_token], dim=-1)
 
-            # 防止超出最大位置编码长度（通常不会，因为限制了 max_new_tokens）
-            if generated.size(1) > self.config.max_position_embeddings:
-                generated = generated[:, -self.config.max_position_embeddings:]
+                # 防止超出最大位置编码长度（通常不会，因为限制了 max_new_tokens）
+                if generated.size(1) > self.config.max_position_embeddings:
+                    generated = generated[:, -self.config.max_position_embeddings:]
 
         return generated
 
