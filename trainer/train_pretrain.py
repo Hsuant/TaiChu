@@ -881,7 +881,7 @@ def main() -> None:
 
     # 14. 检查点管理器
     checkpoint_manager = CheckpointManager(
-        output_dir=pretrain_cfg.training.output_dir,
+        output_dir=experiment_dir,
         keep_last_n=3,
         best_metric_name="val_loss",
         best_metric_mode="min",
