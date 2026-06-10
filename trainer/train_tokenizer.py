@@ -5,8 +5,8 @@ TaiChu Tokenizer 训练入口脚本。
 然后调用训练主控器完成 Byte-Level BPE 分词器的训练与保存。
 
 使用方法：
-    python /root/work/trainer/train_tokenizer.py --config /root/work//configs/tokenizer_config.yaml
-    python train_tokenizer.py --vocab_size 64000 --data_files data/*.jsonl
+    python -m trainer.train_tokenizer --config ./configs/tokenizer_config.yaml
+    python -m trainer.train_tokenizer --vocab_size 64000 --data_files data/*.jsonl
 
 Author: TaiChu Team
 Version: 2.0.0
@@ -72,16 +72,6 @@ def main() -> None:
         help="训练数据文件路径列表，支持多个文件，用空格分隔"
     )
     parser.add_argument(
-        "--split_chinese",
-        type=lambda x: x.lower() in ("true", "1", "yes"),
-        help="是否拆分连续中文字符为单字（true/false），强烈建议开启以降低内存"
-    )
-    parser.add_argument(
-        "--seg_model",
-        type=str,
-        help="分词模型: mixed, news, default (pkuseg) 或 jieba"
-    )
-    parser.add_argument(
         "--num_workers",
         type=int,
         help="数据预取使用的进程数，0 表示自动选择 CPU 核心数"
@@ -127,14 +117,6 @@ def main() -> None:
     if args.epoch is not None:
         config.setdefault("data", {})["epoch"] = args.epoch
         print(f"[覆盖] epoch = {args.epoch}")
-
-    if args.split_chinese is not None:
-        config.setdefault("data", {})["split_chinese"] = args.split_chinese
-        print(f"[覆盖] split_chinese = {args.split_chinese}")
-
-    if args.seg_model is not None:
-        config.setdefault("data", {})["seg_model"] = args.seg_model
-        print(f"[覆盖] seg_model = {args.seg_model}")
 
     if args.num_workers is not None:
         config.setdefault("data", {})["num_workers"] = args.num_workers
