@@ -12,7 +12,11 @@ tokenizers>=0.15.0           # 底层高性能分词器（文本 → token 转�
 
 # ---------- 中英文混合文本处理 ----------
 jieba>=0.42.1                # 中文分词，准确统计词数（繁殖度计算）
-langdetect>=1.0.9            # 语言检测（可选，供后续多语言分析扩展）
+langdetect>=1.0.9            # 语言检测（供多语言分析扩展）
+levenshtein>=0.27.3          # Levenshtein 编辑距离（与 editdistance 互补）
+opencc-python-reimplemented>=0.1.7  # 繁简中文转换（OpenCC Python 实现）
+pycld2>=0.41                 # 紧凑语言检测库（C++ 实现，比 langdetect 更快）
+simhash>=2.1.2               # SimHash 文本指纹，用于模糊去重与近似重复检测
 
 # ---------- 数据读写与进度显示 ----------
 jsonlines>=3.1.0             # 高效读写 JSONL 文件（评估数据加载）
@@ -31,6 +35,10 @@ tensorboard>=2.13.0          # 训练指标可视化（标量、模型图等）
 matplotlib>=3.7.0            # 绘图库（损失曲线、注意力热力图）
 swanlab>=0.3.0               # 云端实验跟踪与对比（类似 TensorBoard，支持团队协作）
 
+# ---------- 可选：困惑度过滤与语言模型 ----------
+# kenlm 需要从 GitHub 源码安装，不列入标准依赖，请手动执行：
+# pip install https://github.com/kpu/kenlm/archive/master.zip
+# kenlm                     # 高效 n-gram 语言模型，用于文本困惑度（PPL）评估
+
 # ---------- 性能加速（可选） ----------
-# 若需使用 FlashAttention 加速注意力计算，请取消注释并安装对应版本
 # flash-attn>=2.3.0          # 高效注意力实现（需 CUDA 环境，CPU 可忽略）
