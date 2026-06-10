@@ -6,7 +6,7 @@
 """
 
 from tokenizers import Regex
-from tokenizers.normalizers import NFKC, Replace, Strip, Sequence
+from tokenizers.normalizers import NFC, NFKC, Replace, Strip, Sequence
 
 
 class NormalizerFactory:
@@ -16,7 +16,7 @@ class NormalizerFactory:
         normalizer:
           type: "sequence"
           steps:
-            - type: "nfkc"
+            - type: "nfc"
             - type: "replace"
               pattern: "\\s+"
               content: " "
@@ -37,19 +37,28 @@ class NormalizerFactory:
         Raises:
             ValueError: 遇到不支持的类型时抛出。
         """
-        n_type = norm_config.get("type", "nfkc")
+        n_type = norm_config.get("type", "nfc")
 
         if n_type == "none":
             return None
 
+        if n_type == "nfc":
+            # NFC 标准化：只对组合字符进行标准化，不会改变全角/半角属性，
+            # 保留中文标点的语义完整性，是中文及多语言场景的推荐基线。
+            return NFC()
+
         if n_type == "nfkc":
+            # NFKC 会将全角字母数字、标点转换为半角，可能破坏中文书写规范，
+            # 仅当明确需要兼容性规范化（如传统检索）时才使用。
             return NFKC()
 
         if n_type == "sequence":
             steps = []
             for step in norm_config.get("steps", []):
                 s_type = step["type"]
-                if s_type == "nfkc":
+                if s_type == "nfc":
+                    steps.append(NFC())
+                elif s_type == "nfkc":
                     steps.append(NFKC())
                 elif s_type == "replace":
                     pattern = Regex(step["pattern"])
