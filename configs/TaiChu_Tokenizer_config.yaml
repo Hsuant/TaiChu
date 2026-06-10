@@ -15,14 +15,8 @@ data:
   # JSON 对象中存储文本的字段名
   text_key: "text"
 
-  # 是否将连续汉字拆分为单字（强烈建议开启，大幅降低内存且不影响质量）
-  split_chinese: true
-
-  # 中文分词模型（可选 "jieba" 或 pkuseg 的 "mixed"/"news"/"default"）
-  seg_model: "jieba"
-
   # 单条文本的最大字节长度，超过此长度将被截断（防止异常长文本拖慢训练）
-  max_text_length: 2000000  # 2 MB
+  max_text_length: 200000  # 200 KB
 
   # 数据预取使用的进程数（根据 CPU 核心数调整，0 表示自动使用全部核心）
   num_workers: 8
@@ -40,7 +34,7 @@ data:
 normalizer:
   type: "sequence"             # 组合多个规范化步骤
   steps:
-    - type: "nfkc"             # Unicode NFKC 标准化，统一全角/半角、连字等
+    - type: "nfc"              # Unicode NFC 标准化，统一全角/半角、连字等
     - type: "replace"          # 将多个连续空白字符（空格、制表符等）替换为单个空格
       pattern: "\\s+"
       content: " "
@@ -52,21 +46,30 @@ pre_tokenizer:
   add_prefix_space: false      # 不在文本前添加空格
   use_regex: true              # 使用 GPT-2 风格的正则模式进行初始分词
   digit_split: true            # 启用数字拆分
-  max_digit_group: 3           # 最大数字分组（3 位千分位风格）
 
 # ---------------------------- BPE 训练器配置 ----------------------------
 trainer:
   vocab_size: 64000            # 目标词表大小
-  min_frequency: 2             # 最低词频，过滤出现次数低于该值的 token（减少噪声）
+  min_frequency: 3             # 最低词频，过滤出现次数低于该值的 token（减少噪声）
   show_progress: true          # 显示训练进度条
   # 特殊 token 列表：这些 token 会被直接加入词表，且不会被 BPE 拆分
   special_tokens:
+    - "<unk>"                  # 未登录词标记
     - "<|endoftext|>"          # 文档结束标记
     - "<|im_start|>"           # 消息起始
     - "<|im_end|>"             # 消息结束（同时复用为 pad_token）
     - "<|think|>"              # 思考内容开始
     - "<|/think|>"             # 思考内容结束
-    - "<unk>"                  # 未登录词标记
+
+# ---------------------------- 模型元信息 ----------------------------
+# 该节不会被 tokenizer 训练过程使用，但会被写入 tokenizer_config.json中，作为词表/分词器的元数据，供下游识别、版本追踪和溯源。
+model_meta:
+  name: "TaiChu-0.3B"            # 模型名称，通常与对应的 LLM 名称保持一致，便于关联。
+  version: "1.0.0"               # 分词器版本号。当词表或配置更新时，可递增版本号以区分。
+  author: "Hsuan Tong"           # 作者或团队名称，用于标明所有权或贡献者。
+  license: "Apache 2.0"          # 许可证类型，明确使用和分发权限。
+  description: "Tokenizer for TaiChu large language model" # 简短描述，说明该分词器的用途。
+  contact: "hsuantx@163.com"
 
 # ---------------------------- Chat Template（Jinja2） ----------------------------
 # 模板功能概述
