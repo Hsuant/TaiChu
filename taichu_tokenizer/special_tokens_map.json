@@ -4,8 +4,8 @@
     "unk_token": "<unk>",
     "pad_token": "<|im_end|>",
     "additional_special_tokens": [
+        "<|endoftext|>",
         "<|think|>",
-        "<|/think|>",
-        "<|endoftext|>"
+        "<|/think|>"
     ]
 }
