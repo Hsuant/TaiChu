@@ -32,30 +32,28 @@ class PreTokenizerFactory:
         if p_type == "bytelevel":
             # 获取数字拆分配置
             digit_split = pre_tokenizer_config.get("digit_split", False)
-            max_digit_group = pre_tokenizer_config.get("max_digit_group", 3)
+            punctuation_split = pre_tokenizer_config.get("punctuation_split", False)
 
             # 构建预分词步骤序列
             steps = []
 
             # 步骤 1：数字拆分（可选）
             if digit_split:
-                # Llama 3 风格的 R2L 数字拆分正则，增加负向后顾提高鲁棒性
-                # 匹配 1-3 位数字，从右向左分组（R2L: Right-to-Left）
-                # 这确保数字进位边界正确，对于算术推理至关重要
-                # 确保数字前面不是点、斜线、冒号、连字符、字母，
-                # 以避免拆分 IP 地址 (192.168.1.1)、版本号 (v1.2.3)、日期 (2025-01-01) 等。
-                # 负向后顾 (?<![.\/\-:a-zA-Z]) 表示前面不能是 . / - : 字母
-                # 注意：仍可能拆分某些边界情况，但已显著降低误拆分率。
-                # 参考：Llama 3 tokenizer 的 r"\d{1,3}(?=(\d{3})*\b)"
-                digit_pattern = rf"(?<![.\/\-:a-zA-Z])\d{{1,{max_digit_group}}}(?=(\d{{{max_digit_group}}})*\b)"
+                # 安全前缀：防止拆分 IP 地址、日期、版本号等含分隔符的数字串
+                safe_prefix = r"(?<![.\/\-:a-zA-Z])"
+                # 零宽位置拆分正则：
+                #   (?<=\d)          当前位置左边必须是数字
+                #   (?=(\d{3})+(?!\d)) 当前位置右边必须是3的倍数个连续数字，且之后不是数字
+                # 这样匹配的是“内部插入点”，通过 REMOVED 行为直接分割，
+                # 不会引入额外 token，实现了 R2L 的千分位分组。
+                digit_pattern = safe_prefix + r"(?<=\d)(?=(\d{3})+(?!\d))"
                 steps.append(
                     Split(
                         pattern=Regex(digit_pattern),
-                        behavior=SplitDelimiterBehavior.ISOLATED,
+                        behavior=SplitDelimiterBehavior.REMOVED,
                         invert=False
                     )
                 )
-                print(f"已启用数字拆分（R2L），最大分组: {max_digit_group} 位")
 
             # 步骤 2：ByteLevel 预分词
             steps.append(
