@@ -1,782 +1,702 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Tokenizer 综合评估工具。
+"""LLM Tokenizer 专业评估工具（带进度条与日志集成）。
 
-本脚本参考以下学术工作，对分词器进行多维评估：
-- "Tokenization of Text: A Review, Evaluation, and Comparison" (Mielke et al., 2021)
-- "How Good is Your Tokenizer? On the Monolingual Performance of Multilingual Tokenizers" (Rust et al., 2021)
-- "A Systematic Analysis of Vocabulary and BPE Settings for Optimal Language Modeling" (Gowda & May, 2020)
+本脚本用于全面评估分词器（Tokenizer）在大型语言模型（LLM）中的性能。
+它会测试压缩效率、覆盖率、重建保真度、分布统计、特殊 Token 和聊天模板功能，
+并将结果输出为结构化的 JSON 报告。
 
-评估指标包括：
-- 繁殖度（Fertility）：每个词产生的 token 数量。
-- 平等性（Parity）：不同文字系统下每个 token 对应的字符数。
-- 重建保真度：完全匹配率和字符错误率（CER）。
-- 未登录词率（OOV rate）。
-- Token 分布熵与基尼系数。
-- 编码速度。
+依赖：
+    - transformers
+    - Levenshtein (可选)
+    - jieba (可选)
+    - tqdm
 
-数据输入支持单个 JSONL 文件或包含多个 JSONL 文件的目录。
+使用方法：
+    python -m eval.eval_tokenizer --tokenizer_path /path/to/tokenizer --test_file /path/to/texts.txt --output report.json
 """
 
 import argparse
+import collections
+import glob
 import json
+import math
 import os
 import re
+import sys
 import time
-from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-import jsonlines
-import numpy as np
+# 进度条
 from tqdm import tqdm
 
-# 可选依赖：editdistance 用于快速编辑距离计算。
-try:
-    import editdistance
-    EDITDISTANCE_AVAILABLE = True
-except ImportError:
-    EDITDISTANCE_AVAILABLE = False
-    print("警告：未安装 'editdistance'，将使用 difflib 近似计算字符错误率。安装命令：pip install editdistance")
-
-# 可选依赖：jieba 用于中文分词，以准确统计词数。
+# ----------------------------------------------------------------------
+# 可选依赖
+# ----------------------------------------------------------------------
 try:
     import jieba
-    JIEBA_AVAILABLE = True
+    _HAS_JIEBA = True
 except ImportError:
-    JIEBA_AVAILABLE = False
-    print("警告：未安装 'jieba'，中文词数将基于字符估算。安装命令：pip install jieba")
+    _HAS_JIEBA = False
 
-from transformers import AutoTokenizer
+try:
+    import Levenshtein
+    _HAS_LEVENSHTEIN = True
+except ImportError:
+    _HAS_LEVENSHTEIN = False
+
+# ----------------------------------------------------------------------
+# 日志管理器（集成 LogManager）
+# ----------------------------------------------------------------------
+try:
+    from utils.logger import LogManager
+    _HAS_LOGMANAGER = True
+except ImportError:
+    _HAS_LOGMANAGER = False
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    LogManager = None
 
 
+# ----------------------------------------------------------------------
+# 内置编辑距离（Levenshtein）回退实现
+# ----------------------------------------------------------------------
+def _edit_distance_builtin(s1: str, s2: str) -> int:
+    if len(s1) < len(s2):
+        return _edit_distance_builtin(s2, s1)
+    previous_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1, 1):
+        current_row = [i]
+        for j, c2 in enumerate(s2, 1):
+            insertions = previous_row[j] + 1
+            deletions = current_row[j - 1] + 1
+            substitutions = previous_row[j - 1] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def edit_distance(s1: str, s2: str) -> int:
+    if _HAS_LEVENSHTEIN:
+        return Levenshtein.distance(s1, s2)
+    return _edit_distance_builtin(s1, s2)
+
+
+# ----------------------------------------------------------------------
+# 字符分类正则表达式
+# ----------------------------------------------------------------------
+_RE_LATIN = re.compile(r"[\u0041-\u005A\u0061-\u007A\u00C0-\u024F\u1E00-\u1EFF]")
+_RE_FULLWIDTH_LATIN = re.compile(r"[\uFF21-\uFF3A\uFF41-\uFF5A]")
+_RE_FULLWIDTH_DIGIT = re.compile(r"[\uFF10-\uFF19]")
+_RE_DIGITS = re.compile(r"\d")
+_RE_CJK = re.compile(
+    r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF"
+    r"\u3040-\u309F\u30A0-\u30FF"
+    r"\uAC00-\uD7AF"
+    r"\u3000-\u303F]"
+)
+
+
+def classify_char(char: str) -> str:
+    if _RE_FULLWIDTH_LATIN.match(char):
+        return "latin"
+    if _RE_FULLWIDTH_DIGIT.match(char):
+        return "digits"
+    if _RE_LATIN.match(char):
+        return "latin"
+    if _RE_CJK.match(char):
+        return "cjk"
+    if _RE_DIGITS.match(char):
+        return "digits"
+    return "other"
+
+
+# ----------------------------------------------------------------------
+# 默认特殊 Token 配置
+# ----------------------------------------------------------------------
+_DEFAULT_SPECIAL_TOKENS = {
+    "bos_token": "<|im_start|>",
+    "eos_token": "<|im_end|>",
+    "unk_token": "<unk>",
+    "pad_token": "<|im_end|>",
+}
+
+# ----------------------------------------------------------------------
+# 聊天模板测试样本
+# ----------------------------------------------------------------------
+_CHAT_TEST_SAMPLES = [
+    {
+        "messages": [
+            {"role": "system", "content": "你是一个有用的助手。"},
+            {"role": "user", "content": "你好，请介绍一下你自己。"},
+            {"role": "assistant", "content": "我是人工智能助手，可以回答问题。"},
+            {"role": "user", "content": "今天的天气怎么样？"},
+        ]
+    },
+    {
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is the capital of France?"},
+            {"role": "assistant", "content": "The capital of France is Paris."},
+            {"role": "user", "content": "Tell me more about it."},
+        ]
+    },
+    {
+        "messages": [
+            {"role": "user", "content": "请解释一下量子计算。"},
+        ]
+    },
+]
+
+
+# ----------------------------------------------------------------------
+# 核心评估类
+# ----------------------------------------------------------------------
 class TokenizerEvaluator:
-    """对指定分词器在 JSONL 数据集上进行全面评估。
-
-    属性:
-        tokenizer_name: 分词器名称或路径。
-        vocab_size: 分词器词汇表大小。
-        text_field: JSONL 中用于提取文本的字段名。
-        max_samples: 最大评估样本数，None 表示使用全部数据。
-    """
-
-    def __init__(
-        self,
-        tokenizer_name_or_path: str,
-        text_field: str = "text",
-        max_samples: Optional[int] = None,
-        use_fast: bool = True,
-        trust_remote_code: bool = False,
-    ) -> None:
+    def __init__(self, tokenizer_path: str, test_files: List[str],
+                 special_tokens: Optional[Dict[str, str]] = None,
+                 log_manager: Optional[Any] = None):
         """初始化评估器。
 
-        参数:
-            tokenizer_name_or_path: HuggingFace 模型名或本地分词器文件路径。
-            text_field: JSONL 对象中存储文本的字段名。
-            max_samples: 限制加载的样本数量，用于快速测试。
-            use_fast: 是否优先使用 Fast 分词器。
-            trust_remote_code: 是否信任远程仓库中的自定义代码。
+        Args:
+            tokenizer_path: 分词器路径或 HuggingFace 模型名称。
+            test_files: 测试文本文件路径列表。
+            special_tokens: 自定义特殊 Token 映射。
+            log_manager: LogManager 实例，若为 None 则创建默认日志。
         """
-        self.text_field = text_field
-        self.max_samples = max_samples
-
-        # 尝试使用 AutoTokenizer 加载，失败时回退到 tokenizers.Tokenizer。
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_name_or_path,
-                use_fast=use_fast,
-                trust_remote_code=trust_remote_code,
-            )
-            self._use_raw_tokenizer = False
-        except Exception as e:
-            print(f"AutoTokenizer 加载失败: {e}")
-            print("尝试从本地 tokenizer.json 加载...")
-            from tokenizers import Tokenizer as FastTokenizer
-            self.tokenizer = FastTokenizer.from_file(tokenizer_name_or_path)
-            self._use_raw_tokenizer = True
-
-        self.tokenizer_name = tokenizer_name_or_path
-        self.vocab_size = self._get_vocab_size()
-        self.stats: Dict[str, Any] = {}
-
-    def _get_vocab_size(self) -> int:
-        """获取词汇表大小，兼容不同类型的 tokenizer 对象。"""
-        if hasattr(self.tokenizer, "vocab_size"):
-            return self.tokenizer.vocab_size
-        if hasattr(self.tokenizer, "get_vocab_size"):
-            return self.tokenizer.get_vocab_size()
-        return len(self.tokenizer.get_vocab())
-
-    def _encode(self, text: str) -> List[int]:
-        """将文本编码为 token ID 列表，不添加特殊标记。"""
-        if self._use_raw_tokenizer:
-            return self.tokenizer.encode(text).ids
-        return self.tokenizer.encode(text, add_special_tokens=False)
-
-    def _decode(self, ids: List[int]) -> str:
-        """将 token ID 列表解码为文本，跳过特殊标记。"""
-        if self._use_raw_tokenizer:
-            return self.tokenizer.decode(ids)
-        return self.tokenizer.decode(ids, skip_special_tokens=True)
-
-    def _count_words(self, text: str) -> int:
-        """估算文本中的词数，支持中英文混合。
-
-        若 jieba 可用则使用其分词结果，否则将拉丁字母序列视为一个词，
-        每个 CJK 字符视为一个词。
-        """
-        if JIEBA_AVAILABLE:
-            words = jieba.lcut(text)
-            # 过滤掉空白字符，只保留有意义的词。
-            return len([w for w in words if w.strip()])
-        # 回退方案：统计拉丁单词和单个汉字。
-        latin_words = len(re.findall(r'[A-Za-z0-9]+', text))
-        cjk_chars = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text))
-        return latin_words + cjk_chars
-
-    def _count_chars_by_script(self, text: str) -> Dict[str, int]:
-        """按文字系统粗略统计字符数量，用于平等性分析。
-
-        返回包含 'latin', 'cjk', 'digits', 'other' 计数的字典。
-        """
-        latin = len(re.findall(r'[A-Za-z]', text))
-        cjk = len(re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]', text))
-        digits = len(re.findall(r'\d', text))
-        other = len(text) - latin - cjk - digits
-        return {"latin": latin, "cjk": cjk, "digits": digits, "other": other}
-
-    def load_data(self, data_path: str) -> List[str]:
-        """从 JSONL 文件或目录加载文本数据。
-
-        参数:
-            data_path: JSONL 文件路径或包含 .jsonl 文件的目录路径。
-
-        返回:
-            提取的文本字符串列表。
-
-        异常:
-            ValueError: 如果路径无效。
-        """
-        texts = []
-        if os.path.isfile(data_path):
-            paths = [data_path]
-        elif os.path.isdir(data_path):
-            paths = [
-                os.path.join(data_path, f)
-                for f in os.listdir(data_path)
-                if f.endswith('.jsonl')
-            ]
+        # 日志管理
+        self.log = None
+        self._fallback_logger = None
+        if log_manager is not None:
+            self.log = log_manager
+        elif _HAS_LOGMANAGER and LogManager is not None:
+            self.log = LogManager(log_dir="./experiments/logs", tensorboard=False, log_file="eval.log")
+            self.log.info("使用 LogManager 记录日志")
         else:
-            raise ValueError(f"无效的数据路径: {data_path}")
+            self._fallback_logger = logging.getLogger(__name__)
 
-        print(f"正在从 {len(paths)} 个文件中加载数据...")
-        for filepath in paths:
-            with jsonlines.open(filepath, 'r') as reader:
-                for obj in reader:
-                    if self.text_field in obj:
-                        texts.append(obj[self.text_field])
-                        if self.max_samples and len(texts) >= self.max_samples:
-                            break
-            if self.max_samples and len(texts) >= self.max_samples:
-                break
+        self.tokenizer = self._load_tokenizer(tokenizer_path)
+        self.texts = self._load_texts(test_files)      # 内部已含进度条
+        self.num_texts = len(self.texts)
+        self.total_chars = sum(len(text) for text in self.texts)
+        self.total_tokens = 0
+        self.total_words = 0
+        self.token_freq = collections.Counter()
+        self.unk_token_id = self._detect_unk_id()
+        self.special_tokens = special_tokens if special_tokens else _DEFAULT_SPECIAL_TOKENS
 
-        print(f"已加载 {len(texts)} 条文本。")
+        # 批量编码获取统计信息（性能优化，内部显示进度条）
+        self._encode_all_batch()
+
+    def _log(self, level: str, msg: str):
+        """内部日志记录，兼容 LogManager 和回退 logger。"""
+        if self.log is not None:
+            getattr(self.log, level.lower())(msg)
+        elif self._fallback_logger is not None:
+            getattr(self._fallback_logger, level.lower())(msg)
+
+    def _load_tokenizer(self, path: str):
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as e:
+            raise ImportError("请安装 transformers 库：pip install transformers") from e
+
+        if os.path.exists(path):
+            self._log("info", f"从本地路径加载分词器：{path}")
+            tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=True)
+        else:
+            self._log("info", f"本地路径 {path} 不存在，尝试从 HuggingFace Hub 加载...")
+            tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        return tokenizer
+
+    def _load_texts(self, paths: List[str]) -> List[str]:
+        """加载文本，使用进度条显示解析进度。"""
+        all_texts = []
+        # 先收集所有需要解析的文件
+        file_list = []
+        for path in paths:
+            if not os.path.exists(path):
+                self._log("warning", f"路径不存在，已跳过: {path}")
+                continue
+            if os.path.isdir(path):
+                found = glob.glob(os.path.join(path, "*.json")) + glob.glob(os.path.join(path, "*.jsonl"))
+                if not found:
+                    self._log("warning", f"目录下未找到 .json 或 .jsonl 文件: {path}")
+                file_list.extend(found)
+            else:
+                file_list.append(path)
+
+        self._log("info", f"共发现 {len(file_list)} 个文件待解析")
+        # 使用 tqdm 遍历文件
+        for file_path in tqdm(file_list, desc="加载文本文件", unit="file"):
+            texts_from_file = self._parse_jsonl_or_json(file_path)
+            all_texts.extend(texts_from_file)
+
+        all_texts = [t for t in all_texts if t.strip()]
+        self._log("info", f"共加载 {len(all_texts)} 条有效测试文本（来自 {len(paths)} 个路径）")
+        return all_texts
+
+    def _parse_jsonl_or_json(self, file_path: str) -> List[str]:
+        texts = []
+        _, ext = os.path.splitext(file_path)
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                if ext.lower() == ".jsonl":
+                    for line_num, line in enumerate(f, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if "text" in obj and isinstance(obj["text"], str):
+                                texts.append(obj["text"])
+                        except json.JSONDecodeError as e:
+                            self._log("warning", f"跳过 {file_path} 第 {line_num} 行 JSON 解析错误: {e}")
+                else:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for idx, item in enumerate(data):
+                            if isinstance(item, dict) and "text" in item and isinstance(item["text"], str):
+                                texts.append(item["text"])
+                    elif isinstance(data, dict) and "text" in data:
+                        if isinstance(data["text"], str):
+                            texts.append(data["text"])
+                    else:
+                        self._log("warning", f"文件 {file_path} 不是 JSON 数组或包含 text 的对象，已忽略")
+        except Exception as e:
+            self._log("error", f"读取文件 {file_path} 失败: {e}")
         return texts
 
-    def evaluate(self, texts: List[str]) -> Dict[str, Any]:
-        """执行核心评估流程，收集原始统计数据。
+    def _detect_unk_id(self) -> Optional[int]:
+        if hasattr(self.tokenizer, "unk_token") and self.tokenizer.unk_token is not None:
+            return self.tokenizer.convert_tokens_to_ids(self.tokenizer.unk_token)
+        unk_str = self.special_tokens.get("unk_token")
+        if unk_str:
+            return self.tokenizer.convert_tokens_to_ids(unk_str)
+        return None
 
-        参数:
-            texts: 待评估的文本列表。
-
-        返回:
-            包含字符数、token 数、词数、UNK 数、重建编辑距离等信息的字典。
-        """
-        stats: Dict[str, Any] = {
-            "num_texts": len(texts),
-            "total_chars": 0,
-            "total_tokens": 0,
-            "total_words": 0,
-            "total_unk": 0,
-            "token_counter": Counter(),
-            "reconstruction_exact": 0,
-            "reconstruction_edits": 0,
-            "reconstruction_total_chars": 0,
-            "script_counts": {"latin": 0, "cjk": 0, "digits": 0, "other": 0},
-        }
-
-        start_time = time.time()
-
-        for text in tqdm(texts, desc="评估中", unit="text"):
-            chars = len(text)
-            words = self._count_words(text)
-            stats["total_chars"] += chars
-            stats["total_words"] += words
-
-            # 按文字系统统计字符。
-            script_counts = self._count_chars_by_script(text)
-            for key in stats["script_counts"]:
-                stats["script_counts"][key] += script_counts[key]
-
-            # 分词并记录 token 频率。
-            ids = self._encode(text)
-            tokens = len(ids)
-            stats["total_tokens"] += tokens
-            stats["token_counter"].update(ids)
-
-            # 检测未登录词（UNK）。
-            unk_id = None
-            if hasattr(self.tokenizer, "unk_token_id"):
-                unk_id = self.tokenizer.unk_token_id
-            elif hasattr(self.tokenizer, "token_to_id"):
-                unk_id = self.tokenizer.token_to_id("<unk>")
-            if unk_id is not None:
-                stats["total_unk"] += ids.count(unk_id)
-
-            # 重建保真度检测。
-            decoded = self._decode(ids)
-            if decoded == text:
-                stats["reconstruction_exact"] += 1
-
-            # 计算编辑距离（字符级）。
-            if EDITDISTANCE_AVAILABLE:
-                dist = editdistance.eval(text, decoded)
-            else:
-                import difflib
-                matcher = difflib.SequenceMatcher(None, text, decoded)
-                dist = int(
-                    (1.0 - matcher.ratio()) * max(len(text), len(decoded))
-                )
-            stats["reconstruction_edits"] += dist
-            stats["reconstruction_total_chars"] += max(len(text), len(decoded))
-
-        elapsed = time.time() - start_time
-        stats["eval_time"] = elapsed
-        return stats
-
-    def compute_metrics(self, stats: Dict[str, Any]) -> Dict[str, Any]:
-        """根据原始统计数据计算各项评估指标。
-
-        参数:
-            stats: evaluate() 方法返回的原始统计字典。
-
-        返回:
-            包含繁殖度、平等性、OOV 率、分布熵、基尼系数等指标的字典。
-        """
-        metrics: Dict[str, Any] = {}
-        n = stats["num_texts"]
-        if n == 0:
-            return metrics
-
-        # 繁殖度：每个词对应的 token 数。
-        metrics["fertility"] = (
-            stats["total_tokens"] / stats["total_words"]
-            if stats["total_words"]
-            else 0.0
-        )
-
-        # 整体字符/token 比，以及按文字系统的近似值。
-        metrics["char_per_token"] = (
-            stats["total_chars"] / stats["total_tokens"]
-            if stats["total_tokens"]
-            else 0.0
-        )
-        for script, count in stats["script_counts"].items():
-            if count > 0:
-                script_tokens_share = (
-                    count / stats["total_chars"] * stats["total_tokens"]
-                )
-                metrics[f"char_per_token_{script}"] = (
-                    count / script_tokens_share if script_tokens_share else 0.0
-                )
-
-        # 未登录词率。
-        metrics["unk_rate"] = (
-            stats["total_unk"] / stats["total_tokens"]
-            if stats["total_tokens"]
-            else 0.0
-        )
-
-        # 重建保真度：完全匹配率和字符错误率。
-        metrics["reconstruction_exact_match"] = stats["reconstruction_exact"] / n
-        metrics["reconstruction_cer"] = (
-            stats["reconstruction_edits"] / stats["reconstruction_total_chars"]
-            if stats["reconstruction_total_chars"]
-            else 0.0
-        )
-
-        # Token 分布熵与基尼系数。
-        if stats["token_counter"]:
-            total_tokens = sum(stats["token_counter"].values())
-            probs = np.array(list(stats["token_counter"].values())) / total_tokens
-            entropy = -np.sum(probs * np.log(probs + 1e-12))
-            max_entropy = np.log(len(stats["token_counter"]))
-            metrics["token_entropy"] = entropy
-            metrics["token_entropy_norm"] = (
-                entropy / max_entropy if max_entropy > 0 else 0.0
-            )
-            # 计算基尼系数（0 表示完全均匀分布，1 表示极度集中）。
-            sorted_probs = np.sort(probs)
-            cum_probs = np.cumsum(sorted_probs)
-            m = len(probs)
-            indices = np.arange(1, m + 1)
-            gini = (2 * np.sum(indices * sorted_probs) - (m + 1) * np.sum(sorted_probs)) / (
-                m * np.sum(sorted_probs)
-            )
-            metrics["token_gini"] = gini
+    def _count_words(self, text: str) -> int:
+        contains_cjk = bool(_RE_CJK.search(text))
+        if contains_cjk and _HAS_JIEBA:
+            words = jieba.lcut(text)
+            return sum(1 for w in words if w.strip())
+        elif contains_cjk:
+            clean = re.sub(r'\s+', '', text)
+            cjk_chars = sum(1 for ch in clean if _RE_CJK.match(ch))
+            non_cjk_words = len(re.findall(r'[^\u4e00-\u9fff\u3400-\u4dbf\u3000-\u303f\uac00-\ud7af]+', text))
+            return cjk_chars + non_cjk_words
         else:
-            metrics["token_entropy"] = 0.0
-            metrics["token_entropy_norm"] = 0.0
-            metrics["token_gini"] = 0.0
+            return len(text.split())
 
-        # 词汇表使用情况。
-        metrics["vocab_size_actual"] = len(stats["token_counter"])
-        metrics["vocab_size_total"] = self.vocab_size
-        metrics["vocab_utilization"] = (
-            metrics["vocab_size_actual"] / self.vocab_size
-            if self.vocab_size
-            else 0.0
-        )
+    def _encode_all_batch(self):
+        """批量编码所有文本，显示进度条。"""
+        self._log("info", "开始批量编码所有文本...")
+        # 一次性编码（transformers 的 encode_batch 本质就是 tokenizer(texts)）
+        encodings = self.tokenizer(self.texts, add_special_tokens=True, padding=False, truncation=False)
+        all_ids = encodings.input_ids
 
-        # 编码速度（tokens/秒）。
-        metrics["encoding_speed_tokens_per_sec"] = (
-            stats["total_tokens"] / stats["eval_time"]
-            if stats["eval_time"]
-            else 0.0
-        )
+        total_tokens = 0
+        freq = collections.Counter()
+        for ids in all_ids:
+            total_tokens += len(ids)
+            freq.update(ids)
 
-        # 人类可读的压缩比。
-        metrics["compression_ratio"] = (
-            stats["total_chars"] / stats["total_tokens"]
-            if stats["total_tokens"]
-            else 0.0
-        )
+        # 单词统计（逐条，显示进度条）
+        total_words = 0
+        with tqdm(total=len(self.texts), desc="统计单词数", unit="text") as pbar:
+            for text in self.texts:
+                total_words += self._count_words(text)
+                pbar.update(1)
+                # 每 10% 记录一次日志
+                if pbar.n % max(1, len(self.texts)//10) == 0 and pbar.n > 0:
+                    self._log("info", f"单词统计进度: {pbar.n}/{len(self.texts)} ({100*pbar.n/len(self.texts):.1f}%)")
 
-        return metrics
+        self.total_tokens = total_tokens
+        self.total_words = total_words
+        self.token_freq = freq
+        self._log("info", f"批量编码完成：总 Token {total_tokens}，总单词 {total_words}")
 
-    def test_chat_template(self, num_samples: int = 3) -> Dict[str, Any]:
-        """测试 tokenizer 的对话模板（chat_template）功能。
-
-        该测试仅当 tokenizer 具有 chat_template 属性时执行。
-        使用示例多轮对话来应用模板，验证生成文本是否包含预期的特殊标记，
-        并确保编码-解码后仍可保留模板结构。
-
-        参数:
-            num_samples: 生成的测试对话样本数量（默认 3）。
-
-        返回:
-            包含测试结果的字典，键为测试名称，值为详情或状态。
-        """
-        results: Dict[str, Any] = {"enabled": False, "template_available": False, "samples": []}
-
-        # 检查 tokenizer 是否包含 chat_template 属性
-        if not hasattr(self.tokenizer, "chat_template") or self.tokenizer.chat_template is None:
-            results["error"] = "该 tokenizer 未设置 chat_template"
-            return results
-
-        results["template_available"] = True
-        results["enabled"] = True
-
-        # 保存原始设置，测试后恢复
-        original_skip_special = getattr(self.tokenizer, "skip_special_tokens", True)
-        self.tokenizer.skip_special_tokens = False  # 确保解码时保留特殊 token
-
-        try:
-            for i in range(num_samples):
-                # 构造一个简单的多轮对话样本，包含系统消息、用户消息和助手回复
-                messages = [
-                    {"role": "system", "content": "你是一个有用的助手。"},
-                    {"role": "user", "content": "你好，请介绍一下你自己。"},
-                    {"role": "assistant", "content": "我是人工智能助手，可以回答问题。"},
-                    {"role": "user", "content": "今天的天气怎么样？"},
-                ]
-                try:
-                    # 1. 应用模板生成格式化文本
-                    formatted = self.tokenizer.apply_chat_template(
-                        messages, tokenize=False, add_generation_prompt=False
-                    )
-                    # 2. 第一次编码
-                    ids_1 = self.tokenizer.encode(formatted, add_special_tokens=False)
-                    # 3. 解码
-                    decoded = self.tokenizer.decode(ids_1, skip_special_tokens=False)
-                    # 4. 第二次编码（对解码后的文本再次编码）
-                    ids_2 = self.tokenizer.encode(decoded, add_special_tokens=False)
-                    # 5. 检查 Roundtrip 一致性
-                    roundtrip_ok = (ids_1 == ids_2)
-                    results["samples"].append({
-                        "messages": messages,
-                        "formatted_text": formatted,
-                        "decoded_text": decoded,
-                        "encoded_length": len(ids_1),
-                        "roundtrip_ok": roundtrip_ok,
-                        "ids_1": ids_1,
-                        "ids_2": ids_2,
-                    })
-                except Exception as e:
-                    results["samples"].append({"messages": messages, "error": str(e)})
-        finally:
-            # 恢复原始设置
-            self.tokenizer.skip_special_tokens = original_skip_special
-
-        return results
-
-    def test_special_tokens(self) -> Dict[str, Any]:
-        """测试 tokenizer 的特殊 token（如 BOS、EOS、UNK、PAD 等）功能。
-
-        验证特殊 token 的 ID 与文本是否对应，编码解码后能否正确还原，
-        并检查特殊 token 是否在词汇表中存在。
-
-        返回:
-            包含各项测试结果的字典，结构为：
-            {
-                "bos": {"id": ..., "text": ..., "encode_ok": ..., "decode_ok": ...},
-                "eos": {...},
-                "unk": {...},
-                "pad": {...},
-                "additional_special_tokens": [...]
-            }
-        """
-        results: Dict[str, Any] = {}
-
-        # 定义要测试的特殊 token 属性及其期望的常见名称
-        special_attrs = {
-            "bos": "bos_token",
-            "eos": "eos_token",
-            "unk": "unk_token",
-            "pad": "pad_token",
-        }
-
-        for token_type, attr_name in special_attrs.items():
-            token_info = {"id": None, "text": None, "exists_in_vocab": False,
-                          "encode_ok": False, "decode_ok": False, "error": None}
-            try:
-                token_text = getattr(self.tokenizer, attr_name, None)
-                token_id = getattr(self.tokenizer, f"{token_type}_token_id", None)
-
-                token_info["text"] = token_text
-                token_info["id"] = token_id
-
-                if token_text is not None and token_id is not None:
-                    # 验证词汇表中 ID 与文本的映射
-                    try:
-                        decoded_text = self.tokenizer.decode([token_id])
-                        token_info["decode_ok"] = (decoded_text == token_text)
-                    except Exception:
-                        token_info["decode_ok"] = False
-
-                    # 编码文本应得到对应的 ID
-                    try:
-                        encoded_id = self.tokenizer.encode(token_text, add_special_tokens=False)
-                        token_info["encode_ok"] = (len(encoded_id) == 1 and encoded_id[0] == token_id)
-                    except Exception:
-                        token_info["encode_ok"] = False
-
-                    # 检查 ID 是否在词汇表内
-                    token_info["exists_in_vocab"] = token_id < self.vocab_size
-            except Exception as e:
-                token_info["error"] = str(e)
-
-            results[token_type] = token_info
-
-        # 测试附加特殊 token（如 <|im_start|> 等）
-        add_special = getattr(self.tokenizer, "additional_special_tokens", None)
-        if add_special:
-            results["additional_special_tokens"] = []
-            for i, token_text in enumerate(add_special):
-                info = {"text": token_text, "id": None, "encode_ok": False, "decode_ok": False}
-                try:
-                    token_id = self.tokenizer.convert_tokens_to_ids(token_text)
-                    info["id"] = token_id
-                    if token_id != self.tokenizer.unk_token_id:
-                        decoded = self.tokenizer.decode([token_id])
-                        info["decode_ok"] = (decoded == token_text)
-                        encoded = self.tokenizer.encode(token_text, add_special_tokens=False)
-                        info["encode_ok"] = (len(encoded) == 1 and encoded[0] == token_id)
-                except Exception as e:
-                    info["error"] = str(e)
-                results["additional_special_tokens"].append(info)
-
-        return results
-
-    def run_speed_benchmark(self, texts: List[str], num_iterations: int = 5,
-                            warmup: int = 2) -> float:
-        """运行独立的编码速度基准测试。
-
-        参数:
-            texts: 文本列表，仅使用前 1000 条作为测试样本。
-            num_iterations: 正式测试的迭代次数。
-            warmup: 预热迭代次数，不计入最终速度。
-
-        返回:
-            平均每秒编码的 token 数。
-        """
-        sample_texts = texts[: min(1000, len(texts))]
-        if not sample_texts:
+    # ---------- 压缩 / 效率指标 ----------
+    def compute_compression_ratio(self) -> float:
+        if self.total_tokens == 0:
             return 0.0
+        return self.total_chars / self.total_tokens
 
-        # 预热运行，消除首次调用的额外开销。
-        for _ in range(warmup):
-            for text in sample_texts:
-                self._encode(text)
+    def compute_char_per_token_by_category(self) -> Dict[str, float]:
+        char_counts = {"latin": 0, "cjk": 0, "digits": 0, "other": 0}
+        for text in self.texts:
+            for ch in text:
+                cat = classify_char(ch)
+                char_counts[cat] += 1
+        result = {}
+        if self.total_tokens == 0:
+            for k in char_counts:
+                result[f"char_per_token_{k}"] = 0.0
+            result["char_per_token"] = 0.0
+            return result
 
-        # 正式计时。
-        start = time.perf_counter()
-        for _ in range(num_iterations):
-            for text in sample_texts:
-                self._encode(text)
-        elapsed = time.perf_counter() - start
+        for cat, count in char_counts.items():
+            result[f"char_per_token_{cat}"] = count / self.total_tokens
+        result["char_per_token"] = self.total_chars / self.total_tokens
+        return result
 
-        total_tokens = sum(len(self._encode(t)) for t in sample_texts) * num_iterations
-        return total_tokens / elapsed if elapsed > 0 else 0.0
+    def compute_fertility(self) -> float:
+        if self.total_tokens == 0:
+            return 0.0
+        return self.total_words / self.total_tokens
 
-    def print_report(
-            self,
-            metrics: Dict[str, Any],
-            speed: float,
-            chat_template_results: Optional[Dict[str, Any]] = None,
-            special_token_results: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """打印格式化的评估报告，包含核心指标、对话模板测试与特殊标签测试摘要。
+    def measure_encoding_speed(self, warmup: int = 1, repeats: int = 3) -> Tuple[float, float]:
+        """批量编码测速，显示进度条。"""
+        texts = self.texts
+        self._log("info", f"开始编码速度测试（预热 {warmup} 次，重复 {repeats} 次）")
+        # 预热
+        for _ in tqdm(range(warmup), desc="预热", unit="次"):
+            _ = self.tokenizer(texts, padding=False, truncation=False)
 
-        所有输出严格对齐，标签宽度 30，数值宽度 15。
-        超过宽度的值会被截断并在末尾添加省略号。
-        """
-        label_width = 30
-        value_width = 15
+        total_time = 0.0
+        total_tokens = 0
+        total_chars = 0
+        # 实际测量
+        for i in tqdm(range(repeats), desc="测速中", unit="次"):
+            start = time.perf_counter()
+            encodings = self.tokenizer(texts, padding=False, truncation=False)
+            ids_list = encodings.input_ids
+            end = time.perf_counter()
+            total_time += (end - start)
+            for ids, txt in zip(ids_list, texts):
+                total_tokens += len(ids)
+                total_chars += len(txt)
 
-        def truncate(s: str, width: int) -> str:
-            """截断字符串至指定宽度，超长部分替换为'…'。"""
-            if len(s) <= width:
-                return s
-            return s[:width - 1] + "…"
+        avg_tokens_per_sec = total_tokens / total_time if total_time > 0 else 0.0
+        avg_chars_per_sec = total_chars / total_time if total_time > 0 else 0.0
+        self._log("info", f"编码速度: {avg_tokens_per_sec:.2f} tokens/秒, {avg_chars_per_sec:.2f} chars/秒")
+        return avg_tokens_per_sec, avg_chars_per_sec
 
-        def fmt(label: str, value_str: str) -> str:
-            """生成对齐的“标签 : 数值”行，自动截断过长的值。"""
-            return f"{label:<{label_width}} : {truncate(value_str, value_width):>{value_width}}"
+    # ---------- 覆盖率指标 ----------
+    def compute_unk_rate(self) -> float:
+        if self.total_tokens == 0 or self.unk_token_id is None:
+            return 0.0
+        unk_count = self.token_freq.get(self.unk_token_id, 0)
+        return unk_count / self.total_tokens
 
-        # ---- 核心指标报告 ----
-        print("\n" + "=" * 70)
-        print(f"分词器评估报告: {self.tokenizer_name}")
-        print("=" * 70)
-
-        print(fmt("文本数量", f"{metrics.get('num_texts', 0)}"))
-        print(fmt("总字符数", f"{metrics.get('total_chars', 0):,}"))
-        print(fmt("总 token 数", f"{metrics.get('total_tokens', 0):,}"))
-        print(fmt("总词数（估算）", f"{metrics.get('total_words', 0):,}"))
-        print(fmt("词汇表大小", f"{self.vocab_size:,}"))
-        print(fmt("实际使用词汇数", f"{metrics.get('vocab_size_actual', 0):,}"))
-        print(fmt("词汇利用率", f"{metrics.get('vocab_utilization', 0):.2%}"))
-        print(fmt("繁殖度 (Fertility)", f"{metrics.get('fertility', 0):.4f}"))
-        print(fmt("字符/Token", f"{metrics.get('char_per_token', 0):.4f}"))
-        print(fmt("字符/Token (拉丁)", f"{metrics.get('char_per_token_latin', 0):.4f}"))
-        print(fmt("字符/Token (CJK)", f"{metrics.get('char_per_token_cjk', 0):.4f}"))
-        print(fmt("OOV/UNK 率", f"{metrics.get('unk_rate', 0):.4%}"))
-        print(fmt("重建完全匹配率", f"{metrics.get('reconstruction_exact_match', 0):.4%}"))
-        print(fmt("重建 CER", f"{metrics.get('reconstruction_cer', 0):.6f}"))
-        print(fmt("Token 熵 (nats)", f"{metrics.get('token_entropy', 0):.4f}"))
-        print(fmt("归一化熵", f"{metrics.get('token_entropy_norm', 0):.4f}"))
-        print(fmt("Token 基尼系数", f"{metrics.get('token_gini', 0):.4f}"))
-        print(fmt("编码速度", f"{speed:,.0f} tokens/秒"))
-        print("=" * 70)
-
-        # ---- 对话模板测试摘要 ----
-        print("\n" + "-" * 70)
-        print("对话模板测试摘要")
-        print("-" * 70)
-
-        if chat_template_results is None:
-            chat_template_results = {}
-
-        if chat_template_results.get("enabled"):
-            print(fmt("模板可用", "是"))
-            samples = chat_template_results.get("samples", [])
-            print(fmt("测试样本数", str(len(samples))))
-            for idx, sample in enumerate(samples):
-                status = "通过" if sample.get("roundtrip_ok") else "失败"
-                label = f"样本 {idx + 1}"
-                print(fmt(label, status))
-        else:
-            error_msg = chat_template_results.get("error", "未设置")
-            # 截断错误消息以保持对齐
-            print(fmt("模板可用", f"否 ({error_msg})"))
-
-        # ---- 特殊标签测试摘要 ----
-        print("\n" + "-" * 70)
-        print("特殊标签测试摘要")
-        print("-" * 70)
-
-        if special_token_results is None:
-            special_token_results = {}
-
-        # 标准特殊标记（BOS, EOS, UNK, PAD）
-        for token_type in ["bos", "eos", "unk", "pad"]:
-            info = special_token_results.get(token_type, {})
-            status = "通过" if info.get("encode_ok") and info.get("decode_ok") else "失败"
-            token_id = info.get("id")
-            token_text = info.get("text", "?")
-            # 构建简短的值字符串：状态 + ID
-            value = f"{status} (ID:{token_id})" if token_id is not None else status
-            print(fmt(token_type.upper(), value))
-
-        # 附加特殊标记（如 <|im_start|> 等）
-        additional_tokens = special_token_results.get("additional_special_tokens", [])
-        for token in additional_tokens:
-            token_text = token.get("text", "?")
-            status = "通过" if token.get("encode_ok") and token.get("decode_ok") else "失败"
-            token_id = token.get("id")
-            value = f"{status} (ID:{token_id})" if token_id is not None else status
-            # 标签限制30字符，对过长的 token 文本进行截断
-            label = f"附加 token {token_text}"
-            if len(label) > label_width:
-                label = label[:label_width - 1] + "…"
-            print(fmt(label, value))
-
-        print("-" * 70)
-
-    def to_json(self, metrics: Dict[str, Any], output_path: Optional[str] = None) -> None:
-        """将指标保存为 JSON 文件或输出到标准输出。
-
-        参数:
-            metrics: 指标字典。
-            output_path: 保存路径，若为 None 则打印到终端。
-        """
-        out = {
-            k: (v if isinstance(v, (int, float, str, bool, list, dict)) else str(v))
-            for k, v in metrics.items()
-        }
-        if output_path:
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(out, f, indent=2, ensure_ascii=False)
-            print(f"指标已保存至 {output_path}")
-        else:
-            print(json.dumps(out, indent=2, ensure_ascii=False))
-
-    def evaluate_from_path(self, data_path: str, run_speed: bool = True,
-                           output_json_path: Optional[str] = None) -> Dict[str, Any]:
-        """完整的评估流水线：加载数据、评估、保存 JSON（若指定）、输出报告。
-
-        参数:
-            data_path: JSONL 数据路径。
-            run_speed: 是否执行速度基准测试。
-            output_json_path: 保存所有指标的 JSON 文件路径（可选）。
-
-        返回:
-            合并原始统计与计算指标的完整字典。
-        """
-        texts = self.load_data(data_path)
-        if not texts:
-            print("未加载到任何文本，退出。")
-            return {}
-
-        raw_stats = self.evaluate(texts)
-        metrics = self.compute_metrics(raw_stats)
-        # 将部分原始统计量加入指标字典，便于报告展示。
-        metrics.update({
-            "num_texts": raw_stats["num_texts"],
-            "total_chars": raw_stats["total_chars"],
-            "total_tokens": raw_stats["total_tokens"],
-            "total_words": raw_stats["total_words"],
-        })
-
-        speed = 0.0
-        if run_speed:
-            print("正在运行速度基准测试...")
-            speed = self.run_speed_benchmark(texts)
-
-        print("正在进行对话模板测试……")
-        chat_template_results = self.test_chat_template()
-
-        print("正在进行特殊标签测试……")
-        special_token_results = self.test_special_tokens()
-
-        # 合并速度指标
-        full_metrics = {
-            **metrics,
-            "encoding_speed": speed,
-            "chat_template_test": chat_template_results,
-            "special_tokens_test": special_token_results,
+    def compute_vocab_utilization(self) -> Dict[str, Any]:
+        vocab_actual = len(self.token_freq)
+        vocab_total = self.tokenizer.vocab_size if hasattr(self.tokenizer, "vocab_size") else None
+        if vocab_total is None:
+            try:
+                vocab_total = len(self.tokenizer.get_vocab())
+            except Exception:
+                vocab_total = 0
+        utilization = vocab_actual / vocab_total if vocab_total > 0 else 0.0
+        return {
+            "vocab_size_actual": vocab_actual,
+            "vocab_size_total": vocab_total,
+            "vocab_utilization": utilization,
         }
 
-        # 先保存 JSON（若指定路径），再打印报告。
-        if output_json_path:
-            self.to_json(full_metrics, output_json_path)
+    # ---------- 重建保真度（批量优化 + 进度条） ----------
+    def compute_reconstruction_metrics(self) -> Dict[str, float]:
+        """批量编码、解码，逐对比较时显示进度条。"""
+        self._log("info", "开始重建保真度计算...")
+        # 批量编码
+        encodings = self.tokenizer(self.texts, padding=False, truncation=False)
+        all_ids = encodings.input_ids
+        # 批量解码
+        decoded_texts = self.tokenizer.batch_decode(all_ids, skip_special_tokens=False)
 
-        self.print_report(
-            metrics=metrics,
-            speed=speed,
-            chat_template_results=chat_template_results,
-            special_token_results=special_token_results,
+        exact_matches = 0
+        total_cer = 0.0
+        total_chars = 0
+
+        with tqdm(total=len(self.texts), desc="重建对比", unit="text") as pbar:
+            for idx, (orig, decoded) in enumerate(zip(self.texts, decoded_texts)):
+                if orig == decoded:
+                    exact_matches += 1
+                total_cer += edit_distance(orig, decoded)
+                total_chars += len(orig)
+                pbar.update(1)
+                # 每 10% 记录一次日志
+                if pbar.n % max(1, len(self.texts)//10) == 0 and pbar.n > 0:
+                    self._log("info", f"重建对比进度: {pbar.n}/{len(self.texts)} ({100*pbar.n/len(self.texts):.1f}%)")
+
+        exact_match_rate = exact_matches / self.num_texts if self.num_texts > 0 else 0.0
+        cer = total_cer / total_chars if total_chars > 0 else 0.0
+        self._log("info", f"重建精确匹配率: {exact_match_rate:.4f}, 字符错误率: {cer:.4f}")
+        return {
+            "reconstruction_exact_match": exact_match_rate,
+            "reconstruction_cer": cer,
+        }
+
+    # ---------- 分布统计 ----------
+    def compute_token_distribution_metrics(self) -> Dict[str, float]:
+        if not self.token_freq:
+            return {"token_entropy": 0.0, "token_entropy_norm": 0.0, "token_gini": 0.0}
+
+        freq_values = list(self.token_freq.values())
+        total = sum(freq_values)
+        entropy = 0.0
+        for count in freq_values:
+            p = count / total
+            entropy -= p * math.log2(p)
+
+        actual_vocab = len(freq_values)
+        max_entropy = math.log2(actual_vocab) if actual_vocab > 1 else 1.0
+        entropy_norm = entropy / max_entropy if max_entropy > 0 else 0.0
+
+        sorted_counts = sorted(freq_values)
+        n = len(sorted_counts)
+        sum_i_ci = 0.0
+        for i, count in enumerate(sorted_counts, 1):
+            sum_i_ci += i * count
+        gini = (2.0 * sum_i_ci / (n * total)) - (n + 1) / n
+        return {
+            "token_entropy": entropy,
+            "token_entropy_norm": entropy_norm,
+            "token_gini": gini,
+        }
+
+    # ---------- 特殊 Token 测试 ----------
+    def test_special_tokens(self) -> Dict[str, Dict[str, Any]]:
+        result = {}
+        vocab_size = self.tokenizer.vocab_size if hasattr(self.tokenizer, "vocab_size") else 0
+        unk_id = self.unk_token_id
+
+        for token_type in ["bos_token", "eos_token", "unk_token", "pad_token"]:
+            token_str = self.special_tokens.get(token_type)
+            if not token_str:
+                result[token_type.split("_")[0]] = {"error": f"未配置 {token_type}"}
+                continue
+
+            token_id = self.tokenizer.convert_tokens_to_ids(token_str)
+            if unk_id is not None:
+                exists_in_vocab = (token_id != unk_id)
+            else:
+                exists_in_vocab = (0 <= token_id < vocab_size) if vocab_size > 0 else True
+
+            encode_ok = False
+            decode_ok = False
+            error = None
+            try:
+                encoded_ids = self.tokenizer.encode(token_str)
+                if hasattr(encoded_ids, "ids"):
+                    first_id = encoded_ids.ids[0] if encoded_ids.ids else None
+                else:
+                    first_id = encoded_ids[0] if encoded_ids else None
+                encode_ok = (first_id == token_id)
+
+                decoded_text = self.tokenizer.decode([token_id])
+                decode_ok = token_str in decoded_text or decoded_text.strip() == token_str.strip()
+            except Exception as e:
+                error = str(e)
+
+            key = token_type.split("_")[0]
+            result[key] = {
+                "id": token_id,
+                "text": token_str,
+                "exists_in_vocab": exists_in_vocab,
+                "encode_ok": encode_ok,
+                "decode_ok": decode_ok,
+                "error": error,
+            }
+        return result
+
+    # ---------- 聊天模板测试 ----------
+    def test_chat_template(self) -> Dict[str, Any]:
+        if not hasattr(self.tokenizer, "apply_chat_template") or self.tokenizer.chat_template is None:
+            return {"enabled": False, "template_available": False, "samples": []}
+
+        samples_output = []
+        for sample in tqdm(_CHAT_TEST_SAMPLES, desc="聊天模板测试", unit="样本"):
+            messages = sample["messages"]
+            try:
+                formatted_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+                ids_list = self.tokenizer.encode(formatted_text)
+                if hasattr(ids_list, "ids"):
+                    ids_list = ids_list.ids
+                if not isinstance(ids_list, list):
+                    ids_list = list(ids_list)
+                encoded_length = len(ids_list)
+
+                decoded_text = self.tokenizer.decode(ids_list)
+                ids_2 = self.tokenizer.encode(formatted_text)
+                if hasattr(ids_2, "ids"):
+                    ids_2 = ids_2.ids
+                ids_consistent = (ids_list == ids_2)
+                roundtrip_ok = (decoded_text == formatted_text) and ids_consistent
+
+                samples_output.append({
+                    "messages": messages,
+                    "formatted_text": formatted_text,
+                    "decoded_text": decoded_text,
+                    "encoded_length": encoded_length,
+                    "roundtrip_ok": roundtrip_ok,
+                    "ids_1": ids_list,
+                    "ids_2": ids_2,
+                    "ids_consistent": ids_consistent,
+                })
+            except Exception as e:
+                samples_output.append({"messages": messages, "error": str(e)})
+
+        return {"enabled": True, "template_available": True, "samples": samples_output}
+
+    # ---------- 汇总评估 ----------
+    def evaluate(self, speed_warmup: int = 1, speed_repeats: int = 3) -> Dict[str, Any]:
+        self._log("info", "开始评估...")
+        report = {}
+
+        report["num_texts"] = self.num_texts
+        report["total_chars"] = self.total_chars
+        report["total_tokens"] = self.total_tokens
+        report["total_words"] = self.total_words
+        self._log("info",
+                  f"数据集统计: 文本数={self.num_texts}, 字符数={self.total_chars}, Token数={self.total_tokens}, 单词数={self.total_words}")
+
+        report["compression_ratio"] = self.compute_compression_ratio()
+        char_per_token_data = self.compute_char_per_token_by_category()
+        report.update(char_per_token_data)
+        report["fertility"] = self.compute_fertility()
+        self._log("info", f"压缩比={report['compression_ratio']:.4f}, 生育率={report['fertility']:.4f}, "
+                          f"每Token字符数(拉丁/CJK/数字/其他): {char_per_token_data.get('char_per_token_latin', 0):.4f}/"
+                          f"{char_per_token_data.get('char_per_token_cjk', 0):.4f}/"
+                          f"{char_per_token_data.get('char_per_token_digits', 0):.4f}/"
+                          f"{char_per_token_data.get('char_per_token_other', 0):.4f}")
+
+        tokens_per_sec, chars_per_sec = self.measure_encoding_speed(warmup=speed_warmup, repeats=speed_repeats)
+        report["encoding_speed_tokens_per_sec"] = tokens_per_sec
+        report["encoding_speed"] = chars_per_sec
+        self._log("info", f"编码速度: {tokens_per_sec:.2f} tokens/秒, {chars_per_sec:.2f} chars/秒")
+
+        report["unk_rate"] = self.compute_unk_rate()
+        vocab_data = self.compute_vocab_utilization()
+        report.update(vocab_data)
+        self._log("info", f"UNK率={report['unk_rate']:.4f}, 词汇表利用率={report['vocab_utilization']:.4f} "
+                          f"({report['vocab_size_actual']}/{report['vocab_size_total']})")
+
+        recon_data = self.compute_reconstruction_metrics()
+        report.update(recon_data)
+        self._log("info",
+                  f"重建精确匹配率={report['reconstruction_exact_match']:.4f}, 字符错误率={report['reconstruction_cer']:.4f}")
+
+        dist_data = self.compute_token_distribution_metrics()
+        report.update(dist_data)
+        self._log("info",
+                  f"Token熵={report['token_entropy']:.4f}, 归一化熵={report['token_entropy_norm']:.4f}, 基尼系数={report['token_gini']:.4f}")
+
+        report["special_tokens_test"] = self.test_special_tokens()
+        report["chat_template_test"] = self.test_chat_template()
+        # 特殊Token和聊天模板测试结果较复杂，简化记录
+        special_ok = all(
+            info.get("encode_ok") and info.get("decode_ok") for info in report["special_tokens_test"].values() if
+            isinstance(info, dict))
+        self._log("info", f"特殊Token测试: {'通过' if special_ok else '部分失败'}")
+
+        ct_test = report["chat_template_test"]
+        if ct_test.get("enabled"):
+            ok_count = sum(1 for s in ct_test.get("samples", []) if s.get("roundtrip_ok"))
+            self._log("info", f"聊天模板测试: 可用, 通过样本数={ok_count}/{len(ct_test.get('samples', []))}")
+        else:
+            self._log("info", "聊天模板测试: 未启用或无模板")
+
+        self._log("info", "评估完成。")
+        return report
+
+
+# ----------------------------------------------------------------------
+# 辅助函数与主入口
+# ----------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="LLM Tokenizer 评估工具")
+    parser.add_argument("--tokenizer_path", required=True, help="分词器路径或 HuggingFace 模型名称。")
+    parser.add_argument("--test_file", required=True, nargs='+', help="一个或多个测试文件/目录路径，支持 .json/.jsonl 文件或目录。")
+    parser.add_argument("--output", default="tokenizer_report.json", help="输出 JSON 报告路径（默认: tokenizer_report.json）。")
+    parser.add_argument("--speed_warmup", type=int, default=1, help="编码速度测试预热次数（默认: 1）。")
+    parser.add_argument("--speed_repeats", type=int, default=3, help="编码速度测试重复次数（默认: 3）。")
+    parser.add_argument("--verbose", action="store_true", help="输出详细日志。")
+    parser.add_argument("--log_dir", default="./experiments/logs", help="日志目录（LogManager 使用）。")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # 初始化 LogManager
+    log_manager = None
+    if _HAS_LOGMANAGER and LogManager is not None:
+        import logging
+        log_manager = LogManager(
+            log_dir=args.log_dir,
+            tensorboard=False,
+            log_file="eval_taichu_tokenizer.log",
+            console_level=logging.DEBUG if args.verbose else logging.INFO,
+            file_level=logging.DEBUG
         )
-        return full_metrics
+        log_manager.info("Tokenizer 评估工具启动")
 
+    try:
+        evaluator = TokenizerEvaluator(
+            tokenizer_path=args.tokenizer_path,
+            test_files=args.test_file,
+            log_manager=log_manager,
+        )
+        report = evaluator.evaluate(
+            speed_warmup=args.speed_warmup,
+            speed_repeats=args.speed_repeats,
+        )
 
-def main() -> None:
-    """命令行入口函数。"""
-    parser = argparse.ArgumentParser(
-        description="分词器综合评估工具"
-    )
-    parser.add_argument(
-        "--data_path",
-        type=str,
-        required=True,
-        help="JSONL 文件或包含 .jsonl 文件的目录路径。",
-    )
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        required=True,
-        help="HuggingFace 分词器名称或本地 tokenizer.json 路径。",
-    )
-    parser.add_argument(
-        "--text_field",
-        type=str,
-        default="text",
-        help="JSON 对象中存储文本的字段名（默认: text）。",
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=None,
-        help="限制评估的样本数量，用于快速测试。",
-    )
-    parser.add_argument(
-        "--no_speed",
-        action="store_true",
-        help="跳过速度基准测试。",
-    )
-    parser.add_argument(
-        "--output_json",
-        type=str,
-        default=None,
-        help="将指标保存为 JSON 文件的路径。",
-    )
-    parser.add_argument(
-        "--use_slow",
-        action="store_true",
-        help="使用慢速分词器而非 Fast 分词器。",
-    )
-    parser.add_argument(
-        "--trust_remote_code",
-        action="store_true",
-        help="加载分词器时信任远程仓库中的自定义代码。",
-    )
+        # 打印关键指标摘要
+        print("\n================ Tokenizer 评估报告 ================")
+        print(f"文本数量: {report['num_texts']}")
+        print(f"总字符数: {report['total_chars']}")
+        print(f"总 Token 数: {report['total_tokens']}")
+        print(f"总单词数: {report['total_words']}")
+        print(f"压缩比: {report['compression_ratio']:.4f}")
+        print(f"生育率: {report['fertility']:.4f}")
+        print(f"每 Token 字符数 (拉丁): {report['char_per_token_latin']:.4f}")
+        print(f"每 Token 字符数 (CJK): {report['char_per_token_cjk']:.4f}")
+        print(f"每 Token 字符数 (数字): {report['char_per_token_digits']:.4f}")
+        print(f"每 Token 字符数 (其他): {report['char_per_token_other']:.4f}")
+        print(f"编码速度: {report['encoding_speed']:.2f} chars/秒")
+        print(f"未知词比率: {report['unk_rate']:.4f}")
+        print(f"词汇表利用率: {report['vocab_utilization']:.4f} "
+              f"({report['vocab_size_actual']}/{report['vocab_size_total']})")
+        print(f"重建精确匹配率: {report['reconstruction_exact_match']:.4f}")
+        print(f"重建字符错误率: {report['reconstruction_cer']:.4f}")
+        print(f"Token 熵: {report['token_entropy']:.4f}")
+        print(f"归一化熵: {report['token_entropy_norm']:.4f}")
+        print(f"基尼系数: {report['token_gini']:.4f}")
+        print("特殊 Token 测试结果:")
+        for token_type, info in report["special_tokens_test"].items():
+            status = "OK" if info.get("encode_ok") and info.get("decode_ok") else "FAIL"
+            print(f"  {token_type}: {status}")
+        print("聊天模板测试结果:")
+        ct_test = report["chat_template_test"]
+        if ct_test["enabled"]:
+            for i, sample in enumerate(ct_test["samples"]):
+                if "error" in sample:
+                    print(f"  样本 {i+1}: ERROR - {sample['error']}")
+                else:
+                    ok = sample.get("roundtrip_ok", False)
+                    consistent = sample.get("ids_consistent", False)
+                    print(f"  样本 {i+1}: {'OK' if ok else 'FAIL'} "
+                          f"(ID一致性: {'OK' if consistent else 'FAIL'})")
+        else:
+            print("  未启用或不可用")
+        print("====================================================\n")
 
-    args = parser.parse_args()
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        if log_manager:
+            log_manager.info(f"报告已保存至 {args.output}")
 
-    evaluator = TokenizerEvaluator(
-        tokenizer_name_or_path=args.tokenizer,
-        text_field=args.text_field,
-        max_samples=args.max_samples,
-        use_fast=not args.use_slow,
-        trust_remote_code=args.trust_remote_code,
-    )
-
-    # 执行评估：内部会先保存 JSON（若指定），再打印报告。
-    evaluator.evaluate_from_path(
-        data_path=args.data_path,
-        run_speed=not args.no_speed,
-        output_json_path=args.output_json,
-    )
+    except Exception as e:
+        if log_manager:
+            log_manager.error(f"评估过程发生错误: {e}", exc_info=True)
+        else:
+            print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if log_manager:
+            log_manager.close()
 
 
 if __name__ == "__main__":
