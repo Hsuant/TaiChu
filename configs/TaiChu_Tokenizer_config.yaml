@@ -105,91 +105,104 @@ model_meta:
 # 4. 内置注释：帮助团队快速理解和维护。
 chat_template: |
   {#- 
-    初始化命名空间，用于标记会话中图像的数量。这是一个为将来可能的扩展预留的计数器，
-    在不支持多模态的当前场景下，它主要用于占位，但保留了与官方模板结构的一致性。
+      适用于 ChatML 格式的单模态文本模型
+      特性：
+      1. 支持系统消息（优先级：messages[0] > default_system_message）
+      2. 支持 Assistant 内容延续（当最后一条消息为 assistant 且 add_generation_prompt=True 时不闭合标记）
+      3. 严格空白控制（所有标签均使用 - 控制符）
+      4. 每个消息块结束后均添加换行符
+      5. 支持 reasoning_content（以 <|think|>...</|think|> 包裹）
+      6. 过滤空 content 的消息
+      7. 不包含工具调用、多模态等扩展功能
+  #}
+
+  {#- 
+      [可选] 预留命名空间，用于未来可能的扩展（如图像计数）。
+      当前未实际使用，但保留以保持结构一致性。
   #}
   {%- set image_count = namespace(value=0) -%}
 
-  {#- 
-    处理系统提示（System Prompt）。
-    1. 如果 messages 的第一条消息是 'system' 角色，则其内容将被格式化为系统提示。
-    2. 否则，若定义了 default_system_message（通过 kwargs 传入），将使用其内容。
-    3. 系统消息在对话历史的顶部是唯一且必须的，格式为 `<|im_start|>system\n{content}<|im_end|>\n`。
-    4. 若同时存在两种定义，将优先使用第一条消息。
+  {#-
+      ==================== 系统消息处理 ====================
+      优先级：
+      1. 如果 messages[0]['role'] == 'system'，使用该内容作为系统提示。
+      2. 否则，如果传入了 default_system_message 参数，则使用该内容。
+      3. 否则，无系统消息。
+      
+      系统消息格式：<|im_start|>system\n{content}<|im_end|>\n
+      注意：末尾的换行符 \n 是 Qwen 官方格式要求，用于分隔消息。
   #}
   {%- if messages[0]['role'] == 'system' -%}
       {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' -}}
-      {#- 设置变量以指示系统消息已处理 #}
       {%- set system_processed = true -%}
-      {#- 从剩余消息列表开始循环 #}
       {%- set loop_messages = messages[1:] -%}
   {%- elif default_system_message is defined -%}
       {{- '<|im_start|>system\n' + default_system_message + '<|im_end|>\n' -}}
       {%- set system_processed = true -%}
       {%- set loop_messages = messages -%}
   {%- else -%}
-      {#- 无系统消息，从原始消息列表开始循环 #}
       {%- set loop_messages = messages -%}
   {%- endif -%}
 
   {#-
-    遍历并格式化除系统消息之外的所有消息。
-    核心逻辑：对每条消息，根据其角色（user 或 assistant），使用对应的标记进行包装。
+      ==================== 遍历并格式化所有消息 ====================
+      对每条消息，根据其角色（user / assistant）应用不同的格式。
+      严格使用空白控制符（-）避免模板中的换行/空格污染输出。
   #}
   {%- for message in loop_messages -%}
-      {#- 
-        内容检查与智能过滤。 
-        确保 message 中的 content 字段既不是 None，也不是空列表或空字典。
-        如果 content 为空或无效，则跳过该条消息的处理，防止因无效输入导致模板渲染失败。
-      #}
+      {#- 跳过 content 为空或无效的消息，防止输出孤立的标记对 #}
       {%- if message.get('content') is none or message.content|length == 0 -%}
           {%- continue -%}
       {%- endif -%}
-      
-      {#-
-        按角色类型格式化消息。
-        此处的逻辑保证了每条消息的边界都被正确闭合，避免输出格式混乱。
-      #}
+
+      {#- ---------- 用户消息 ---------- #}
       {%- if message['role'] == 'user' -%}
-          {#- 
-            对用户内容进行过滤。当用户输入为空时，会自动跳过该消息，
-            避免生成无内容的 '<|im_start|>user\n<|im_end|>' 等无效标记对。 
-          #}
           {{- '<|im_start|>user\n' -}}
-          {#- 
-            处理用户输入的内容格式。
-            确保将用户输入的内容渲染为字符串，并正确闭合。 
-          #}
           {{- message['content'] | string -}}
-          {{- '<|im_end|>\n' -}}
-          
+          {{- '<|im_end|>\n' -}}   {# 结束标签后紧跟换行符 #}
+
+      {#- ---------- 助手消息 ---------- #}
       {%- elif message['role'] == 'assistant' -%}
           {{- '<|im_start|>assistant\n' -}}
-          {#- 
-            支持 reasoning_content 标签。
-            如果助手消息中包含 'reasoning_content' 字段（通常用于展示模型的思考过程），
-            则以 '<|think|>' 和 '<|/think|>' 包裹并渲染。 
-          #}
-          {%- if message.get('reasoning_content') -%}
-              {#- 非空检查，防止输出空的 think 标签。 #}
-              {%- if message['reasoning_content'] | trim -%}
-                  {{- '<|think|>' + message['reasoning_content'] + '<|/think|>\n' -}}
-              {%- endif -%}
+
+          {#- 可选：处理 reasoning_content（如思维链） #}
+          {%- if message.get('reasoning_content') and message['reasoning_content'] | trim -%}
+              {{- '<|think|>' + message['reasoning_content'] + '<|/think|>\n' -}}
           {%- endif -%}
-          {#- 输出助手消息的主要内容 #}
-          {{- message['content'] -}}
-          {{- '<|im_end|>\n' -}}
-          
+
+          {#- 输出助手的主要内容 #}
+          {{- message['content'] | string -}}
+
+          {#-
+              关键：Assistant 内容延续支持
+              如果当前消息是最后一条消息，并且 add_generation_prompt 为 True，
+              则**不输出** <|im_end|> 及其后的换行符，使得模型可以从此处直接继续生成。
+              否则，正常闭合消息块。
+          #}
+          {%- if not (loop.last and add_generation_prompt) -%}
+              {{- '<|im_end|>\n' -}}
+          {%- endif -%}
+
+      {#- ---------- 其他角色（预留，未实现） ----------#}
+      {%- else -%}
+          {#- 静默忽略非 user/assistant 的消息，保持向后兼容。可在此处添加警告日志。 #}
       {%- endif -%}
   {%- endfor -%}
 
   {#-
-    为响应（Generation）添加起始提示。
-    仅在需要时添加。这意味着模板在多数情况下会输出历史的完整格式，
-    但在推理时，通过额外输出 '<|im_start|>assistant\n' 提示模型开始生成回复。
+      ==================== 生成提示（Generation Prompt）处理 ====================
+      当 add_generation_prompt 为 True 时，添加一个未闭合的 assistant 起始标记，
+      引导模型开始生成回复。
+      
+      注意：
+      - 如果最后一条消息已经是 assistant 并且我们在上一步中已经故意未闭合它（延续场景），
+        则**不再**添加新的 <|im_start|>assistant\n，避免重复。
+      - 否则，正常添加。
   #}
   {%- if add_generation_prompt -%}
-      {{- '<|im_start|>assistant\n' -}}
+      {%- if not (loop_messages and loop_messages[-1]['role'] == 'assistant') -%}
+          {{- '<|im_start|>assistant\n' -}}
+      {%- endif -%}
   {%- endif -%}
 
 # ---------------------------- 解码器配置 ----------------------------
