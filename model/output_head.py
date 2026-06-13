@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 
-class OutputHead(nn.Module):
+class TaiChuOutputHead(nn.Module):
     """语言模型输出头。
 
     通常是一个线性层，将 hidden_size 映射到 vocab_size。
