@@ -144,14 +144,23 @@ class ModelConfig:
     稳定门控网络训练。典型范围：0.0001 ~ 0.01。
     仅在 ffn_type="moe" 时生效。"""
 
+    # ==================== 推理优化 ====================
+
+    use_flash_attention: bool = True
+    """是否优先使用 FlashAttention 后端进行注意力计算。
+
+    - 若为 True，则通过 ``torch.backends.cuda.sdp_kernel`` 强制启用 FlashAttention，
+      可显著降低内存占用并加速训练/推理（需硬件支持，如 Ampere 及以上 GPU）。
+    - 若为 False，则回退到 PyTorch 默认的自动后端选择（Memory‑Efficient / Math）。
+    """
 
     def __post_init__(self):
         """配置校验与后处理。
 
-        - 若 num_key_value_heads 为 0，自动设为 num_attention_heads（即 MHA）。
-        - 检查 GQA 的整除性。
-        - 若启用 MoE，校验 MoE 相关参数的一致性。
-        """
+            - 若 num_key_value_heads 为 0，自动设为 num_attention_heads（即 MHA）。
+            - 检查 GQA 的整除性。
+            - 若启用 MoE，校验 MoE 相关参数的一致性。
+            """
         # GQA 处理
         if self.num_key_value_heads <= 0:
             self.num_key_value_heads = self.num_attention_heads
