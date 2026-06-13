@@ -8,8 +8,8 @@ optimizer:
   epsilon: 1.0e-8
 
 scheduler:
-  warmup_ratio: 0.01          # 预热步数占总步数的比例（1%）
-  stable_ratio: 0.75          # 恒定阶段 80%（WSD 核心）[0.7,0.85]
+  warmup_ratio: 0.02          # 预热步数占总步数的比例（2%）
+  stable_ratio: 0.7           # 恒定阶段 70%（WSD 核心）[0.7,0.85]
   min_lr_ratio: 0.0           # 最终学习率比例,推荐衰减至 0，完全退火
   decay_type: "cosine"        # 余弦衰减，可选 "linear" "cosine"
 
@@ -36,7 +36,7 @@ training:
   log_interval: 10
   output_dir: "./experiments"
   experiment_name: "TaiChu_LMM_pretrain_v1"
-  use_mixed_precision: false
+  use_mixed_precision: true
   dtype: "bfloat16"
   seed: 42
   # 设备选择配置：
@@ -57,41 +57,26 @@ training:
 
 # 测试配置
 evaluating:
-  batch_size: 2
+  batch_size: 2      # 验证的batch_size可以比训练的batch_size更高
   eval_interval: 20
   log_interval: 10
-  prompts: # 20个覆盖多维度能力的生成前缀（无指令，适合基座模型）
-    # 常识与事实知识
-    - "The capital of France is"                          # 地理知识
-    - "水在标准大气压下的沸点是"                               # 中文物理常识
-    - "The process of photosynthesis converts"            # 生物知识
-    - "Albert Einstein is best known for"                 # 历史/人物
-    # 逻辑推理与因果关系
-    - "If you drop a glass on a concrete floor, it"       # 物理因果
-    - "All mammals have hair. A whale is a mammal, so"    # 三段论推理
-    - "因为下雨，所以地面"                                    # 中文因果
-    # 数学与代码
-    - "The derivative of x^3 is"                          # 数学
-    - "The output of `2 + 3 * 4` is"                      # 算术表达式
-    # 叙事与创造性写作
-    - "Once upon a time in a distant galaxy,"             # 故事开头（英文）
-    - "深夜，一只猫悄悄地爬上了"                               # 中文叙事
-    - "She looked out the window and saw"                 # 情景描写
-    # 多语言（根据模型语料比例选择）
-    - "Le futur de l'intelligence artificielle est"       # 法语
-    - "Der Prozess des maschinellen Lernens beginnt mit"  # 德语
-    - "Deep learning is powerful because"                 # 英文
-    - "人工智能的未来是"                                     # 中文
-    # 列表/枚举与结构化输出
-    - "The three primary colors are"                      # 简单枚举
-    - "为了保持健康，你应该"                                  # 建议列表
-    - "Steps to solve a quadratic equation: first"        # 过程描述
-    # 对话式/角色模拟（无指令形式，仅自然前缀）
-    - "User: What's the weather like today?\nAssistant:"  # 对话延续（测试角色一致性）
-    - "客服：您好，请问有什么可以帮您？\n客户："                  # 中文客服场景
-    # 抽象与哲学
-    - "Consciousness is often defined as"                 # 抽象定义
-    - "时间就像"                                            # 比喻类
+  prompts:           # 20个覆盖多维度能力的生成前缀（无指令，适合基座模型）
+    # 中文常识
+    - "水在标准大气压下的沸点是"
+    # 英文常识
+    - "The capital of France is"
+    # 中文叙事（故事开头）
+    - "深夜，一只猫悄悄地爬上了"
+    # 英文叙事
+    - "Once upon a time in a distant galaxy,"
+    # 中文场景描写
+    - "她推开窗户，看见远处的天空"
+    # 英文场景描写
+    - "She looked out the window and saw"
+    # 中文对话（客服场景）
+    - "客服：您好，请问有什么可以帮您？\n客户："
+    # 英文对话（用户与助手）
+    - "User: What's the weather like today?\nAssistant:"
   num_generate_tokens: 50   # 每个提示生成的 token 数量
 
 # 早停配置
