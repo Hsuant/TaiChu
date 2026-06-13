@@ -13,8 +13,8 @@ import torch.nn.functional as F
 from model.embedding import TokenEmbedding
 from model.positional_encoding import RoPEPositionEncoding
 from model.normalization import RMSNorm
-from model.transformer_block import TransformerBlock
-from model.output_head import OutputHead
+from model.transformer_block import TaiChuBlock
+from model.output_head import TaiChuOutputHead
 
 
 @dataclass
@@ -68,34 +68,17 @@ class TaiChuModel(nn.Module):
             theta=config.rope_theta,
         )
 
-        # 若启用了 MoE，则从 config 中提取 MoEConfig（由 ConfigLoader 已解析好的对象）
-        moe_config = config.moe_config
-
         # Transformer 层堆叠
-        self.layers = nn.ModuleList(
-            [
-                TransformerBlock(
-                    hidden_size=config.hidden_size,
-                    num_attention_heads=config.num_attention_heads,
-                    num_key_value_heads=config.num_key_value_heads
-                    if config.num_key_value_heads > 0
-                    else config.num_attention_heads,
-                    intermediate_size=config.intermediate_size,
-                    ffn_type=config.ffn_type,
-                    attention_dropout=config.attention_dropout,
-                    hidden_dropout=config.hidden_dropout,
-                    rms_norm_eps=config.rms_norm_eps,
-                    moe_config=moe_config,
-                )
-                for _ in range(config.num_layers)
-            ]
-        )
+        self.layers = nn.ModuleList([
+            TaiChuBlock(config, layer_idx=i)
+            for i in range(config.num_layers)
+        ])
 
         # 最终归一化层
         self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # 输出头
-        self.output_head = OutputHead(
+        self.output_head = TaiChuOutputHead(
             hidden_size=config.hidden_size,
             vocab_size=config.vocab_size,
             tie_weights=config.tie_word_embeddings,
@@ -179,7 +162,7 @@ class TaiChuModel(nn.Module):
 
         # ========== 4. 逐层传递 Transformer 层 ==========
         new_past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = [] if use_cache else None
-        total_aux_loss = 0.0  # MoE 辅助损失累积
+        total_aux_loss = torch.tensor(0.0, device=input_ids.device)  # MoE 辅助损失累积
 
         for idx, layer in enumerate(self.layers):
             # 获取本层的旧缓存（如果存在）
@@ -194,8 +177,7 @@ class TaiChuModel(nn.Module):
             )
 
             # 收集 MoE 辅助损失（仅训练时需要）
-            if aux_loss is not None:
-                total_aux_loss = total_aux_loss + aux_loss
+            total_aux_loss = total_aux_loss + aux_loss
 
             if use_cache:
                 assert new_past_key_values is not None
