@@ -27,6 +27,8 @@ class RoPEPositionEncoding(nn.Module):
             theta: 旋转频率的基频
         """
         super().__init__()
+        assert head_dim % 2 == 0, "head_dim 必须为偶数"
+
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
         self.theta = theta
@@ -64,38 +66,44 @@ class RoPEPositionEncoding(nn.Module):
         )
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """将输入张量的最后一维分为两半并执行旋转操作。
+
+    具体操作：将 ``x`` 的前半部分与后半部分交换，并对原先的后半部分取反。
+    相当于将向量对视为复数时乘以 i 的旋转效果。
+
+    Args:
+        x: 输入张量，最后一维长度必须为偶数。
+
+    Returns:
+        旋转后的张量，形状与输入相同。
+    """
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
 def apply_rotary_pos_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """对张量应用旋转位置编码。
+    """对张量应用旋转位置编码（使用 ``rotate_half`` 方法）。
 
-    该方法将输入张量的最后两个维度视为复数的实部和虚部交替排列，
-    并执行旋转操作。
+    按照公式：
+        x_rot = x * cos + rotate_half(x) * sin
+    该实现完全基于实数运算，避免复数转换开销，是 LLaMA、GPT-NeoX 等
+    主流模型的标准做法。
 
     Args:
-        x: 输入张量，形状 (batch_size, seq_len, num_heads, head_dim)
-        cos: 余弦值，形状 (1, seq_len, 1, head_dim)
-        sin: 正弦值，形状 (1, seq_len, 1, head_dim)
+        x: 输入张量，形状 ``(batch_size, seq_len, num_heads, head_dim)``。
+        cos: 余弦值，形状 ``(1, seq_len, 1, head_dim)``（可广播）。
+        sin: 正弦值，形状 ``(1, seq_len, 1, head_dim)``（可广播）。
 
     Returns:
-        应用旋转后的张量，形状与输入相同
+        应用旋转后的张量，形状与输入相同，数据类型与输入一致。
     """
-    batch_size, seq_len, num_heads, head_dim = x.shape
-    # 将最后一个维度分成两半，以便视为复数旋转
-    x_reshaped = x.float().reshape(batch_size, seq_len, num_heads, head_dim // 2, 2)
-    x_real = x_reshaped[..., 0]  # 实部
-    x_imag = x_reshaped[..., 1]  # 虚部
+    # 确保 cos/sin 与输入 x 的 dtype 一致
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
 
-    cos = cos[:, :seq_len, :, :].float()
-    sin = sin[:, :seq_len, :, :].float()
-    cos_reshaped = cos.reshape(1, seq_len, 1, head_dim // 2, 2)[..., 0]
-    sin_reshaped = sin.reshape(1, seq_len, 1, head_dim // 2, 2)[..., 0]
-
-    # 复数乘法: (a + ib) * (cos + i sin) = (a*cos - b*sin) + i(a*sin + b*cos)
-    out_real = x_real * cos_reshaped - x_imag * sin_reshaped
-    out_imag = x_real * sin_reshaped + x_imag * cos_reshaped
-
-    out = torch.stack([out_real, out_imag], dim=-1).reshape(
-        batch_size, seq_len, num_heads, head_dim
-    )
-    return out.type_as(x)
+    # 直接使用输入的数据类型进行运算，避免不必要的 float() 转换
+    return (x * cos) + (_rotate_half(x) * sin)
