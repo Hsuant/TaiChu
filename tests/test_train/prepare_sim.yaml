@@ -1,0 +1,32 @@
+task_type: "pretraining"
+dataset_id: "taichu-sim-v1"
+version: "1"
+
+tokenizer_path: "./taichu_tokenizer/tokenizer.json"
+output_dir: "./tests/test_train/unified"
+
+text_column: "text"
+max_seq_length: 64
+
+pad_token: "<|pad|>"
+bos_token: "<|taichu_start|>"
+eos_token: "<|taichu_end|>"
+add_bos: true
+add_eos: true
+invalid_policy: "skip"
+shard_size: 16
+
+cleaning:
+  unicode_form: "NFC"
+  min_chars: 2
+  max_chars: 200000
+  collapse_whitespace: false
+  remove_control_chars: true
+  oversize_policy: "skip"
+  deduplicate: true
+
+splits:
+  train:
+    - "./tests/test_train/train.jsonl"
+  validation:
+    - "./tests/test_train/val.jsonl"
