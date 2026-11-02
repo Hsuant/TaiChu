@@ -1,304 +1,542 @@
 <div align="center">
 
-# TaiChu (太初)
+# TaiChu · 太初
 
-> **从零实现 Decoder-Only Transformer，构建专属于自己的 LLM**  
-> 涵盖 Tokenizer 训练、模型架构、预训练、Agent 扩展的全链路
+**一套从 Tokenizer 到预训练评估，全链路可读、可运行、可审计的 LLM 工程。**
 
-[![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.11+-ee4c2c.svg)](https://pytorch.org/)
-[![Stars](https://img.shields.io/github/stars/Hsuant/TaiChu?style=social)](https://github.com/Hsuant/TaiChu/stargazers)
+不调用现成大模型接口，而是把 Byte-level BPE、Decoder-only Transformer、统一训练数据、
+预训练、检查点和评估拆开讲清楚、写完整。
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.10%2B-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![Scale](https://img.shields.io/badge/Model-80M--190M-0F766E?style=for-the-badge)](#模型预设)
+[![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-6B7280?style=for-the-badge)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/Hsuant/TaiChu?style=for-the-badge&logo=github)](https://github.com/Hsuant/TaiChu)
+
+[项目定位](#项目定位) ·
+[能力全景](#能力全景) ·
+[系统架构](#系统架构) ·
+[模型预设](#模型预设) ·
+[快速开始](#快速开始) ·
+[开发记录](#开发记录) ·
+[已知边界](#已知边界)
 
 </div>
 
 ---
 
-## 🎯 项目初衷
+## 项目定位
 
-在 LLM 遍地开花的今天，TaiChu 选择了一条「反求诸己」的道路：
+TaiChu 不是一层 API 包装，也不是只包含模型定义的最小示例。它试图回答一个更具体的问题：
 
-**从零开始，不依赖预训练模型，亲手写每一行代码。**
+> 如果要从零构建一个可训练的语言模型，代码、数据、指标和工程边界应该怎样组织？
 
-这不是一个简单的 API 调用封装，而是一个完整的 LLM 学习与构建工程。你会发现：
+项目以 **80M、150M、190M** 三档小模型为落点，用可检查的配置和测试串起完整链路：
 
-- **Tokenizer 怎么训？** —— 亲手实现 BPE 训练流程
-- **Attention 怎么做？** —— 从 MHA 到 GQA 再到 Flash Attention
-- **模型怎么训？** —— 从数据加载到分布式训练全链路打通
-- **Agent怎么做** —— 预留扩展接口，深入探索
+```text
+原始语料
+  -> Byte-level BPE Tokenizer
+  -> 统一 Schema 与离线数据准备
+  -> tcbin/tcidx 二进制分片与 mmap 读取
+  -> 采样、Packing、Batch Builder
+  -> Decoder-only Transformer
+  -> 训练、验证、检查点与独立评估
+```
 
-这里没有黑盒，每一层网络、每一个超参数，都清晰可见。
+相比“把模型跑起来”，TaiChu 更关注另外四件事：
 
----
+- **行为可解释**：labels 如何移位、padding 如何屏蔽、KV Cache 如何布局，都在代码中显式表达。
+- **配置可复用**：Tokenizer、模型、数据和训练配置分层，模型规模可通过 YAML 切换。
+- **数据可恢复**：数据集带有版本、Manifest、Content Hash 和可恢复的 DataState。
+- **结果可验证**：通过手工公式对照、形状检查、边界测试和端到端预检发现静默错误。
 
-## ✨ 核心特性
+> 仓库内置的是 **Tokenizer 产物与模型配置**，不包含已经训练好的语言模型权重。模型预设用于复现训练流程和开展小规模研究。
 
-| 模块 | 实现内容 | 亮点 |
-|------|----------|------|
-| **Tokenizer 训练** | BPE 分词器训练、词汇表构建、编解码 | HuggingFace `tokenizers` 高性能后端 |
-| **模型架构** | Decoder-Only Transformer | MHA / GQA、RoPE、SwiGLU、RMSNorm |
-| **训练流程** | 预训练 + 分布式训练 | 混合精度、梯度累积、Checkpoint 管理 |
-| **模型规模** | 50M ~ 1B+ 可配置 | YAML 配置文件一键切换 |
-| **Agent 扩展** | 预留 Tool Use / ReAct 接口 | Roadmap 规划中 |
+## 项目速览
 
----
+| 维度 | 当前状态 |
+|---|---:|
+| Decoder-only 模型预设 | **3 档**：80M / 150M / 190M |
+| 内置 Tokenizer 词表 | **32,768** |
+| 固定特殊 Token | **9 个**，ID 为 `0-8` |
+| 统一数据任务契约 | Pretraining、SFT、Preference、Reward、Trajectory、Multimodal |
+| 测试代码静态清点 | **162 个测试函数** |
+| Git 开发起点 | **2025-07-14** |
+| 最新完整审计记录 | **154 passed, 1 skipped, 120 subtests passed** |
 
-## 📁 项目结构
+目标不是追求参数规模，而是建立一条 **可观察、可复现、可继续扩展** 的小模型基线。
+
+## 能力全景
+
+| 模块 | 已实现 | 工程边界 |
+|---|---|---|
+| **Tokenizer** | Byte-level BPE、NFC、数字拆分、流式语料读取、资源监控、特殊 Token 校验、Chat Template、HF 兼容导出 | 生产语料需要显式传入；默认配置中的外部路径不可直接复用 |
+| **模型** | Pre-Norm Decoder、RoPE、MHA/GQA、SwiGLU、RMSNorm、权重绑定、可选 MoE、KV Cache | 小模型预设均为 Dense；MoE 作为独立架构能力保留 |
+| **生成** | Greedy、Temperature、Top-K、Top-P、EOS、二维 Padding Mask、上下文边界检查 | 尚未实现 Beam Search、Repetition Penalty |
+| **数据** | 多格式流式读取、清洗、精确去重、任务 Adapter、Binary Shard、Manifest、mmap Reader | 当前模型尚未实现文档隔离 Attention |
+| **采样与批处理** | Random、Distributed、Mixer、Shuffle Buffer、Stream/Sample-isolated Packing | 不同任务分别使用独立 Packing 与 Batch Builder |
+| **训练** | AdamW、WSD 调度、BF16/FP16 AMP、梯度累积与裁剪、DDP、`torch.compile` 回退、早停、检查点恢复 | GPU、AMP、FlashAttention 和 NCCL 路径仍需实机验证 |
+| **指标** | Token 加权 Loss、PPL、BPB、Accuracy、CE 分位数、BOS -> EOS 诊断 | 尚未集成 MMLU、C-Eval、HumanEval、GSM8K |
+| **实验管理** | TensorBoard、SwanLab、结构化日志、阶段资源报告、独立评估入口 | 未配置 GitHub Actions CI |
+
+## 系统架构
+
+```mermaid
+flowchart LR
+    A["JSONL / JSONL.GZ / Parquet"] --> B["Task Adapter"]
+    B --> C["Cleaning / Dedup"]
+    C --> D["Tokenizer + Masks"]
+    D --> E["tcbin + tcidx"]
+    E --> F["Manifest + Hash"]
+    F --> G["mmap Reader"]
+    G --> H["Sampler / Mixer"]
+    H --> I["Packing"]
+    I --> J["Batch Builder"]
+    J --> K["TaiChuModel"]
+    K --> L["Loss / Metrics"]
+    K --> M["Checkpoint"]
+    K --> N["Generation / Evaluation"]
+```
+
+### 模型主干
+
+```text
+input_ids
+  -> Token Embedding
+  -> N x TaiChuBlock
+       -> RMSNorm
+       -> RoPE + Causal Self-Attention (MHA / GQA)
+       -> Residual
+       -> RMSNorm
+       -> SwiGLU / Standard FFN / MoE
+       -> Residual
+  -> Final RMSNorm
+  -> Output Head (tied with input embedding)
+  -> logits / loss / KV Cache
+```
+
+关键实现位置：
+
+- [`model/model.py`](model/model.py)：模型组装、Loss、生成、优化器参数分组。
+- [`model/attention.py`](model/attention.py)：掩码计划、因果注意力、GQA、KV Cache。
+- [`model/transformer_block.py`](model/transformer_block.py)：Pre-Norm 解码器块。
+- [`model/feedforward.py`](model/feedforward.py)：SwiGLU、标准 FFN 与 MoE FFN。
+- [`model/positional_encoding.py`](model/positional_encoding.py)：实数形式 RoPE。
+
+## 模型预设
+
+所有预设都与内置 `32768` 词表对齐，上下文长度为 `2048`。
+
+| 规格 | 实际参数量 | Hidden | Layers | Q / KV Heads | FFN | 目标 Token |
+|---|---:|---:|---:|---:|---:|---:|
+| **80M** | 77,611,520 | 512 | 16 | 8 / 2 | 2,048 | 4.0B |
+| **150M** | 149,057,280 | 768 | 18 | 12 / 4 | 2,304 | 5.2B |
+| **190M** | 191,394,816 | 1,024 | 14 | 16 / 4 | 2,816 | 7.0B |
+
+模型与训练配置：
+
+| 规格 | Model YAML | Training YAML | 单步 Padded Token |
+|---|---|---|---:|
+| 80M | [`configs/TaiChu_80M.yaml`](configs/TaiChu_80M.yaml) | [`configs/train_pretrain_80m.yaml`](configs/train_pretrain_80m.yaml) | 524,288 |
+| 150M | [`configs/TaiChu_150M.yaml`](configs/TaiChu_150M.yaml) | [`configs/train_pretrain_150m.yaml`](configs/train_pretrain_150m.yaml) | 524,288 |
+| 190M | [`configs/TaiChu_190M.yaml`](configs/TaiChu_190M.yaml) | [`configs/train_pretrain_190m.yaml`](configs/train_pretrain_190m.yaml) | 524,288 |
+
+三个训练预设都把全局 Batch 设计为约 `0.5M Padded Token / Step`。多卡训练时，
+应按 world size 调整梯度累积，保持全局 Token/Step 不变。
+
+## 快速开始
+
+> 以下命令使用 PowerShell。Bash 用户将行尾反引号 `` ` `` 替换为反斜杠 `\` 即可。
+
+### 1. 环境安装
+
+推荐 Python 3.10+。最新审计环境为 Python 3.13、PyTorch 2.10、CPU only。
+
+```powershell
+git clone https://github.com/Hsuant/TaiChu.git
+cd TaiChu
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+PyTorch 的 CUDA wheel 与平台相关。如需指定 CUDA 版本，建议先按
+[PyTorch 官方安装方式](https://pytorch.org/get-started/locally/) 安装 PyTorch，再安装剩余依赖。
+
+### 2. 验证内置 Tokenizer
+
+```powershell
+python -m trainer.validate_tokenizer `
+  --config configs/TaiChu_Tokenizer_config.yaml `
+  --tokenizer_dir taichu_tokenizer `
+  --vocab_size 32768
+```
+
+该命令会检查词表大小、9 个特殊 Token 的 ID 与文件协议、随机 Unicode 往返、
+单条与批量编码一致性，以及 Hugging Face 兼容加载。
+
+### 3. 检查数据格式
+
+仓库自带小规模样例，可先验证离线数据管线：
+
+```powershell
+python -m dataset.offline.prepare `
+  --config configs/prepare_pretrain_sample.yaml
+```
+
+样例将被写入 `data/unified/sample/`。它只用于格式与链路验证，不代表训练规模。
+
+生产预训练建议使用：
+
+```text
+data/raw/train/        # 训练原始文件
+data/raw/validation/   # 与训练集隔离的验证原始文件
+```
+
+然后运行：
+
+```powershell
+python -m dataset.offline.prepare `
+  --config configs/prepare_pretrain_data.yaml
+```
+
+默认会生成 `data/unified/taichu_80m/{train,validation}/`，与 80M 训练配置一致。
+切换到 150M 或 190M 时，需要同步修改准备配置的 `dataset_id`、`output_dir`，
+以及训练配置中的 `storage.train_path` 与 `storage.validation_path`。
+
+### 4. 运行 Next-Token 预检
+
+正式训练前先验证 logits/labels 移位、CrossEntropy、Padding/Causal Mask、梯度、
+优化器单步更新、SFT Loss Mask 和 Packing 边界：
+
+```powershell
+python benchmarks/preflight_next_token.py `
+  --model-config configs/TaiChu_80M.yaml `
+  --report reports/next_token_pipeline_report_80m.json
+```
+
+报告状态必须为 `PASS`。快速调试可改用
+[`tests/test_train/model_sim.yaml`](tests/test_train/model_sim.yaml) 降低资源占用。
+
+### 5. 启动预训练
+
+单进程或单卡：
+
+```powershell
+python -m trainer.train_pretrain `
+  --model_config configs/TaiChu_80M.yaml `
+  --pretrain_config configs/train_pretrain_80m.yaml
+```
+
+`torchrun` 多卡启动：
+
+```powershell
+torchrun --standalone --nproc_per_node=4 `
+  -m trainer.train_pretrain `
+  --model_config configs/TaiChu_80M.yaml `
+  --pretrain_config configs/train_pretrain_80m.yaml
+```
+
+从中断检查点恢复：
+
+```powershell
+python -m trainer.train_pretrain `
+  --model_config configs/TaiChu_80M.yaml `
+  --pretrain_config configs/train_pretrain_80m.yaml `
+  --resume experiments/small_models/taichu_80m_pretrain_v1/checkpoints/checkpoint-1000.pt
+```
+
+常用命令行覆盖项：
+
+```powershell
+python -m trainer.train_pretrain --help
+```
+
+每次运行会创建独立实验目录，并生成：
+
+```text
+experiments/small_models/<experiment_name>/
+├── best_models/
+├── checkpoints/
+├── final_models/
+└── logs/
+```
+
+### 6. 独立评估
+
+```powershell
+python -m eval.eval_pretrain_model `
+  --model_config configs/TaiChu_80M.yaml `
+  --pretrain_config configs/train_pretrain_80m.yaml `
+  --exp_dir experiments/small_models/taichu_80m_pretrain_v1 `
+  --generate `
+  --num_generate_tokens 32
+```
+
+默认加载 `best_models/best_model.pt`；也可通过 `--checkpoint` 指定其他检查点。
+评估结果写入实验目录下的 `evaluation/` 子目录。
+
+### 7. 运行测试
+
+```powershell
+python -m pytest -q
+```
+
+测试覆盖模型形状与数值对照、因果掩码、GQA/MHA、KV Cache、生成一致性、
+SwiGLU、RMSNorm、MoE、Checkpoint、数据 Schema、Binary Storage、离线准备、
+Runtime 数据流和训练完整性。
+
+## 最小推理示例
+
+```python
+import torch
+from tokenizers import Tokenizer
+
+from model import TaiChuModel
+from utils.checkpoint import strip_checkpoint_prefixes
+from utils.config_loader import load_model_config
+
+tokenizer = Tokenizer.from_file("taichu_tokenizer/tokenizer.json")
+config = load_model_config("configs/TaiChu_80M.yaml")
+model = TaiChuModel(config).eval()
+
+# 没有加载训练权重时，输出来自随机初始化模型。
+checkpoint = torch.load(
+    "experiments/small_models/taichu_80m_pretrain_v1/final_models/final_model.pt",
+    map_location="cpu",
+)
+state_dict = strip_checkpoint_prefixes(checkpoint["model_state_dict"])
+model.load_state_dict(state_dict)
+
+prompt_ids = tokenizer.encode("太初是什么？", add_special_tokens=False).ids
+input_ids = torch.tensor([prompt_ids], dtype=torch.long)
+output_ids = model.generate(
+    input_ids,
+    max_new_tokens=32,
+    temperature=0.8,
+    top_k=50,
+    top_p=0.9,
+    eos_token_id=tokenizer.token_to_id("<|taichu_end|>"),
+)
+
+print(tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True))
+```
+
+## Tokenizer 协议
+
+内置 Tokenizer 使用 Byte-level BPE、NFC 归一化、数字拆分和
+`add_special_tokens=False` 的显式特殊 Token 控制。固定 ID 如下：
+
+| ID | Token | 用途 |
+|---:|---|---|
+| 0 | `<\|pad\|>` | Padding |
+| 1 | `<unk>` | Unknown |
+| 2 | `<\|endoftext\|>` | 文档结束 |
+| 3 | `<\|taichu_start\|>` | BOS，消息开始 |
+| 4 | `<\|taichu_end\|>` | EOS，消息结束 |
+| 5 | `<\|think\|>` | 思考区段开始 |
+| 6 | `<\|/think\|>` | 思考区段结束 |
+| 7 | `<\|ghissue\|>` | 项目保留 Token |
+| 8 | `<\|final\|>` | 项目保留 Token |
+
+Chat Template 支持 system、user、assistant 多轮消息、`reasoning_content`、
+空消息过滤和 `add_generation_prompt`。
+
+重新训练 Tokenizer：
+
+```powershell
+python -m trainer.train_tokenizer `
+  --config configs/TaiChu_Tokenizer_config.yaml `
+  --data_files D:\data\corpus.jsonl `
+  --report experiments/tokenizer_memory.json
+```
+
+默认配置包含作者本机的外部语料路径，实际使用时必须通过 `--data_files` 覆盖。
+资源受限环境可增加 `--low-memory`。
+
+## 统一数据基础设施
+
+项目只保留一条训练数据主路径：
+
+```text
+Raw records
+  -> task preprocessing adapter
+  -> cleaning / exact dedup
+  -> tokenization / masks / metadata
+  -> tcbin + tcidx shards
+  -> manifest + content hash
+  -> indexed mmap reader
+  -> sampler / mixer
+  -> packing
+  -> batch builder
+  -> model input adapter
+```
+
+`tcbin` 保存 Metadata 与按字段编码的一维数组，`tcidx` 保存定长 Record Offset。
+Reader 通过只读 `mmap` 随机访问样本，训练热路径不重新读取 JSONL，也不重复 Tokenize。
+
+| 任务 | 数据契约 | Packing | 当前工程状态 |
+|---|---|---|---|
+| Pretraining / CPT | `PretrainingSample` | Stream | 已接入预训练 |
+| SFT / Instruction Tuning | `SFTSequenceSample` | Sample-isolated | 数据契约与 Batch 已实现，训练器未接入 |
+| Preference / DPO / IPO / KTO | `PreferenceSample` | Disabled | 数据契约已实现，优化目标未实现 |
+| Reward Model | `RewardSample` | Disabled | 数据契约已实现，Reward Head 未实现 |
+| RLHF / PPO / GRPO | `TrajectorySample` | Disabled | 离线/在线数据接口已预留，算法未实现 |
+| Multimodal | `MultimodalSample` | 模型决定 | Schema 已预留，训练未接入 |
+
+完整 Schema、模块依赖、Packing 与扩展规则见
+[`docs/UNIFIED_DATA_INFRASTRUCTURE.md`](docs/UNIFIED_DATA_INFRASTRUCTURE.md)。
+
+## 损失与指标
+
+因果语言模型损失只在模型内部执行一次 shift：
+
+```text
+shift_logits = logits[:, :-1, :]
+shift_labels = labels[:, 1:]
+loss = CrossEntropy(shift_logits, shift_labels, ignore_index=-100)
+```
+
+数据层保持 labels 与 input_ids 对齐，不做提前移位。Padding 位置的 mask 必须为 `0`，
+对应 label 必须为 `-100`。
+
+验证阶段输出：
+
+| 指标 | 含义 |
+|---|---|
+| `val_loss` | 有效 Next-Token 的 Token 加权交叉熵 |
+| `val_perplexity` | `exp(val_loss)`，仅适合同 Tokenizer 内比较 |
+| `val_bpb` | 排除特殊 Token 后的 Bits per UTF-8 Byte |
+| `val_accuracy` | Next-Token Top-1 Accuracy |
+| `val_ce_p50/p90/p95` | 逐 Token CE 的精确分位数 |
+| `empty_prefix_eos_ce/ppl` | 可选 `[BOS, EOS]` 转移诊断，默认关闭 |
+
+无效指标返回 `None/null`，不会写入 `Infinity` 或 `NaN`。
+公式、分布式聚合与边界处理见 [`docs/METRICS_AUDIT.md`](docs/METRICS_AUDIT.md)。
+
+## 项目目录
 
 ```text
 TaiChu/
-├── configs/                     # 配置文件目录
-│   ├── TaiChu_LLM.yaml         # 模型配置
-│   └── tokenizer_config.yaml   # Tokenizer 训练配置
-├── model/                       # 模型核心代码
-│   ├── attention.py             # 因果自注意力（MHA / GQA + RoPE）
-│   ├── transformer_block.py    # Transformer 解码器层
-│   ├── model.py                 # TaiChuModel 主模型
-│   ├── config.py                # 超参数配置类
-│   ├── embedding.py             # 词嵌入层
-│   ├── positional_encoding.py   # RoPE 旋转位置编码
-│   ├── normalization.py         # RMSNorm
-│   ├── output_head.py           # 输出头
-│   └── moe.py                   # MoE（混合专家）扩展
-├── tokenizer/                   # Tokenizer 训练与推理
-│   ├── train_tokenizer.py       # BPE 分词器训练脚本
-│   ├── tokenizer.py             # 分词器加载与使用
-│   ├── decoder.py               # 推理解码
-│   ├── corpus.py                # 训练语料处理
-│   └── __init__.py
-├── dataset/                     # 数据加载模块
-│   ├── train/                   # 训练集
-│   ├── eval/                    # 评估集
-│   ├── test/                    # 测试集
-│   └── llm_dataset.py           # 预训练数据集（HuggingFace 集成）
-├── trainer/                     # 训练引擎
-│   ├── distributed_train.py     # 分布式训练入口
-│   ├── train_pretrain.py        # 预训练主逻辑
-│   ├── train_tokenizer.py       # tokenizer训练主逻辑
-│   └── __init__.py
-├── utils/                       # 工具模块
-│   ├── config_loader.py         # 统一配置加载
-│   ├── checkpoint.py            # 检查点管理（保存/恢复）
-│   ├── logger.py                # 日志管理
-│   ├── model_utils.py           # 模型相关工具（模型权重初始化策略、模型摘要、参数与 FLOPs 统计、梯度监控等功能）
-│   ├── train_utils.py           # 训练相关工具（随机种子设置、设备获取、时间格式化、参数量统计等）
-│   ├── visualization.py         # 可视化相关工具
-│   └── __init__.py
-├── tests/                       # 单元测试
-│   ├── test_model.py            # 模型前向/反向测试
-│   └── test_tokenizer.py        # Tokenizer 测试
-│   └── ……
-├── README.md                    # 项目简介
-├── requirements.txt             # 项目依赖
-└── LICENSE                      # CC BY-NC 4.0 许可证
+├── model/                    # Attention、RoPE、FFN、MoE、Transformer、生成
+├── tokenizer/                # BPE 训练、读取、归一化、验证与导出
+├── dataset/
+│   ├── schema/               # 多任务类型化样本契约
+│   ├── storage/              # tcbin/tcidx、Manifest、mmap Reader
+│   ├── offline/              # 流式读取、清洗、去重、Adapter、准备入口
+│   ├── sampling/             # Random、Distributed、Mixer、Shuffle
+│   ├── packing/              # Stream 与 Sample-isolated Packing
+│   ├── batching/             # Batch Builder、Padding、Segment 对齐
+│   ├── adapters/             # Model Input Adapter
+│   └── runtime/              # DataLoader、在线 Buffer、Resume
+├── trainer/                  # Tokenizer 训练、模型预训练与启动入口
+├── eval/                     # Tokenizer 与预训练模型独立评估
+├── utils/                    # 配置、指标、日志、Checkpoint、可视化
+├── benchmarks/               # Next-Token 预检与数据吞吐基准
+├── configs/                  # 模型、训练、数据与 Tokenizer YAML
+├── data/
+│   ├── samples/              # 仓库内样例数据
+│   ├── eval/                 # 评估样例
+│   └── raw|unified/          # 生产数据目录，默认不提交
+├── tests/                    # 单元、集成与端到端测试
+└── taichu_tokenizer/         # 内置 32K Tokenizer 产物
 ```
 
----
+## 开发记录
 
-## 🚀 技术全景
+TaiChu 的开发过程本身就是项目的一部分。以下时间线来自 Git 提交与仓库审计文档，
+记录了项目从模型原型走向统一训练系统的过程。
 
-### 🔤 Tokenizer：让模型「读懂」你的语言
+| 时间 | 里程碑 | 主要变化 |
+|---|---|---|
+| **2025-07-14** | 项目起步 | 初始模型、KV Cache、预训练框架、日志和基础测试进入仓库 |
+| **2025-07 至 2025-09** | 模型与训练原型 | 持续重构 Attention、位置编码、FFN、数据集与训练循环 |
+| **2025-11 至 2025-12** | 训练框架成形 | 权重绑定、生成、验证集、最佳模型保存与配置体系完善 |
+| **2026-05** | 工程重建 | 调整 GQA、WSD Scheduler、`torch.compile`、混合精度和实验目录管理 |
+| **2026-06** | Tokenizer 专项 | 使用双语语料重训 Tokenizer，引入 NFC、数字拆分、HF 兼容与质量评估 |
+| **2026-10-26** | 系统审计 | 对 Tokenizer、数据、损失、指标、训练、配置和文档做一致性审计 |
+| **2026-11-02** | 统一基础设施 | 引入类型化 Schema、Binary mmap 数据、Runtime Resume、三档小模型配置与端到端预检 |
 
-```python
-# 从零训练一个 BPE 分词器
-from tokenizer import train_tokenizer
+截至 **2026-11-02**，仓库累计约 **394 次提交**，经历了“原型验证 -> 重构 -> 审计 ->
+统一数据基础设施”的完整演进。开发记录不只是功能增加，也包含多次删除旧加载器、
+修正监督语义和收窄文档承诺。
 
-train_tokenizer(
-    files=["./data/corpus.jsonl"],  # 训练语料
-    vocab_size=50000,                # 词表大小
-    output_dir="./my_tokenizer"      # 输出目录
-)
+## 验证基线
+
+最新完整审计记录来自 **2026-10-26**：
+
+```text
+154 passed, 1 skipped, 120 subtests passed
 ```
 
-**实现要点：**
-- 基于 HuggingFace `tokenizers` 高性能后端
-- 支持 BPE（Byte-Pair Encoding）算法
-- 自定义特殊标记：`<|im_start|>`、`<|im_end|>`、`<|pad|>`
-- 训练完成后导出 `tokenizer.json`，可直接用于模型编解码
+验证重点包括：
 
-### 🧠 模型架构：Decoder-Only 的核心实现
+- 特殊 Token ID、文件协议、Chat Template 和 Unicode 往返。
+- Full Load 与 Parquet/Worker 分片的一致性。
+- labels、attention mask、packing 和 Worker 所有权。
+- Attention 手工参考、因果性、MHA/GQA、KV Cache。
+- SwiGLU、RMSNorm、MoE、主损失与辅助损失。
+- PPL、BPB、Accuracy、CE 分位数和严格 JSON 输出。
+- Checkpoint 保存/恢复、独立评估和生成。
 
-```python
-# 加载配置并初始化模型
-from utils.config_loader import load_model_config
-from model.model import TaiChuModel
+后续提交又增加了架构、训练完整性和统一数据相关测试。当前测试目录静态清点为
+**162 个测试函数**；在 GPU 或多卡环境使用前，仍应在目标机器重新执行完整测试。
 
-config = load_model_config("configs/TaiChu_77M.yaml")
-model = TaiChuModel(config)
-```
+历史审计的 CPU 模拟训练完成了 79 个优化步，并跑通训练、验证、Checkpoint、
+日志和独立评估。其结果只证明链路有效，不代表小模型已经具备可用的语言能力。
 
-**架构亮点：**
+完整证据和剩余风险见 [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md)。
 
-| 组件 | 实现 | 说明 |
-|------|------|------|
-| **注意力机制** | MHA / GQA | 支持 Grouped Query Attention 减少 KV 缓存 |
-| **位置编码** | RoPE（旋转位置编码）| 苏剑林团队论文实现，支持长序列外推 |
-| **前馈网络** | SwiGLU | 现代 LLM 标配，比标准 FFN 更优 |
-| **归一化** | RMSNorm | 比 LayerNorm 更快，效果相当 |
-| **MoE（可选）** | 混合专家 | 支持动态路由扩展模型容量 |
+## 已知边界
 
-### 📊 训练流程：从数据到 Checkpoint
+| 边界 | 当前影响 | 后续方向 |
+|---|---|---|
+| CUDA、AMP、FlashAttention 未完成实机审计 | 不能宣称 GPU 训练路径已稳定 | 在 Ampere/Hopper GPU 上复跑测试与短训练 |
+| 多卡 NCCL 未完成实机验证 | 不能宣称 DDP 稳定性 | 使用 2/4 卡 `torchrun` 做通信与恢复测试 |
+| 无 Activation Checkpointing | 低显存训练 150M/190M 受限制 | 在 Transformer Block 增加可配置重计算 |
+| Packing 未实现文档隔离 Attention | Packed 文档之间仍使用普通 Causal Mask | 使用 `document_ids` / `segment_ids` 构造块对角 Mask |
+| 无下游 Benchmark | 无法评价知识、推理、代码与安全能力 | 接入 MMLU、C-Eval、HumanEval、GSM8K 等 |
+| 分布式分位数需要 gather 逐 Token Loss | 超大验证集增加 CPU 内存与通信 | 增加分块量化或可配置采样 |
+| MFU 使用近似 FLOPs 公式 | 只能作为硬件效率参考 | 接入更精确的算子级 FLOP 统计 |
+| SFT/Preference/RLHF 仅完成数据契约 | 不能把 Schema 误认为算法已支持 | 分别实现训练器、Loss、Reference Model 与 Rollout |
+| Tokenizer 配置包含外部语料路径 | 直接运行生产训练会找不到数据 | 使用 `--data_files` 或维护本地配置副本 |
 
-```python
-# 预训练启动命令（示例）
-python -m trainer.train_pretrain --model_config configs/TaiChu_LLM.yaml --pretrain_config configs/train_pretrain_config.yaml
-```
+## 文档导航
 
-**训练特性：**
-- ✅ 混合精度训练（FP16 / BF16）
-- ✅ 梯度累积，突破显存限制
-- ✅ 分布式训练（DDP），支持多卡扩展
-- ✅ Warmup + Cosine Decay 学习率调度
-- ✅ Checkpoint 滚动保存 + 最佳模型自动选取
+| 文档 | 内容 |
+|---|---|
+| [`docs/AUDIT_REPORT.md`](docs/AUDIT_REPORT.md) | 系统审计、问题修复、测试证据与剩余风险 |
+| [`docs/UNIFIED_DATA_INFRASTRUCTURE.md`](docs/UNIFIED_DATA_INFRASTRUCTURE.md) | 多任务数据生命周期、Schema、Storage、Runtime 与扩展规则 |
+| [`docs/TOKENIZER_OPTIMIZATION_REPORT.md`](docs/TOKENIZER_OPTIMIZATION_REPORT.md) | Tokenizer 设计、资源测量、特殊 Token 与 Chat Template |
+| [`docs/METRICS_AUDIT.md`](docs/METRICS_AUDIT.md) | Loss、PPL、BPB、MoE 辅助损失与指标边界 |
+| [`dataset/ARCHITECTURE.md`](dataset/ARCHITECTURE.md) | Dataset 包分层与依赖方向 |
+| [`dataset/README.md`](dataset/README.md) | Dataset 公共 API 与任务入口 |
+| [`dataset/offline/README.md`](dataset/offline/README.md) | 原始记录到 Binary Dataset 的离线准备流程 |
+| [`data/README.md`](data/README.md) | 样例数据、生产数据目录与忽略规则 |
 
-**数据集处理：**
-- 基于 HuggingFace `datasets` 库，支持 JSON/JSONL 格式
-- 自动添加 BOS/EOS 标记，PAD 填充位置标签设为 -100 忽略损失
+## 许可证
 
-### 🔧 配置体系：模块化、可扩展
+仓库根目录使用 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)：
+允许署名非商业使用、修改与再分发，禁止未经授权的商业用途。商业授权请联系
+[`hsuantx@163.com`](mailto:hsuantx@163.com)。
 
-项目采用 **YAML 配置 + Python 数据类** 的双层设计：
+`taichu_tokenizer/tokenizer_config.json` 的 `model_info` 中仍有历史上的
+“Apache 2.0”元数据；发布或再分发时，应统一以仓库根目录的 `LICENSE` 为准并修正该元数据。
 
-- **模型配置**（`model/config.py`）：隐藏层维度、头数、层数、激活函数等
-- **训练配置**（`configs/train_pretrain_config.yaml`）：学习率、batch size、优化器参数
-- **Tokenizer 配置**（`configs/tokenizer_config.yaml`）：词表大小、训练语料路径
+## 参考
 
-通过 `ConfigLoader` 统一加载，支持命令行参数覆盖。
-
----
-
-## 📦 快速开始
-
-### 环境要求
-
-- Python 3.9+
-- CUDA 11.8+（推荐，CPU 也可运行但速度较慢，CPU仅用于测试）
-
-### 安装依赖
-
-```bash
-git clone https://github.com/Hsuant/TaiChu.git
-cd TaiChu
-pip install -r requirements.txt
-```
-
-### 配置实验监控
-
-使用 SwanLab 可视化训练过程（损失曲线、学习率、梯度等）：
-
-```bash
-# 安装 SwanLab
-pip install swanlab
-
-# 登录并输入你的 API Key（从 https://swanlab.cn 获取）
-swanlab login
-```
-
-> 提示：如果仅作测试或无需云端记录，可跳过此步骤。训练脚本会自动检测 `swanlab` 是否可用。
-
-
-### 训练你的第一个模型
-
-```bash
-# 1. 准备语料（JSONL 格式，每条为 {"text": "内容"}）
-# 2. 训练 Tokenizer
-python -m trainer.train_tokenizer --config configs/tokenizer_config.yaml
-
-# 3. 开始预训练
-python -m trainer.train_pretrain.py --config configs/TaiChu_50m.yaml
-
-# 4. 测试生成效果
-python -c "from model.model import TaiChuModel; ..."  # 详见 tests/test_model.py
-```
-
-### 单元测试
-
-```bash
-python -m pytest tests/
-```
-
----
-
-## 🧪 模型测试
-
-项目内置完整的单元测试，覆盖核心功能：
-
-- 前向传播形状验证
-- 带 labels 的损失计算
-- 带 attention_mask 的因果掩码
-- KV Cache 增量推理
-- MoE 层路由测试
-- ……
-
-
----
-
-## 🗺️ 未来路线图
-
-> 初心延续：从 Tokenizer → LLM → Agent 的完整链路
-
-| 阶段 | 目标 | 状态 |
-|------|------|------|
-| **Phase 1** | Tokenizer 训练与模型基础架构 | ✅ 已完成 |
-| **Phase 2** | 预训练全流程 + 分布式训练 | ✅ 已完成 |
-| **Phase 3** | Instruction Tuning + SFT | 🔄 进行中 |
-| **Phase 4** | Agent 能力扩展（Tool Use / ReAct / Memory）| 📅 规划中 |
-| **Phase 5** | 模型部署与服务化（vLLM / TGI 集成）| 📅 规划中 |
-
-**Agent 扩展方向：**
-- 工具调用（Tool Use）：让 LLM 能够调用外部 API
-- 记忆机制（Memory）：短期/长期记忆管理
-- ReAct 框架：推理 + 行动的循环决策
-- 多 Agent 协作与编排
-
----
-
-## 🤝 贡献指南
-
-欢迎共建！TaiChu 是一个完全开源的学习型项目，特别欢迎以下方向的贡献：
-
-- 模型架构优化（如 MoE、MLA 等新机制）
-- 更高效的训练 pipeline（数据集预处理加速）
-- Agent 模块的代码实现
-- Bug 修复与文档完善
-
-**提交前请确保：**
-1. 代码通过现有单元测试
-2. 新增功能有对应的测试覆盖
-3. 遵循 CC BY-NC 4.0 许可证规范
-
----
-
-## 📜 许可证
-
-本项目采用 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) 许可证：
-
-- ✅ 允许共享、复制、修改
-- ❌ **禁止商业用途**（如需商业授权，请联系 hsuantx@163.com）
-- 🔗 需标注原作者（ZhangYao Xiang）
-
-
----
-
-## 📖 相关资源
-
-- [博客主页](https://blog.devnest.top) —— 技术细节与学习笔记
-- [Transformer 论文](https://arxiv.org/abs/1706.03762) —— Attention Is All You Need
-- [RoPE 论文](https://arxiv.org/abs/2104.09864) —— 旋转位置编码
-- [GQA 论文](https://arxiv.org/abs/2305.13245) —— Grouped Query Attention
-
----
-
-## 🙏 致谢
-
-- 感谢所有为开源 LLM 生态做出贡献的开发者们
-
----
+- [Attention Is All You Need](https://arxiv.org/abs/1706.03762)
+- [RoFormer: Enhanced Transformer with Rotary Position Embedding](https://arxiv.org/abs/2104.09864)
+- [GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints](https://arxiv.org/abs/2305.13245)
+- [Root Mean Square Layer Normalization](https://arxiv.org/abs/1910.07467)
+- [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202)
+- [Switch Transformers](https://arxiv.org/abs/2101.03961)
+- [ST-MoE: Designing Stable and Transferable Sparse Expert Models](https://arxiv.org/abs/2202.08906)
 
 <div align="center">
 
-**💡 TaiChu 的意义：不只是一个模型，更是一份从零开始的 LLM 学习指南**
-
-*如果这个项目对你有帮助，欢迎点亮 ⭐ Star*
+**从一行 Token 开始，把语言模型的每一层真正跑通。**
 
 </div>
