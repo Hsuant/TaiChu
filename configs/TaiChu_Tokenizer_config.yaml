@@ -1,214 +1,58 @@
-# ============================================================================
-# TaiChu Tokenizer 训练配置文件
-# 兼容 HuggingFace tokenizers 库，支持 Byte-Level BPE。
-# ============================================================================
+# TaiChu Byte-Level BPE Tokenizer training configuration.
 
-# ---------------------------- 数据配置 ----------------------------
 data:
-  # 训练文件列表（支持绝对路径或相对路径）
   files:
-    - "./TaiChu/merge_wiki_ch.jsonl"
-
-  # 数据集遍历次数（通常设为 1，避免过拟合）
+    # Formal 4.0 GB tokenizer corpus: Chinese 3.201 GB + English 0.803 GB.
+    - 'E:\Academic\Datasets\TaiChu\Pretrain\tokenizer\ch\*.jsonl'
+    - 'E:\Academic\Datasets\TaiChu\Pretrain\tokenizer\en\*.jsonl'
   epoch: 1
-
-  # JSON 对象中存储文本的字段名
   text_key: "text"
 
-  # 单条文本的最大字节长度，超过此长度将被截断（防止异常长文本拖慢训练）
-  max_text_length: 200000  # 200 KB
-
-  # 数据预取使用的进程数（根据 CPU 核心数调整，0 表示自动使用全部核心）
-  num_workers: 8
-
-  # 多进程模式下每个任务包含的行数（块大小）
-  # 推荐 1000~10000：块越小内存越稳但进程通信开销略增，块越大吞吐量越高但主进程内存稍增
-  chunk_size: 5000
-
-  # 是否跳过空文本或仅包含空白字符的文本
+  # Character-based guard, not a byte count. Truncation is counted in logs.
+  max_text_chars: 200000
   skip_empty: true
 
-# ---------------------------- 规范化器配置 ----------------------------
-# 规范化器在预分词之前执行，用于清洗文本、统一字符表示。
-# 支持 none（跳过规范化）或 sequence（组合多个步骤）。
+  # The old Python process pool is intentionally disabled. Tokenizers performs
+  # native pretokenization in parallel without duplicating the Python heap.
+  num_workers: 1
+
+  # Only used for a top-level JSON object. JSONL and top-level JSON arrays are
+  # always streamed and do not need this setting.
+  json_prefix: null
+  allow_full_json_load: false
+
+# NFC preserves Chinese punctuation and avoids collapsing newlines or code
+# indentation. Whitespace normalization caused lossy tokenizer round trips.
 normalizer:
-  type: "sequence"             # 组合多个规范化步骤
-  steps:
-    - type: "nfc"              # Unicode NFC 标准化，统一全角/半角、连字等
-    - type: "replace"          # 将多个连续空白字符（空格、制表符等）替换为单个空格
-      pattern: "\\s+"
-      content: " "
-    - type: "strip"            # 去除首尾空格
+  type: "nfc"
 
-# ---------------------------- 预分词器配置 ----------------------------
 pre_tokenizer:
-  type: "bytelevel"            # Byte-Level BPE，鲁棒性强，可直接处理任意字节
-  add_prefix_space: false      # 不在文本前添加空格
-  use_regex: true              # 使用 GPT-2 风格的正则模式进行初始分词
-  digit_split: true            # 启用数字拆分
+  type: "bytelevel"
+  add_prefix_space: false
+  use_regex: true
+  digit_split: true
 
-# ---------------------------- BPE 训练器配置 ----------------------------
 trainer:
-  vocab_size: 64000            # 目标词表大小
-  min_frequency: 3             # 最低词频，过滤出现次数低于该值的 token（减少噪声）
-  show_progress: true          # 显示训练进度条
-  # 特殊 token 列表：这些 token 会被直接加入词表，且不会被 BPE 拆分
-  special_tokens:
-    - "<unk>"                  # 未登录词标记
-    - "<|endoftext|>"          # 文档结束标记
-    - "<|im_start|>"           # 消息起始
-    - "<|im_end|>"             # 消息结束（同时复用为 pad_token）
-    - "<|think|>"              # 思考内容开始
-    - "<|/think|>"             # 思考内容结束
+  vocab_size: 32768
+  min_frequency: 2
+  show_progress: true
 
-# ---------------------------- 模型元信息 ----------------------------
-# 该节不会被 tokenizer 训练过程使用，但会被写入 tokenizer_config.json中，作为词表/分词器的元数据，供下游识别、版本追踪和溯源。
+runtime:
+  monitor_interval_seconds: 0.1
+  progress_every_records: 100000
+  # true 时在训练进程内执行完整 Transformers 重载和 Jinja 渲染，峰值会明显增加。
+  # 轻量原生重载默认开启；完整验证可用 trainer.validate_tokenizer 单独执行。
+  full_reload_validation: false
+
 model_meta:
-  name: "TaiChu-0.3B"            # 模型名称，通常与对应的 LLM 名称保持一致，便于关联。
-  version: "1.0.0"               # 分词器版本号。当词表或配置更新时，可递增版本号以区分。
-  author: "Hsuan Tong"           # 作者或团队名称，用于标明所有权或贡献者。
-  license: "Apache 2.0"          # 许可证类型，明确使用和分发权限。
-  description: "Tokenizer for TaiChu large language model" # 简短描述，说明该分词器的用途。
+  name: "TaiChu"
+  version: "1.0.0"
+  author: "Hsuan Tong"
+  license: "Apache 2.0"
+  description: "Tokenizer for TaiChu large language model"
   contact: "hsuantx@163.com"
 
-# ---------------------------- Chat Template（Jinja2） ----------------------------
-# 模板功能概述
-# ============================================
-# 用于 Transformers 库的 apply_chat_template 方法
-# 模板引擎：Jinja2
-# 格式规范：ChatML 对话格式
-#
-# 支持的角色
-# --------------------------------------------
-# - system     : 系统消息
-# - user       : 用户输入
-# - assistant  : 模型回复
-#
-# 扩展字段
-# --------------------------------------------
-# - reasoning_content : 模型的思考过程，位于 assistant 消息中
-#                       输出时以 <|think|> 标签包裹
-#
-# 特性
-# --------------------------------------------
-# - 支持多轮对话
-# - 支持系统消息
-# - 支持思考标签输出
-#
-# 设计原则与实现
-# --------------------------------------------
-# 1. 覆盖边界情况：确保处理 system 角色的多种表达、空消息、列表与字典格式等内容类型。
-#    最终返回一个符合预期的字符串，具备更高的工程鲁棒性。
-# 2. 避免格式错误：增加 token 过滤和格式化有效性检查，防止生成异常输出。
-# 3. 逻辑清晰：Jinja 模板与核心逻辑分离，基于 OpenChat 等的实现，将可视化与渲染分开，
-#    使代码易于理解和维护。
-# 4. 内置注释：帮助团队快速理解和维护。
-chat_template: |
-  {#- 
-      适用于 ChatML 格式的单模态文本模型
-      特性：
-      1. 支持系统消息（优先级：messages[0] > default_system_message）
-      2. 支持 Assistant 内容延续（当最后一条消息为 assistant 且 add_generation_prompt=True 时不闭合标记）
-      3. 严格空白控制（所有标签均使用 - 控制符）
-      4. 每个消息块结束后均添加换行符
-      5. 支持 reasoning_content（以 <|think|>...</|think|> 包裹）
-      6. 过滤空 content 的消息
-      7. 不包含工具调用、多模态等扩展功能
-  #}
-
-  {#- 
-      [可选] 预留命名空间，用于未来可能的扩展（如图像计数）。
-      当前未实际使用，但保留以保持结构一致性。
-  #}
-  {%- set image_count = namespace(value=0) -%}
-
-  {#-
-      ==================== 系统消息处理 ====================
-      优先级：
-      1. 如果 messages[0]['role'] == 'system'，使用该内容作为系统提示。
-      2. 否则，如果传入了 default_system_message 参数，则使用该内容。
-      3. 否则，无系统消息。
-      
-      系统消息格式：<|im_start|>system\n{content}<|im_end|>\n
-      注意：末尾的换行符 \n 是 Qwen 官方格式要求，用于分隔消息。
-  #}
-  {%- if messages[0]['role'] == 'system' -%}
-      {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' -}}
-      {%- set system_processed = true -%}
-      {%- set loop_messages = messages[1:] -%}
-  {%- elif default_system_message is defined -%}
-      {{- '<|im_start|>system\n' + default_system_message + '<|im_end|>\n' -}}
-      {%- set system_processed = true -%}
-      {%- set loop_messages = messages -%}
-  {%- else -%}
-      {%- set loop_messages = messages -%}
-  {%- endif -%}
-
-  {#-
-      ==================== 遍历并格式化所有消息 ====================
-      对每条消息，根据其角色（user / assistant）应用不同的格式。
-      严格使用空白控制符（-）避免模板中的换行/空格污染输出。
-  #}
-  {%- for message in loop_messages -%}
-      {#- 跳过 content 为空或无效的消息，防止输出孤立的标记对 #}
-      {%- if message.get('content') is none or message.content|length == 0 -%}
-          {%- continue -%}
-      {%- endif -%}
-
-      {#- ---------- 用户消息 ---------- #}
-      {%- if message['role'] == 'user' -%}
-          {{- '<|im_start|>user\n' -}}
-          {{- message['content'] | string -}}
-          {{- '<|im_end|>\n' -}}   {# 结束标签后紧跟换行符 #}
-
-      {#- ---------- 助手消息 ---------- #}
-      {%- elif message['role'] == 'assistant' -%}
-          {{- '<|im_start|>assistant\n' -}}
-
-          {#- 可选：处理 reasoning_content（如思维链） #}
-          {%- if message.get('reasoning_content') and message['reasoning_content'] | trim -%}
-              {{- '<|think|>' + message['reasoning_content'] + '<|/think|>\n' -}}
-          {%- endif -%}
-
-          {#- 输出助手的主要内容 #}
-          {{- message['content'] | string -}}
-
-          {#-
-              关键：Assistant 内容延续支持
-              如果当前消息是最后一条消息，并且 add_generation_prompt 为 True，
-              则**不输出** <|im_end|> 及其后的换行符，使得模型可以从此处直接继续生成。
-              否则，正常闭合消息块。
-          #}
-          {%- if not (loop.last and add_generation_prompt) -%}
-              {{- '<|im_end|>\n' -}}
-          {%- endif -%}
-
-      {#- ---------- 其他角色（预留，未实现） ----------#}
-      {%- else -%}
-          {#- 静默忽略非 user/assistant 的消息，保持向后兼容。可在此处添加警告日志。 #}
-      {%- endif -%}
-  {%- endfor -%}
-
-  {#-
-      ==================== 生成提示（Generation Prompt）处理 ====================
-      当 add_generation_prompt 为 True 时，添加一个未闭合的 assistant 起始标记，
-      引导模型开始生成回复。
-      
-      注意：
-      - 如果最后一条消息已经是 assistant 并且我们在上一步中已经故意未闭合它（延续场景），
-        则**不再**添加新的 <|im_start|>assistant\n，避免重复。
-      - 否则，正常添加。
-  #}
-  {%- if add_generation_prompt -%}
-      {%- if not (loop_messages and loop_messages[-1]['role'] == 'assistant') -%}
-          {{- '<|im_start|>assistant\n' -}}
-      {%- endif -%}
-  {%- endif -%}
-
-# ---------------------------- 解码器配置 ----------------------------
-decoder:
-  type: "bytelevel"            # 与预分词器保持一致，确保编码解码可逆
-
-# ---------------------------- 保存路径 ----------------------------
 save:
-  directory: "./taichu_tokenizer"  # 输出目录，将生成 tokenizer.json 等文件
+  directory: "../experiments/tokenizer_zh_en_32k"
+  model_max_length: 32768
+  overwrite: true

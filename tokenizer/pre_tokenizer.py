@@ -5,8 +5,8 @@
 数字拆分（R2L Digit Splitting），以提升数学推理和代码能力。
 """
 
-from tokenizers.pre_tokenizers import ByteLevel, Whitespace, Split, Sequence
 from tokenizers import Regex, SplitDelimiterBehavior
+from tokenizers.pre_tokenizers import ByteLevel, Sequence, Split, Whitespace
 
 
 class PreTokenizerFactory:
@@ -32,8 +32,6 @@ class PreTokenizerFactory:
         if p_type == "bytelevel":
             # 获取数字拆分配置
             digit_split = pre_tokenizer_config.get("digit_split", False)
-            punctuation_split = pre_tokenizer_config.get("punctuation_split", False)
-
             # 构建预分词步骤序列
             steps = []
 
@@ -47,13 +45,7 @@ class PreTokenizerFactory:
                 # 这样匹配的是“内部插入点”，通过 REMOVED 行为直接分割，
                 # 不会引入额外 token，实现了 R2L 的千分位分组。
                 digit_pattern = safe_prefix + r"(?<=\d)(?=(\d{3})+(?!\d))"
-                steps.append(
-                    Split(
-                        pattern=Regex(digit_pattern),
-                        behavior=SplitDelimiterBehavior.REMOVED,
-                        invert=False
-                    )
-                )
+                steps.append(_create_split(Regex(digit_pattern)))
 
             # 步骤 2：ByteLevel 预分词
             steps.append(
@@ -73,3 +65,15 @@ class PreTokenizerFactory:
             return Whitespace()
         else:
             raise ValueError(f"不支持的预分词器类型: {p_type}")
+
+
+def _create_split(pattern: Regex) -> Split:
+    """Create a Split compatible with both old and current tokenizers APIs."""
+    try:
+        return Split(pattern=pattern, behavior="removed", invert=False)
+    except TypeError:
+        return Split(
+            pattern=pattern,
+            behavior=SplitDelimiterBehavior.REMOVED,
+            invert=False,
+        )

@@ -1,11 +1,13 @@
 {
-    "bos_token": "<|im_start|>",
-    "eos_token": "<|im_end|>",
-    "unk_token": "<unk>",
-    "pad_token": "<|im_end|>",
-    "additional_special_tokens": [
-        "<|endoftext|>",
-        "<|think|>",
-        "<|/think|>"
-    ]
+  "bos_token": "<|taichu_start|>",
+  "eos_token": "<|taichu_end|>",
+  "unk_token": "<unk>",
+  "pad_token": "<|pad|>",
+  "additional_special_tokens": [
+    "<|endoftext|>",
+    "<|think|>",
+    "<|/think|>",
+    "<|ghissue|>",
+    "<|final|>"
+  ]
 }
