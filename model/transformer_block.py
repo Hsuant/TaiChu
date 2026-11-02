@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
-from model.attention import TaiChuCausalSelfAttention
+from model.attention import AttentionMask, TaiChuCausalSelfAttention
 from model.feedforward import create_ffn
 from model.normalization import RMSNorm
 
@@ -98,6 +98,7 @@ class TaiChuBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        mask: Optional[AttentionMask] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
@@ -107,8 +108,9 @@ class TaiChuBlock(nn.Module):
             hidden_states: 输入隐藏状态，形状 ``(batch, seq_len, hidden_size)``。
             cos: RoPE 余弦值，形状 ``(1, seq_len, 1, head_dim)``。
             sin: RoPE 正弦值，形状 ``(1, seq_len, 1, head_dim)``。
-            attention_mask: 可选的加性掩码，形状可广播至
-                ``(batch, 1, seq_len_q, total_len)``，padding 处为 ``-inf``。
+            attention_mask: 可选的二维 Padding Mask，形状
+                ``(batch, total_len)``。零/False 表示 Padding。
+            mask: 可选的预构造注意力掩码计划，供所有层复用。
             past_key_value: 之前的 KV 缓存，布局为
                 ``(batch, num_kv_heads, total_len, head_dim)`` 的元组 ``(k, v)``。
             use_cache: 是否返回本次计算的 KV 缓存。
@@ -129,6 +131,7 @@ class TaiChuBlock(nn.Module):
             cos=cos,
             sin=sin,
             attention_mask=attention_mask,
+            mask=mask,
             past_key_value=past_key_value,
             use_cache=use_cache,
         )

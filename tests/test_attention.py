@@ -112,20 +112,141 @@ class TestCausalSelfAttention(unittest.TestCase):
         except Exception as e:
             self.fail(f"FlashAttention 回退失败: {e}")
 
+    def test_bool_padding_mask_with_flash_preference(self):
+        """Flash 优先时必须能对不支持的 bool Mask 合理回退。"""
+        attn = self._create_attention(use_flash=True)
+        hidden = torch.randn(self.batch, self.seq_len, self.hidden_size)
+        mask = torch.ones(self.batch, self.seq_len, dtype=torch.bool)
+        output, _ = attn(hidden, self.cos, self.sin, attention_mask=mask)
+        self.assertEqual(output.shape, (self.batch, self.seq_len, self.hidden_size))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_native_causal_and_explicit_bool_mask_match(self):
+        attn = self._create_attention()
+        hidden = torch.randn(self.batch, self.seq_len, self.hidden_size)
+        native, _ = attn(hidden, self.cos, self.sin)
+        explicit, _ = attn(
+            hidden,
+            self.cos,
+            self.sin,
+            attention_mask=torch.ones(
+                self.batch,
+                self.seq_len,
+                dtype=torch.bool,
+            ),
+        )
+        self.assertTrue(torch.allclose(native, explicit, atol=1e-5, rtol=1e-5))
+
     def test_attention_mask_integration(self):
-        """测试外部注意力掩码的融合。"""
+        """二维 Padding Mask 应被接受，四维 Mask 必须被明确拒绝。"""
         attn = self._create_attention()
         hidden = torch.randn(self.batch, self.seq_len, self.hidden_size)
 
-        # 外部掩码约定： (batch, 1, seq_len_q, total_len)
-        mask = torch.zeros(self.batch, 1, self.seq_len, self.seq_len, dtype=torch.float32)
+        mask = torch.ones(self.batch, self.seq_len, dtype=torch.bool)
         output, _ = attn(hidden, self.cos, self.sin, attention_mask=mask)
         self.assertEqual(output.shape, (self.batch, self.seq_len, self.hidden_size))
 
-        # 全 -inf 掩码，输出形状应仍正确（值可能为 NaN）
-        mask_inf = torch.full((self.batch, 1, self.seq_len, self.seq_len), float('-inf'))
-        output_inf, _ = attn(hidden, self.cos, self.sin, attention_mask=mask_inf)
-        self.assertEqual(output_inf.shape, (self.batch, self.seq_len, self.hidden_size))
+        mask_4d = torch.ones(self.batch, 1, self.seq_len, self.seq_len, dtype=torch.float32)
+        with self.assertRaises(ValueError):
+            attn(hidden, self.cos, self.sin, attention_mask=mask_4d)
+
+    def test_two_dimensional_padding_mask(self):
+        """二维 padding 掩码应屏蔽填充 key，并保持有效前缀输出一致。"""
+        attn = self._create_attention()
+        valid = torch.randn(1, 5, self.hidden_size)
+        padded = torch.cat([valid, torch.randn(1, 3, self.hidden_size)], dim=1)
+        valid_cos, valid_sin = self.rope(5)
+        padded_cos, padded_sin = self.rope(8)
+        mask = torch.tensor([[1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.bool)
+
+        valid_out, _ = attn(valid, valid_cos, valid_sin)
+        padded_out, _ = attn(
+            padded,
+            padded_cos,
+            padded_sin,
+            attention_mask=mask,
+        )
+        self.assertTrue(
+            torch.allclose(valid_out, padded_out[:, :5], atol=1e-5)
+        )
+
+    def test_all_padding_mask_is_finite(self):
+        """全 Padding 行应通过全局自身 Key 回退保持有限值。"""
+        attn = self._create_attention()
+        hidden = torch.randn(self.batch, self.seq_len, self.hidden_size)
+        output, _ = attn(
+            hidden,
+            self.cos,
+            self.sin,
+            attention_mask=torch.zeros(self.batch, self.seq_len, dtype=torch.bool),
+        )
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_incompatible_kv_cache_shapes_are_rejected(self):
+        attn = self._create_attention()
+        hidden = torch.randn(self.batch, 1, self.hidden_size)
+        cos, sin = self.rope(5)
+        cos = cos[:, -1:, :, :]
+        sin = sin[:, -1:, :, :]
+
+        bad_batch_k = torch.randn(1, self.num_kv_heads, 4, self.head_dim)
+        bad_batch_v = torch.randn(1, self.num_kv_heads, 4, self.head_dim)
+        with self.assertRaises(ValueError):
+            attn(
+                hidden,
+                cos,
+                sin,
+                past_key_value=(bad_batch_k, bad_batch_v),
+                use_cache=True,
+            )
+
+        bad_length_k = torch.randn(self.batch, self.num_kv_heads, 4, self.head_dim)
+        bad_length_v = torch.randn(self.batch, self.num_kv_heads, 3, self.head_dim)
+        with self.assertRaises(ValueError):
+            attn(
+                hidden,
+                cos,
+                sin,
+                past_key_value=(bad_length_k, bad_length_v),
+                use_cache=True,
+            )
+
+        bad_heads_k = torch.randn(self.batch, self.num_kv_heads + 1, 4, self.head_dim)
+        bad_heads_v = torch.randn(self.batch, self.num_kv_heads + 1, 4, self.head_dim)
+        with self.assertRaises(ValueError):
+            attn(
+                hidden,
+                cos,
+                sin,
+                past_key_value=(bad_heads_k, bad_heads_v),
+                use_cache=True,
+            )
+
+        bad_dim_k = torch.randn(self.batch, self.num_kv_heads, 4, self.head_dim + 1)
+        bad_dim_v = torch.randn(self.batch, self.num_kv_heads, 4, self.head_dim + 1)
+        with self.assertRaises(ValueError):
+            attn(
+                hidden,
+                cos,
+                sin,
+                past_key_value=(bad_dim_k, bad_dim_v),
+                use_cache=True,
+            )
+
+        bad_dtype_k = torch.randn(
+            self.batch, self.num_kv_heads, 4, self.head_dim, dtype=torch.float64
+        )
+        bad_dtype_v = torch.randn(
+            self.batch, self.num_kv_heads, 4, self.head_dim, dtype=torch.float64
+        )
+        with self.assertRaises(ValueError):
+            attn(
+                hidden,
+                cos,
+                sin,
+                past_key_value=(bad_dtype_k, bad_dtype_v),
+                use_cache=True,
+            )
 
 
 if __name__ == '__main__':

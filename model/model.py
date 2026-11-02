@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model.embedding import TokenEmbedding
+from model.attention import build_attention_mask, normalize_padding_mask
 from model.positional_encoding import RoPEPositionEncoding
 from model.normalization import RMSNorm
 from model.transformer_block import TaiChuBlock
@@ -125,7 +126,8 @@ class TaiChuModel(nn.Module):
         Args:
             input_ids: token ID 序列，训练/完整序列时形状 (batch, seq_len)，
                        增量推理时形状 (batch, cur_len)（通常 cur_len=1）。
-            attention_mask: 可选的注意力掩码，训练时使用。
+            attention_mask: 可选的二维 Padding Mask，形状
+                (batch_size, total_len)。非零/True 表示有效 Token。
             labels: 语言模型标签，形状 (batch, seq_len)，仅训练/完整序列时有效。
             past_key_values: 各层上一时刻的 KV 缓存，列表长度 = num_layers，
                              每个元素为 (k, v) 元组或 None。
@@ -136,17 +138,81 @@ class TaiChuModel(nn.Module):
             - 训练/完整序列： (logits, loss) 或 (logits, None)
             - 缓存推理： (logits, new_past_key_values)
         """
+        if input_ids.dim() != 2:
+            raise ValueError(f"input_ids 必须为二维张量，当前形状为 {tuple(input_ids.shape)}")
         batch_size, cur_len = input_ids.shape
+        if cur_len == 0:
+            raise ValueError("input_ids 的序列长度不能为 0")
+        if past_key_values is not None and len(past_key_values) != len(self.layers):
+            raise ValueError(
+                f"past_key_values 长度应为 {len(self.layers)}，"
+                f"当前为 {len(past_key_values)}"
+            )
+        if labels is not None and labels.shape != input_ids.shape:
+            raise ValueError(
+                f"labels 形状 {tuple(labels.shape)} 必须与 input_ids 形状 "
+                f"{tuple(input_ids.shape)} 一致"
+            )
+        if labels is not None:
+            if labels.dtype != torch.long:
+                raise ValueError("labels 必须使用 torch.long")
+            if labels.device != input_ids.device:
+                raise ValueError("labels 与 input_ids 必须位于同一设备")
+            if cur_len < 2:
+                raise ValueError("训练损失至少需要两个 Token 才能构造 next-token 目标")
+            if not (labels[..., 1:] != -100).any():
+                raise ValueError("batch 中没有任何可监督的 next-token 标签")
+            valid_label_mask = labels != -100
+            if valid_label_mask.any() and (
+                (labels[valid_label_mask] < 0)
+                | (labels[valid_label_mask] >= self.config.vocab_size)
+            ).any():
+                raise ValueError("labels 中的有效 Token ID 超出词表范围")
+        if attention_mask is not None:
+            if attention_mask.dim() != 2:
+                raise ValueError(
+                    "attention_mask 仅支持二维 Padding Mask，"
+                    f"当前为 {attention_mask.dim()} 维"
+                )
+            if attention_mask.size(0) != batch_size:
+                raise ValueError("attention_mask 的 batch 维度与 input_ids 不一致")
+            if labels is not None:
+                padding_positions = (attention_mask == 0).to(labels.device)
+                if (labels[padding_positions] != -100).any():
+                    raise ValueError(
+                        "attention_mask 为 0 的位置必须使用 labels=-100"
+                    )
 
         # ========== 1. 计算位置信息与总序列长度 ==========
-        if past_key_values is not None and past_key_values[0] is not None:
+        first_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = (
+            past_key_values[0] if past_key_values else None
+        )
+        if first_cache is not None:
             # 从缓存中获取已存储的序列长度
-            past_len = past_key_values[0][0].size(1)
+            # 缓存 k 的布局为 (batch, num_kv_heads, total_len, head_dim)，
+            # 序列长度位于第 2 维。
+            past_len = first_cache[0].size(2)
             total_len = past_len + cur_len
+            for layer_idx, cache in enumerate(past_key_values or []):
+                if cache is None:
+                    raise ValueError(
+                        f"past_key_values[{layer_idx}] 为 None，但其他层缓存存在"
+                    )
+                cache_k, cache_v = cache
+                if cache_k.dim() != 4 or cache_v.dim() != 4:
+                    raise ValueError("KV cache 的 K/V 必须为四维张量")
+                if cache_k.size(2) != past_len or cache_v.size(2) != past_len:
+                    raise ValueError("各层 KV cache 的序列长度必须一致")
+                if cache_k.size(0) != batch_size or cache_v.size(0) != batch_size:
+                    raise ValueError("KV cache 的 batch 维度与当前输入不一致")
             # 增量推理模式，禁止提供 labels
             if labels is not None:
                 raise ValueError("增量推理时 labels 必须为 None")
         else:
+            if past_key_values is not None and any(
+                cache is not None for cache in past_key_values
+            ):
+                raise ValueError("past_key_values[0] 为 None，但其他层缓存存在")
             # 完整序列前向（训练或首次推理）
             past_len = 0
             total_len = cur_len
@@ -159,6 +225,13 @@ class TaiChuModel(nn.Module):
 
         # ========== 3. 词嵌入 ==========
         hidden_states = self.token_embedding(input_ids)
+        mask = build_attention_mask(
+            q_len=cur_len,
+            total_len=total_len,
+            batch_size=batch_size,
+            attention_mask=attention_mask,
+            device=hidden_states.device,
+        )
 
         # ========== 4. 逐层传递 Transformer 层 ==========
         new_past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = [] if use_cache else None
@@ -171,7 +244,7 @@ class TaiChuModel(nn.Module):
             # 调用层的统一 forward（层需支持 past_key_value 参数）
             hidden_states, present_kv, aux_loss = layer(
                 hidden_states, cos, sin,
-                attention_mask=attention_mask,
+                mask=mask,
                 past_key_value=past_kv,
                 use_cache=use_cache,
             )
@@ -198,8 +271,9 @@ class TaiChuModel(nn.Module):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
-            # 将 MoE 辅助损失直接加到总损失上（权重已在损失计算内部处理）
-            loss = loss + total_aux_loss
+            # 将 MoE 辅助损失直接加到总损失上（权重已在损失计算内部处理），
+            # 并保持与主损失相同的数据类型
+            loss = loss + total_aux_loss.to(loss.dtype)
 
         # ========== 7. 统一返回 CausalLMOutput 对象 ==========
         return CausalLMOutput(
@@ -215,6 +289,9 @@ class TaiChuModel(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        eos_token_id: Optional[int] = None,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """自回归生成文本（使用 KV 缓存加速）。
 
@@ -224,54 +301,134 @@ class TaiChuModel(nn.Module):
         Args:
             input_ids: 起始 token 序列，形状 (batch_size, seq_len)。
             max_new_tokens: 要生成的最大新 token 数。
-            temperature: 采样温度，越高越随机。
-            top_k: top‑k 采样参数，若为 None 则使用全词表 softmax 采样。
+            temperature: 采样温度，越高越随机；<= 0 时退化为贪心解码。
+            top_k: top‑k 采样参数，为 None 时不过滤。
+            top_p: nucleus 采样阈值，保留累积概率不超过该值的最小 token 集合，
+                   为 None 或 1.0 时不过滤。
+            eos_token_id: 结束符 token id，对应行生成结束后停止推进，
+                   整批全部完成时提前结束。
+            attention_mask: 可选形状 ``(batch, seq_len)`` 的 padding mask，
+                    仅接受 bool 或整数张量，非零/True 表示有效 Token。
+                    增量解码时会自动延长。
 
         Returns:
-            包含生成结果的完整序列，形状 (batch_size, seq_len + max_new_tokens)。
+            包含生成结果的完整序列，形状 (batch_size, seq_len + 实际生成数)。
         """
-        self.eval()  # 切换到评估模式（关闭 dropout）
-        generated = input_ids
-        past_key_values = None  # 初始无缓存
+        if input_ids.dim() != 2 or input_ids.size(1) == 0:
+            raise ValueError("input_ids 必须为非空的二维张量")
+        if input_ids.size(1) > self.config.max_position_embeddings:
+            raise ValueError(
+                f"输入长度 {input_ids.size(1)} 超过最大上下文 "
+                f"{self.config.max_position_embeddings}"
+            )
+        if input_ids.size(1) + max_new_tokens > self.config.max_position_embeddings:
+            raise ValueError(
+                f"输入长度 {input_ids.size(1)} + max_new_tokens {max_new_tokens} "
+                f"超过最大上下文 {self.config.max_position_embeddings}"
+            )
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens 不能为负数")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k 必须为正整数")
+        if top_p is not None and not (0.0 < top_p <= 1.0):
+            raise ValueError("top_p 必须在 (0, 1] 范围内")
+        if eos_token_id is not None and not (0 <= eos_token_id < self.config.vocab_size):
+            raise ValueError("eos_token_id 超出词表范围")
 
-        # 强制使用 eager 模式，确保每次 forward 都不会触发 CUDA Graph 的内存复用冲突
-        with torch.compiler.set_stance("force_eager"):
-            for _ in range(max_new_tokens):
-                # 首次推理输入完整序列，之后只输入最后一个生成的 token
-                if past_key_values is None:
-                    cur_input = generated
-                else:
-                    cur_input = generated[:, -1:]
+        key_attention_mask: Optional[torch.Tensor] = None
+        if attention_mask is not None:
+            key_attention_mask = normalize_padding_mask(
+                attention_mask,
+                batch_size=input_ids.size(0),
+                total_len=input_ids.size(1),
+                device=input_ids.device,
+            )
 
-                # 调用统一 forward，启用缓存
-                output = self.forward(
-                    cur_input,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                logits = output.logits
-                past_key_values = output.past_key_values  # 类型与 past_key_values 一致
+        was_training = self.training
+        self.eval()
+        try:
+            generated = input_ids
+            past_key_values = None
+            finished = torch.zeros(
+                (input_ids.size(0), 1), dtype=torch.bool, device=input_ids.device
+            )
 
-                # 取最后一个位置的 logits（用于预测下一个 token）
-                next_token_logits = logits[:, -1, :] / temperature
+            # 强制使用 eager 模式，确保每次 forward 都不会触发 CUDA Graph 的内存复用冲突
+            with torch.compiler.set_stance("force_eager"):
+                for _ in range(max_new_tokens):
+                    # 首次推理输入完整序列，之后只输入最后一个生成的 token
+                    cur_input = generated if past_key_values is None else generated[:, -1:]
 
-                # 可选的 top‑k 过滤
-                if top_k is not None:
-                    v, _ = torch.topk(next_token_logits, top_k)
-                    next_token_logits[next_token_logits < v[:, [-1]]] = -float("Inf")
+                    output = self.forward(
+                        cur_input,
+                        attention_mask=key_attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+                    logits = output.logits
+                    past_key_values = output.past_key_values
+                    next_token_logits = logits[:, -1, :]
 
-                # 计算概率并采样
-                probs = F.softmax(next_token_logits, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)  # (batch, 1)
+                    if temperature > 0:
+                        filtered_logits = self._filter_logits_for_sampling(
+                            next_token_logits / temperature,
+                            top_k=top_k,
+                            top_p=top_p,
+                        )
+                        probs = F.softmax(filtered_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token = next_token_logits.argmax(dim=-1, keepdim=True)
 
-                # 追加到生成序列
-                generated = torch.cat([generated, next_token], dim=-1)
+                    # 达到结束符的行停止推进，后续统一填充结束符直至整批完成
+                    if eos_token_id is not None:
+                        finished = finished | (next_token == eos_token_id)
+                        next_token = torch.where(
+                            finished,
+                            torch.full_like(next_token, eos_token_id),
+                            next_token,
+                        )
 
-                # 防止超出最大位置编码长度（通常不会，因为限制了 max_new_tokens）
-                if generated.size(1) > self.config.max_position_embeddings:
-                    generated = generated[:, -self.config.max_position_embeddings:]
+                    generated = torch.cat([generated, next_token], dim=-1)
+                    if key_attention_mask is not None:
+                        current_mask: torch.Tensor = key_attention_mask
+                        key_attention_mask = F.pad(
+                            current_mask,
+                            (0, 1),
+                            value=True,
+                        )
 
-        return generated
+                    if eos_token_id is not None and finished.all():
+                        break
+            return generated
+        finally:
+            self.train(was_training)
+
+    @staticmethod
+    def _filter_logits_for_sampling(
+        logits: torch.Tensor,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> torch.Tensor:
+        """按 Top-K 与 Top-P 过滤二维 logits，每一行至少保留一个候选。"""
+        filtered_logits = logits.clone()
+        if top_k is not None:
+            top_k_eff = min(top_k, filtered_logits.size(-1))
+            top_values, _ = torch.topk(filtered_logits, top_k_eff)
+            filtered_logits = filtered_logits.masked_fill(
+                filtered_logits < top_values[:, [-1]],
+                float("-inf"),
+            )
+
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(filtered_logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cumulative_probs > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            remove = remove.scatter(-1, sorted_idx, remove)
+            filtered_logits = filtered_logits.masked_fill(remove, float("-inf"))
+        return filtered_logits
 
     def configure_optimizers(self, config) -> torch.optim.Optimizer:
         """配置 AdamW 优化器，区分需要权重衰减的参数。
