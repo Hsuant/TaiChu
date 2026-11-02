@@ -61,8 +61,9 @@ class TestTransformerBlock(unittest.TestCase):
     def test_forward_shape(self):
         block = self._create_block()
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        out, _ = block(x, self.cos, self.sin)
+        out, _, aux_loss = block(x, self.cos, self.sin)
         self.assertEqual(out.shape, x.shape)
+        self.assertEqual(aux_loss.item(), 0.0)
 
     def test_kv_cache(self):
         block = self._create_block()
@@ -79,7 +80,7 @@ class TestTransformerBlock(unittest.TestCase):
         cos = cos_full[:, -cur_len:, :, :]
         sin = sin_full[:, -cur_len:, :, :]
 
-        out, present_kv = block(
+        out, present_kv, aux_loss = block(
             x_cur, cos, sin,
             past_key_value=(past_k, past_v),
             use_cache=True
@@ -90,21 +91,20 @@ class TestTransformerBlock(unittest.TestCase):
         # 期望形状与输入一致：(batch, num_kv_heads, total_len, head_dim)
         self.assertEqual(new_k.shape, (self.batch, self.num_kv_heads, total_len, self.head_dim))
         self.assertEqual(new_v.shape, (self.batch, self.num_kv_heads, total_len, self.head_dim))
+        self.assertEqual(aux_loss.item(), 0.0)
 
     def test_moe_aux_loss_collection(self):
         moe_config = MoEConfig(num_experts=4, top_k=2)
         block = self._create_block(ffn_type="moe", moe_config=moe_config)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        out, _ = block(x, self.cos, self.sin)
-        aux_loss = block.get_moe_aux_loss()
+        out, _, aux_loss = block(x, self.cos, self.sin)
         self.assertIsInstance(aux_loss, torch.Tensor)
         self.assertEqual(aux_loss.dim(), 0)
 
     def test_non_moe_aux_loss_zero(self):
         block = self._create_block(ffn_type="swiglu")
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        out, _ = block(x, self.cos, self.sin)
-        aux_loss = block.get_moe_aux_loss()
+        out, _, aux_loss = block(x, self.cos, self.sin)
         self.assertEqual(aux_loss.item(), 0.0)
 
 

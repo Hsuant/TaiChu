@@ -13,7 +13,7 @@ from typing import Optional
 class SwiGLUFeedForward(nn.Module):
     """使用 SwiGLU 激活的前馈网络。
 
-    SwiGLU 形式: output = (x @ W_gate * SILU(x @ W_up)) @ W_down
+    SwiGLU 形式: output = (SILU(x @ W_gate) * (x @ W_up)) @ W_down
 
     Attributes:
         gate_proj: 门控投影矩阵
@@ -36,11 +36,6 @@ class SwiGLUFeedForward(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
-        # 初始化权重，参考常见实践
-        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.up_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播。
 
@@ -52,7 +47,7 @@ class SwiGLUFeedForward(nn.Module):
         """
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        hidden = gate * torch.nn.functional.silu(up)
+        hidden = torch.nn.functional.silu(gate) * up
         output = self.down_proj(hidden)
         return self.dropout(output)
 
@@ -72,8 +67,6 @@ class StandardFFN(nn.Module):
         self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        nn.init.normal_(self.fc1.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.fc2.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播。"""

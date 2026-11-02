@@ -3,10 +3,43 @@
 定义模型架构所需的所有超参数，支持从字典或 YAML 文件加载。
 """
 
+import re
 from dataclasses import dataclass, fields
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union, get_args, get_origin
 
 from model.moe import MoEConfig
+
+# 数值类字符串模式：整数（含正负号）与所有科学计数/小数写法
+_NUMERIC_INT_RE = re.compile(r'^[+-]?\d+$')
+_NUMERIC_FLOAT_RE = re.compile(r'^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$')
+
+
+def _coerce_numeric_strings(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+    """将声明为数值类型的字段中、由配置解析产生的字符串还原为数值。
+
+    例如 PyYAML 会把不带小数点的科学计数法 ``1e-6`` 解析为字符串，
+    此函数依据 dataclass 字段类型将其转回 ``float``/``int``，避免
+    数值字段以字符串形式进入后续计算。
+    """
+    field_types = {f.name: f.type for f in fields(cls)}
+    result = dict(data)
+    for key, value in list(result.items()):
+        if not isinstance(value, str) or key not in field_types:
+            continue
+        ftype = field_types[key]
+        # 解析 Optional[X] / Union[X, None] 为内部基础类型
+        if get_origin(ftype) is Union:
+            inner = [a for a in get_args(ftype) if a is not type(None)]
+            ftype = inner[0] if len(inner) == 1 else ftype
+        try:
+            if ftype is float and _NUMERIC_FLOAT_RE.match(value):
+                result[key] = float(value)
+            elif ftype is int and _NUMERIC_INT_RE.match(value):
+                result[key] = int(value)
+        except (TypeError, ValueError):
+            # 类型还原失败时保留原值，交由 dataclass 构造时给出更明确的错误
+            pass
+    return result
 
 
 @dataclass
@@ -32,7 +65,7 @@ class ModelConfig:
     """模型名称，用于日志记录和模型保存。"""
 
     vocab_size: int = 50304
-    """词表大小。通常取 2 的幂次方倍数（如 50304 = 50272 + 32）以优化 GPU 计算。"""
+    """词表大小。通常对齐到 8 的倍数以适配 GPU 高效计算（如 50304 = 50257 向上对齐）。"""
 
     hidden_size: int = 768
     """隐藏层维度（d_model），Transformer 主干的特征宽度。"""
@@ -126,7 +159,7 @@ class ModelConfig:
 
     moe_num_shared_experts: int = 1
     """共享专家数量。共享专家会被所有 token 无差别地经过（类似普通 FFN），
-    用于捕捉通用特征。通常设为 0（不使用）或 1。
+    用于捕捉通用特征。当前实现支持 0（不使用）或 1。
     仅在 ffn_type="moe" 时生效。"""
 
     moe_shared_expert_intermediate_size: int = 3072
@@ -161,6 +194,27 @@ class ModelConfig:
             - 检查 GQA 的整除性。
             - 若启用 MoE，校验 MoE 相关参数的一致性。
             """
+        if self.vocab_size <= 0:
+            raise ValueError("vocab_size 必须为正整数")
+        if self.hidden_size <= 0:
+            raise ValueError("hidden_size 必须为正整数")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers 必须为正整数")
+        if self.num_attention_heads <= 0:
+            raise ValueError("num_attention_heads 必须为正整数")
+        if self.intermediate_size <= 0:
+            raise ValueError("intermediate_size 必须为正整数")
+        if self.max_position_embeddings < 2:
+            raise ValueError("max_position_embeddings 至少为 2")
+        if self.rope_theta <= 0:
+            raise ValueError("rope_theta 必须为正数")
+        if self.rms_norm_eps <= 0:
+            raise ValueError("rms_norm_eps 必须为正数")
+        for name in ("attention_dropout", "hidden_dropout", "embedding_dropout"):
+            value = getattr(self, name)
+            if not (0.0 <= value < 1.0):
+                raise ValueError(f"{name} 必须在 [0, 1) 范围内，当前为 {value}")
+
         # GQA 处理
         if self.num_key_value_heads <= 0:
             self.num_key_value_heads = self.num_attention_heads
@@ -173,6 +227,9 @@ class ModelConfig:
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) 必须能被 num_attention_heads ({self.num_attention_heads}) 整除"
             )
+        head_dim = self.hidden_size // self.num_attention_heads
+        if head_dim % 2 != 0:
+            raise ValueError(f"RoPE 要求 head_dim 为偶数，当前为 {head_dim}")
 
         # MoE 参数校验
         if self.ffn_type == "moe":
@@ -186,8 +243,11 @@ class ModelConfig:
                 raise ValueError(
                     f"moe_expert_intermediate_size 必须为正整数，当前为 {self.moe_expert_intermediate_size}"
                 )
-            if self.moe_num_shared_experts < 0:
-                raise ValueError(f"moe_num_shared_experts 不能为负数，当前为 {self.moe_num_shared_experts}")
+            if self.moe_num_shared_experts not in (0, 1):
+                raise ValueError(
+                    "当前 SparseMoE 仅实现 0 或 1 个共享专家，"
+                    f"当前配置为 {self.moe_num_shared_experts}"
+                )
             if self.moe_num_shared_experts > 0 and self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
                     f"使用共享专家时 moe_shared_expert_intermediate_size 必须为正，"
@@ -279,6 +339,10 @@ class ModelConfig:
                 else:
                     # 未知字段保留原样
                     data[moe_key] = moe_val
+
+        # 依据字段声明类型还原数值字符串（PyYAML 会把不带小数点的
+        # 科学计数法如 1e-6 解析为字符串，这里统一转回数值）
+        data = _coerce_numeric_strings(cls, data)
 
         return cls(**data)
 

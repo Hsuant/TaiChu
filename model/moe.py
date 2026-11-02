@@ -64,8 +64,8 @@ class MoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """初始化权重，使用较小的标准差以稳定训练。"""
-        nn.init.normal_(self.weight, mean=0.0, std=1.0 / self.weight.size(1))
+        """初始化权重，与其它线性投影层保持一致的标准差。"""
+        nn.init.normal_(self.weight, mean=0.0, std=0.02)
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """计算路由结果。
@@ -116,13 +116,6 @@ class SharedExpert(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """初始化权重。"""
-        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.up_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播。
@@ -135,14 +128,14 @@ class SharedExpert(nn.Module):
         """
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        hidden = gate * F.silu(up)
+        hidden = F.silu(gate) * up
         return self.down_proj(hidden)
 
 
 class RoutedExpert(nn.Module):
     """单个路由专家（SwiGLU FFN）。
 
-    结构：Linear → SiLU(gate * up) → Linear。
+    结构：SiLU(gate) * up → Linear。
 
     Attributes:
         gate_proj: 门控投影
@@ -161,13 +154,6 @@ class RoutedExpert(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        """初始化权重。"""
-        nn.init.normal_(self.gate_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.up_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.down_proj.weight, mean=0.0, std=0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """前向传播。
@@ -180,7 +166,7 @@ class RoutedExpert(nn.Module):
         """
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        hidden = gate * F.silu(up)
+        hidden = F.silu(gate) * up
         return self.down_proj(hidden)
 
 
@@ -330,15 +316,20 @@ class SparseMoE(nn.Module):
             density = torch.zeros(num_experts, device=router_logits.device)
             for k in range(self.top_k):
                 density.scatter_add_(0, topk_indices[:, k], torch.ones(num_tokens, device=router_logits.device))
-            density = density / num_tokens                         # (E,)
+            # Normalize by token-expert assignments so the uniform baseline
+            # remains 1.0 for arbitrary top_k, matching Switch-style aux loss.
+            density = density / (num_tokens * self.top_k)          # (E,)
             # 负载均衡损失 = num_experts * sum(avg_probs * density)
             load_bal_loss = num_experts * (avg_probs * density).sum()
+            # Router z-loss penalizes large log-partition values, as used by
+            # ST-MoE-style router regularization.
+            z_loss = torch.logsumexp(
+                router_logits.float(),
+                dim=-1,
+            ).pow(2).mean()
         else:
             load_bal_loss = torch.tensor(0.0, device=router_logits.device)
-
-        # --- 路由器 z‑loss ---
-        # 鼓励 logits 的平方和不要太大，源自 DeepSeek-V3
-        z_loss = router_logits.float().pow(2).mean()
+            z_loss = torch.tensor(0.0, device=router_logits.device)
 
         total_aux_loss = (
             self.load_balancing_loss_weight * load_bal_loss +

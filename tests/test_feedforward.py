@@ -31,6 +31,14 @@ class TestSwiGLUFeedForward(unittest.TestCase):
         out = ff(x)
         self.assertEqual(out.shape, x.shape)
 
+    def test_swiglu_formula(self):
+        ff = SwiGLUFeedForward(self.hidden_size, self.intermediate_size, dropout=0.0)
+        x = torch.randn(self.batch, self.seq_len, self.hidden_size)
+        expected = ff.down_proj(
+            torch.nn.functional.silu(ff.gate_proj(x)) * ff.up_proj(x)
+        )
+        self.assertTrue(torch.allclose(ff(x), expected, atol=1e-6))
+
     def test_dropout(self):
         ff = SwiGLUFeedForward(self.hidden_size, self.intermediate_size, dropout=0.5)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
