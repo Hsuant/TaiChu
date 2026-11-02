@@ -1,0 +1,20 @@
+task_type: "reward"
+dataset_id: "taichu-reward-v1"
+version: "1"
+
+tokenizer_path: "./taichu_tokenizer/tokenizer.json"
+output_dir: "./data/unified/reward"
+
+add_eos: true
+invalid_policy: "error"
+shard_size: 50000
+
+pad_token: "<|pad|>"
+bos_token: "<|taichu_start|>"
+eos_token: "<|taichu_end|>"
+
+splits:
+  train:
+    - "./data/raw/reward/train"
+  validation:
+    - "./data/raw/reward/validation"

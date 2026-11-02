@@ -1,0 +1,24 @@
+task_type: "sft"
+dataset_id: "taichu-sft-v1"
+version: "1"
+
+tokenizer_path: "./taichu_tokenizer/tokenizer.json"
+output_dir: "./data/unified/sft"
+
+max_seq_length: 4096
+assistant_only_loss: true
+train_on_eos: true
+truncation: "left"
+invalid_policy: "error"
+shard_size: 50000
+
+pad_token: "<|pad|>"
+bos_token: "<|taichu_start|>"
+eos_token: "<|taichu_end|>"
+add_eos: true
+
+splits:
+  train:
+    - "./data/raw/sft/train"
+  validation:
+    - "./data/raw/sft/validation"

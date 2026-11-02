@@ -1,0 +1,21 @@
+task_type: "preference"
+dataset_id: "taichu-preference-v1"
+version: "1"
+
+tokenizer_path: "./taichu_tokenizer/tokenizer.json"
+output_dir: "./data/unified/preference"
+
+max_seq_length: 4096
+add_eos: true
+invalid_policy: "error"
+shard_size: 50000
+
+pad_token: "<|pad|>"
+bos_token: "<|taichu_start|>"
+eos_token: "<|taichu_end|>"
+
+splits:
+  train:
+    - "./data/raw/preference/train"
+  validation:
+    - "./data/raw/preference/validation"
