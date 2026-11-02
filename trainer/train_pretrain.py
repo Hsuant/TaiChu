@@ -14,7 +14,7 @@
 
 用法：
     # 单卡训练
-    python ./trainer/train_pretrain.py --model_config configs/TaiChu_LLM.yaml --pretrain_config configs/train_pretrain_config.yaml
+    python ./trainer/train_pretrain.py --model_config configs/TaiChu_Small_80M.yaml --pretrain_config configs/train_pretrain_config.yaml
 
     # 多卡训练（通过 torchrun 启动）
     torchrun --nproc_per_node=4 train_pretrain.py --model_config configs/TaiChu_125m.yaml --pretrain_config configs/pretrain_config.yaml

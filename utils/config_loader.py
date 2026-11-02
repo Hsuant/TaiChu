@@ -143,7 +143,7 @@ def parse_tokens_string(value) -> int:
 
 # ==================== 加载函数 ====================
 def load_model_config(yaml_path: str) -> ModelConfig:
-    """从 YAML 文件加载模型结构配置（扁平结构 + 可选 moe 子块）。
+    """从 YAML 文件加载模型结构配置（结构化或扁平结构，可选 moe 子块）。
 
     Args:
         yaml_path: 模型结构 YAML 文件路径，格式必须符合 ModelConfig 的字段要求。

@@ -131,7 +131,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         cases = [
             (
                 ROOT / "configs" / "train_pretrain_config.yaml",
-                ROOT / "configs" / "TaiChu_LLM.yaml",
+                ROOT / "configs" / "TaiChu_Small_80M.yaml",
             ),
             (
                 ROOT / "tests" / "test_train" / "pretrain_sim.yaml",

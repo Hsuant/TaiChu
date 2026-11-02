@@ -94,13 +94,65 @@ class TestTokenizerAndConfig(unittest.TestCase):
                 moe_num_shared_experts=2,
             )
 
-    def test_bundled_sample_configs_cover_bundled_tokenizer(self):
-        tokenizer = Tokenizer.from_file(str(ROOT / "taichu_tokenizer" / "tokenizer.json"))
-        for name in ("TaiChu_LLM.yaml", "TaiChu_77M.yaml", "TaiChu_256M.yaml"):
-            config = load_model_config(str(ROOT / "configs" / name))
-            self.assertEqual(config.vocab_size, tokenizer.get_vocab_size(), name)
+    def test_model_config_accepts_structured_and_flat_layouts(self):
+        shared = {
+            "model_name": "layout-test",
+            "vocab_size": 128,
+            "hidden_size": 32,
+            "num_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 64,
+            "max_position_embeddings": 64,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 1.0e-6,
+            "tie_word_embeddings": True,
+            "hidden_act": "silu",
+            "ffn_type": "swiglu",
+            "use_flash_attention": False,
+            "attention_dropout": 0.0,
+            "hidden_dropout": 0.0,
+            "embedding_dropout": 0.0,
+        }
+        structured = {
+            "model_name": shared["model_name"],
+            "architecture": {
+                key: shared[key]
+                for key in (
+                    "vocab_size",
+                    "hidden_size",
+                    "num_layers",
+                    "num_attention_heads",
+                    "num_key_value_heads",
+                    "intermediate_size",
+                    "max_position_embeddings",
+                    "rope_theta",
+                    "rms_norm_eps",
+                    "tie_word_embeddings",
+                )
+            },
+            "activation": {
+                "hidden_act": shared["hidden_act"],
+                "ffn_type": shared["ffn_type"],
+            },
+            "attention": {
+                "use_flash_attention": shared["use_flash_attention"],
+            },
+            "regularization": {
+                "attention_dropout": shared["attention_dropout"],
+                "hidden_dropout": shared["hidden_dropout"],
+                "embedding_dropout": shared["embedding_dropout"],
+            },
+        }
+        self.assertEqual(
+            ModelConfig.from_dict(structured),
+            ModelConfig.from_dict(shared),
+        )
 
     def test_small_model_presets_match_parameter_and_token_budgets(self):
+        tokenizer = Tokenizer.from_file(
+            str(ROOT / "taichu_tokenizer" / "tokenizer.json")
+        )
         cases = [
             ("TaiChu_Small_80M.yaml", "train_small_80m.yaml", 77_611_520, 4_000_000_000),
             ("TaiChu_Small_150M.yaml", "train_small_150m.yaml", 149_057_280, 5_200_000_000),
@@ -113,6 +165,10 @@ class TestTokenizerAndConfig(unittest.TestCase):
                 )
                 pretrain = load_pretrain_config(
                     str(ROOT / "configs" / train_name)
+                )
+                self.assertEqual(
+                    model_config.vocab_size,
+                    tokenizer.get_vocab_size(),
                 )
                 with torch.device("meta"):
                     model = TaiChuModel(model_config)

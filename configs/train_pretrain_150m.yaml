@@ -1,0 +1,90 @@
+# TaiChu 150M pretraining configuration.
+# Data budget (decimal GB, about 4 bytes/token):
+#   target tokens: 5.2B
+#   filtered UTF-8 text: about 21GB
+#   binary token shards: about 9-15GB
+#   validation shards: about 0.3-0.5GB
+optimizer:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+
+scheduler:
+  warmup_ratio: 0.02
+  stable_ratio: 0.70
+  min_lr_ratio: 0.1
+  decay_type: "cosine"
+
+tokenizer:
+  library: "tokenizers"
+  path: "./taichu_tokenizer/tokenizer.json"
+
+data:
+  schema_version: 1
+  task_type: pretraining
+  dataset_id: taichu-150m-pretraining-v1
+  storage:
+    format: binary_mmap
+    train_path: "./data/unified/taichu_150m/train"
+    validation_path: "./data/unified/taichu_150m/validation"
+    num_workers: 2
+    prefetch_factor: 2
+  sampling:
+    strategy: distributed
+    shuffle: true
+    seed: 42
+    drop_last: true
+  bos_token: "<|taichu_start|>"
+  eos_token: "<|taichu_end|>"
+  pad_token: "<|pad|>"
+  packing:
+    enabled: true
+    strategy: stream
+    max_seq_length: 2048
+    pad_to_multiple_of: 8
+    drop_last_remainder: false
+  batching:
+    strategy: fixed_length
+    micro_batch_size: 4
+    pad_to_multiple_of: 8
+
+training:
+  target_tokens: "5.2B"
+  batch_size: 4
+  gradient_accumulation_steps: 64
+  save_interval: 1000
+  log_interval: 10
+  output_dir: "./experiments/small_models"
+  experiment_name: "taichu_150m_pretrain_v1"
+  use_mixed_precision: true
+  dtype: "bfloat16"
+  seed: 42
+  local_rank: -1
+  compile_model: true
+  max_grad_norm: 1.0
+
+evaluating:
+  batch_size: 4
+  eval_interval: 500
+  log_interval: 10
+  empty_prefix_eos_ppl: false
+  prompts:
+    - "清晨，阳光透过窗户洒进房间，小明起床后"
+    - "On a quiet morning, Sarah walked into the garden and"
+  num_generate_tokens: 32
+
+early_stopping:
+  enabled: false
+  monitor: "val_loss"
+  patience: 5
+  min_delta: 1.0e-4
+  mode: "min"
+
+swanlab:
+  use_swanlab: false
+  swanlab_project: "TaiChu-Small"
+  swanlab_experiment_name: "taichu_150m"
+  swanlab_log_dir: "./swanlogs"
+  swanlab_mode: "local"

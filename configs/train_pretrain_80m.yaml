@@ -1,0 +1,213 @@
+# ============================================================
+# TaiChu 80M LLM Pretraining Configuration
+# Version: 0.2.0
+#
+# Data budget:
+#   Target tokens: 4.0B
+#   Filtered UTF-8 text: ~16GB
+#   Binary token shards: ~7-10GB
+#   Packed validation: ~0.2-0.4GB
+#
+# Data loading:
+#   Indexed binary shards
+#   mmap Reader + map-style DataLoader
+#   Runtime stream packing
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. Optimizer
+# ------------------------------------------------------------
+
+optimizer:
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+
+
+# ------------------------------------------------------------
+# 2. Learning Rate Scheduler
+# ------------------------------------------------------------
+
+scheduler:
+  warmup_ratio: 0.02
+  stable_ratio: 0.70
+  min_lr_ratio: 0.1
+  decay_type: "cosine"
+
+
+# ------------------------------------------------------------
+# 3. Tokenizer
+# ------------------------------------------------------------
+
+# Tokenizer is initialized by the training entrypoint.
+# Pass the resulting tokenizer object to TaiChuDataLoaderFactory.
+
+tokenizer:
+  path: "./taichu_tokenizer/tokenizer.json"
+  backend: "tokenizers"
+
+
+# ------------------------------------------------------------
+# 4. Dataset Configuration
+# ------------------------------------------------------------
+
+data:
+  schema_version: 1
+  task_type: pretraining
+  dataset_id: taichu-80m-pretraining-v1
+  storage:
+    format: binary_mmap
+    train_path: "./data/unified/taichu_80m/train"
+    validation_path: "./data/unified/taichu_80m/validation"
+    num_workers: 2
+    prefetch_factor: 2
+  sampling:
+    strategy: distributed
+    shuffle: true
+    seed: 42
+    drop_last: true
+  pad_token: "<|pad|>"
+  bos_token: "<|taichu_start|>"
+  eos_token: "<|taichu_end|>"
+  packing:
+    enabled: true
+    strategy: stream
+    max_seq_length: 2048
+    pad_to_multiple_of: 8
+    drop_last_remainder: false
+  batching:
+    strategy: fixed_length
+    micro_batch_size: 8
+    pad_to_multiple_of: 8
+
+
+# ------------------------------------------------------------
+# 5. Training Configuration
+# ------------------------------------------------------------
+
+training:
+
+  # Token budget
+  target_tokens: "4B"
+
+  # Batch configuration
+  batch_size: 8
+
+  gradient_accumulation_steps: 32
+
+
+  # Checkpoint and logging
+
+  save_interval: 1000
+  log_interval: 10
+
+  output_dir: "./experiments/small_models"
+
+  experiment_name: "taichu_80m_pretrain_v1"
+
+
+  # Numerical precision
+
+  use_mixed_precision: true
+
+  dtype: "bfloat16"
+
+  max_grad_norm: 1.0
+
+
+  # Reproducibility
+
+  seed: 42
+
+  local_rank: -1
+
+
+  # Model optimization
+
+  compile_model: true
+
+
+  # DataLoader runtime configuration
+  # Passed explicitly to TaiChuDataLoaderFactory.create().
+
+  dataloader:
+
+    pin_memory: true
+
+    persistent_workers: false
+
+    drop_last: true
+
+
+# ------------------------------------------------------------
+# 6. Evaluation Configuration
+# ------------------------------------------------------------
+
+evaluating:
+
+  batch_size: 8
+
+  eval_interval: 500
+
+  log_interval: 10
+
+  empty_prefix_eos_ppl: false
+
+
+  prompts:
+
+    - "清晨，阳光透过窗户洒进房间，小明起床后"
+
+    - "On a quiet morning, Sarah walked into the garden and"
+
+
+  num_generate_tokens: 32
+
+
+  # Evaluation DataLoader runtime configuration
+
+  dataloader:
+
+    pin_memory: true
+
+    persistent_workers: false
+
+    drop_last: false
+
+
+# ------------------------------------------------------------
+# 7. Early Stopping
+# ------------------------------------------------------------
+
+early_stopping:
+
+  enabled: false
+
+  monitor: "val_loss"
+
+  patience: 5
+
+  min_delta: 1.0e-4
+
+  mode: "min"
+
+
+# ------------------------------------------------------------
+# 8. SwanLab
+# ------------------------------------------------------------
+
+swanlab:
+
+  use_swanlab: false
+
+  swanlab_project: "TaiChu-Small"
+
+  swanlab_experiment_name: "taichu_80m"
+
+  swanlab_log_dir: "./swanlogs"
+
+  swanlab_mode: "local"

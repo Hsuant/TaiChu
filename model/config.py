@@ -295,22 +295,22 @@ class ModelConfig:
         """从字典创建配置对象，自动展平除 moe 外的所有嵌套字典。
 
         支持以下 YAML 格式：
-            1. 平铺字段（新格式）：
-               hidden_size: 768
-               num_layers: 12
-               ...
-            2. 任意嵌套结构（旧格式）：
+            1. 结构化分组（推荐）：
                architecture:
                  hidden_size: 768
                  num_layers: 12
-               regularization:
-                 attention_dropout: 0.0
                activation:
                  hidden_act: "silu"
                  ffn_type: "swiglu"
+               regularization:
+                 attention_dropout: 0.0
                moe:
                  num_experts: 8
                  ...
+            2. 平铺字段（兼容格式）：
+               hidden_size: 768
+               num_layers: 12
+               ...
 
         Args:
             config_dict: 配置字典（可能包含嵌套块）。
