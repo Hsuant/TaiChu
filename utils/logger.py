@@ -12,6 +12,23 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 
+class _UnicodeSafeStreamHandler(logging.StreamHandler):
+    """Write console logs even when stdout cannot encode the message."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = self.format(record)
+        try:
+            self.stream.write(message + self.terminator)
+        except UnicodeEncodeError:
+            encoding = getattr(self.stream, "encoding", None) or "utf-8"
+            safe_message = message.encode(
+                encoding,
+                errors="backslashreplace",
+            ).decode(encoding)
+            self.stream.write(safe_message + self.terminator)
+        self.flush()
+
+
 class LogManager:
     """训练日志管理器。
 
@@ -59,7 +76,7 @@ class LogManager:
         self.logger.handlers.clear()
 
         # 控制台 handler
-        console = logging.StreamHandler(sys.stdout)
+        console = _UnicodeSafeStreamHandler(sys.stdout)
         console.setLevel(console_level)
         console_fmt = logging.Formatter(
             "[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"

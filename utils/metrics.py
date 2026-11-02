@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """LLM 预训练专业评估指标模块。
 
-提供4个指标的封装类：
+提供4类训练诊断指标的封装类：
 1. SmoothedLossTracker       - 指数加权平滑损失（EMA Loss）
-2. GradientNoiseScale        - 梯度噪声尺度，衡量优化器利用效率
+2. GradientNoiseScale        - 梯度范数平方/方差比，仅作稳定性诊断
 3. ModelFlopsUtilization     - 模型FLOPs利用率，计算硬件效率
 4. RepresentationStability   - Token嵌入稳定性，检测表示坍塌
 """
 
-import time
 import math
+import time
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Dict, List, Tuple
 from torch.utils.hooks import RemovableHandle
 
@@ -87,10 +89,12 @@ class SmoothedLossTracker:
 
 
 class GradientNoiseScale:
-    """梯度噪声尺度（Gradient Noise Scale）计算器。
+    """Gradient norm squared to variance ratio tracker.
 
-    梯度噪声尺度反映批次梯度噪声与真实梯度的比值，可用于指导动态
-    Batch Size 调度。计算公式：GNS = (‖g_batch‖²) / (σ_g²)。
+    This is not the textbook per-example Gradient Noise Scale. The project
+    only has the aggregate gradient at each optimizer step, so this class
+    tracks a scalar stability ratio instead. The class name is retained for
+    backward compatibility.
 
     Attributes:
         window_size: 保留历史梯度范数的滑动窗口大小（用于可选统计）。
@@ -98,7 +102,7 @@ class GradientNoiseScale:
         grad_norms: 历史梯度范数平方列表（保留最近 window_size 个）。
         ema_mean: 梯度范数平方的 EMA 均值。
         ema_var: 梯度范数平方的 EMA 方差。
-        current_gns: 当前步的梯度噪声尺度。
+        current_gns: 当前步的梯度范数平方/EMA 方差比。
     """
 
     def __init__(self, window_size: int = 100, ema_beta: float = 0.99):
@@ -108,6 +112,10 @@ class GradientNoiseScale:
             window_size: 滑动窗口大小，用于计算梯度方差。
             ema_beta: 指数加权移动平均的平滑系数，通常取 0.99 或 0.999。
         """
+        if window_size <= 0:
+            raise ValueError("window_size must be positive")
+        if not 0.0 < ema_beta < 1.0:
+            raise ValueError("ema_beta must be in (0, 1)")
         self.window_size = window_size
         self.ema_beta = ema_beta
         self.grad_norms: List[float] = []
@@ -146,14 +154,11 @@ class GradientNoiseScale:
             self.ema_mean = grad_norm_sq
             self.ema_var = 0.0
         else:
-            # 更新 EMA 均值
-            self.ema_mean = self.ema_beta * self.ema_mean + (1 - self.ema_beta) * grad_norm_sq
-            # 更新 EMA 二阶矩：E[x^2] = var + mean^2
-            old_e2 = self.ema_var + self.ema_mean ** 2  # 注意：此处应使用更新前的均值和方差
-            # 更正确的方式：先暂存旧值
+            # 使用更新前的均值与方差计算新的 EMA 均值与二阶矩
             old_mean = self.ema_mean
             old_var = self.ema_var
             new_mean = self.ema_beta * old_mean + (1 - self.ema_beta) * grad_norm_sq
+            # 利用 E[x^2] = var + mean^2 递推 EMA 二阶矩
             new_e2 = self.ema_beta * (old_var + old_mean ** 2) + (1 - self.ema_beta) * grad_norm_sq ** 2
             self.ema_mean = new_mean
             self.ema_var = max(new_e2 - new_mean ** 2, 1e-12)  # 保证方差非负
@@ -168,15 +173,19 @@ class GradientNoiseScale:
         return self.current_gns
 
     def get_metrics(self) -> Dict[str, float]:
-        """获取 GNS 及相关统计信息。
+        """获取梯度范数方差比及相关统计信息。
 
         Returns:
             字典，包含：
-                - gradient_noise_scale: 当前 GNS
+                - grad_norm_sq_variance_ratio: 当前范数平方/方差比
                 - grad_norm_sq_mean: 窗口内梯度范数平方的平均值
                 - grad_norm_sq_std: 窗口内梯度范数平方的标准差
         """
-        metrics = {"gradient_noise_scale": self.current_gns if self.current_gns is not None else 0.0}
+        metrics = {
+            "grad_norm_sq_variance_ratio": (
+                self.current_gns if self.current_gns is not None else 0.0
+            )
+        }
         if len(self.grad_norms) > 0:
             mean_val = sum(self.grad_norms) / len(self.grad_norms)
             metrics["grad_norm_sq_mean"] = mean_val
@@ -189,13 +198,15 @@ class GradientNoiseScale:
         """重置追踪器状态。"""
         self.grad_norms = []
         self.current_gns = None
+        self.ema_mean = None
+        self.ema_var = None
 
 
 class EfficientGradientNoiseScale(GradientNoiseScale):
-    """高效梯度噪声尺度（仅使用归一化层）。
+    """Lightweight gradient variance-ratio diagnostic.
 
-    该变体仅使用 LayerNorm 层的梯度来估计整体 GNS，可大幅降低计算开销。
-    适用于 Transformer 等包含大量归一化层的模型。
+    Uses normalization-layer gradients only to reduce overhead. It retains the
+    legacy class name but does not claim to compute textbook GNS.
 
     Attributes:
         norm_layers: 模型中所有的 LayerNorm 层列表。
@@ -225,7 +236,7 @@ class EfficientGradientNoiseScale(GradientNoiseScale):
         """
         norm_layers = []
         for module in model.modules():
-            if isinstance(module, (nn.LayerNorm,)):
+            if isinstance(module, nn.LayerNorm) or type(module).__name__ == "RMSNorm":
                 norm_layers.append(module)
         return norm_layers
 
@@ -254,9 +265,9 @@ class EfficientGradientNoiseScale(GradientNoiseScale):
             if grad_norm_variance > 1e-12:
                 self.current_gns = grad_norm_sq / grad_norm_variance
             else:
-                self.current_gns = float("inf")
+                self.current_gns = 0.0
         else:
-            self.current_gns = float("inf")
+            self.current_gns = 0.0
 
         # 记录各层的梯度贡献
         for idx, layer in enumerate(self.norm_layers):
@@ -408,6 +419,18 @@ class ModelFlopsUtilization:
         total_params = sum(p.numel() for p in model.parameters())
         return 6 * total_params * seq_len * batch_size
 
+    def estimate_model_flops_for_tokens(
+        self,
+        model: nn.Module,
+        token_count: int,
+    ) -> float:
+        """Estimate training FLOPs using the actual padded token count."""
+
+        if token_count <= 0:
+            return 0.0
+        total_params = sum(p.numel() for p in model.parameters())
+        return 6 * total_params * token_count
+
     def _log_to_file(self, step: int, metrics: Dict[str, float]) -> None:
         """将 MFU 指标写入日志文件（JSON Lines 格式）。"""
         import json
@@ -453,8 +476,10 @@ class RepresentationStability:
         self._register_hook()
 
     def _register_hook(self) -> None:
-        """注册前向钩子以捕获模型输出（通常为 logits 张量）。"""
-        self.hook_handle = self.model.register_forward_hook(self._capture_embedding)
+        """在最终归一化层注册前向钩子，捕获其输出的隐藏状态张量。"""
+        norm = getattr(self.model, "final_norm", None)
+        target = norm if norm is not None else self.model
+        self.hook_handle = target.register_forward_hook(self._capture_embedding)
 
     def _capture_embedding(self, module: nn.Module, input: Tuple[torch.Tensor, ...],
                            output: torch.Tensor) -> None:
@@ -524,6 +549,23 @@ class RepresentationStability:
             self.hook_handle = None
 
 
+@dataclass(frozen=True)
+class TokenStatistics:
+    """Exact token-level statistics for one validation batch.
+
+    ``token_losses`` contains one finite value per supervised next-token
+    position. ``bpb_*`` excludes added special tokens so that bits-per-byte
+    remains comparable across tokenizers.
+    """
+
+    nll_nats: float
+    token_count: int
+    correct_count: int
+    token_losses: torch.Tensor
+    bpb_nll_nats: float
+    bpb_bytes: int
+
+
 class ValidationMetrics:
     """验证阶段评估指标集。
 
@@ -534,7 +576,10 @@ class ValidationMetrics:
     """
 
     @staticmethod
-    def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    def compute_accuracy(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Optional[float]:
         """计算 next token 预测准确率（argmax 与 label 匹配的比例）。
 
         对于因果语言模型，logits 中位置 i 预测的是下一个 token (i+1)，
@@ -547,10 +592,14 @@ class ValidationMetrics:
             labels: 标签，形状 [batch_size, seq_len]，其中 -100 表示忽略该位置。
 
         Returns:
-            准确率（0~1 之间的浮点数）。如果没有有效 token，返回 0.0。
+            准确率（0~1 之间的浮点数）。如果没有有效 token，返回 None。
         """
         if logits is None or labels is None:
-            return 0.0
+            return None
+        if logits.dim() != 3 or labels.dim() != 2:
+            raise ValueError("logits must be 3D and labels must be 2D")
+        if tuple(labels.shape) != tuple(logits.shape[:2]):
+            raise ValueError("labels shape must match logits batch and sequence axes")
 
         # 1. 对齐预测目标：预测下一个 token
         shift_logits = logits[..., :-1, :].contiguous()  # [b, s-1, v]
@@ -559,7 +608,7 @@ class ValidationMetrics:
         # 2. 创建有效位置掩码（忽略 -100）
         valid_mask = shift_labels != -100
         if not valid_mask.any():
-            return 0.0
+            return None
 
         # 3. 取预测概率最高的 token ID
         preds = torch.argmax(shift_logits, dim=-1)  # [b, s-1]
@@ -572,7 +621,10 @@ class ValidationMetrics:
         return accuracy
 
     @staticmethod
-    def compute_percentile_ce(losses_per_token: torch.Tensor, percentiles: List[float] = None) -> Dict[str, float]:
+    def compute_percentile_ce(
+        losses_per_token: torch.Tensor,
+        percentiles: List[float] = None,
+    ) -> Dict[str, Optional[float]]:
         """计算每个 token 损失的分位数（中位数、90% 分位数等）。
 
         Args:
@@ -584,29 +636,227 @@ class ValidationMetrics:
         """
         if percentiles is None:
             percentiles = [0.5, 0.9]
+        if not percentiles:
+            return {}
+        if any(not 0.0 <= value <= 1.0 for value in percentiles):
+            raise ValueError("percentiles must be in [0, 1]")
         if losses_per_token.numel() == 0:
-            return {f"ce_p{int(p*100)}": 0.0 for p in percentiles}
-        # 排序后计算分位数
-        sorted_losses, _ = torch.sort(losses_per_token)
-        n = sorted_losses.numel()
-        results = {}
-        for p in percentiles:
-            idx = int(p * (n - 1))
-            results[f"ce_p{int(p*100)}"] = sorted_losses[idx].item()
-        return results
+            return {f"ce_p{int(p*100)}": None for p in percentiles}
+        losses = losses_per_token.detach().reshape(-1)
+        if not torch.isfinite(losses).all():
+            raise ValueError("per-token losses must be finite")
+        quantiles = torch.quantile(
+            losses.to(dtype=torch.float64),
+            torch.tensor(percentiles, dtype=torch.float64),
+        )
+        return {
+            f"ce_p{int(p * 100)}": float(value.item())
+            for p, value in zip(percentiles, quantiles)
+        }
+
+    @staticmethod
+    def compute_perplexity(loss: Optional[float]) -> Optional[float]:
+        """Convert mean NLL to perplexity without injecting artificial inf."""
+
+        if loss is None:
+            return None
+        finite_loss = float(loss)
+        if not math.isfinite(finite_loss) or finite_loss < 0.0:
+            return None
+        try:
+            perplexity = math.exp(finite_loss)
+        except OverflowError:
+            return None
+        return perplexity if math.isfinite(perplexity) else None
+
+    @staticmethod
+    def compute_bits_per_byte(
+        total_nll_nats: float,
+        total_utf8_bytes: int,
+    ) -> Optional[float]:
+        """Return tokenizer-independent bits-per-byte for predicted content."""
+
+        if total_utf8_bytes <= 0 or not math.isfinite(total_nll_nats):
+            return None
+        if total_nll_nats < 0.0:
+            raise ValueError("total_nll_nats cannot be negative")
+        value = float(total_nll_nats) / (math.log(2.0) * total_utf8_bytes)
+        return value if math.isfinite(value) else None
+
+    @staticmethod
+    def _special_token_ids(tokenizer) -> set[int]:
+        if tokenizer is None:
+            return set()
+        if hasattr(tokenizer, "all_special_ids"):
+            return {int(token_id) for token_id in tokenizer.all_special_ids}
+        if hasattr(tokenizer, "get_added_tokens_decoder"):
+            return {
+                int(token_id)
+                for token_id in tokenizer.get_added_tokens_decoder()
+            }
+        if hasattr(tokenizer, "get_added_vocab"):
+            return {int(token_id) for token_id in tokenizer.get_added_vocab().values()}
+        if hasattr(tokenizer, "get_vocab"):
+            return {
+                int(token_id)
+                for token, token_id in tokenizer.get_vocab().items()
+                if (
+                    (token.startswith("<|") and token.endswith("|>"))
+                    or token in {"<s>", "</s>", "<unk>", "<pad>"}
+                )
+            }
+        return set()
+
+    @staticmethod
+    def compute_token_statistics(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        tokenizer=None,
+    ) -> TokenStatistics:
+        """Compute all core token-level metrics with one shift definition."""
+
+        if logits.dim() != 3 or labels.dim() != 2:
+            raise ValueError("logits must be 3D and labels must be 2D")
+        if tuple(labels.shape) != tuple(logits.shape[:2]):
+            raise ValueError("labels shape must match logits batch and sequence axes")
+        if logits.size(1) < 2:
+            empty = torch.empty(0, dtype=torch.float64)
+            return TokenStatistics(0.0, 0, 0, empty, 0.0, 0)
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        vocab_size = shift_logits.size(-1)
+        token_losses = F.cross_entropy(
+            shift_logits.reshape(-1, vocab_size).float(),
+            shift_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape(shift_labels.shape)
+        valid_mask = shift_labels != -100
+        selected_losses = token_losses[valid_mask]
+        if not torch.isfinite(selected_losses).all():
+            raise ValueError("token losses must be finite")
+
+        token_count = int(selected_losses.numel())
+        if token_count == 0:
+            return TokenStatistics(
+                nll_nats=0.0,
+                token_count=0,
+                correct_count=0,
+                token_losses=torch.empty(0, dtype=torch.float64),
+                bpb_nll_nats=0.0,
+                bpb_bytes=0,
+            )
+
+        predictions = torch.argmax(shift_logits, dim=-1)
+        correct_count = int(
+            ((predictions == shift_labels) & valid_mask).sum().item()
+        )
+        selected_losses_cpu = selected_losses.detach().to(
+            device="cpu",
+            dtype=torch.float64,
+        )
+        bpb_nll_nats = 0.0
+        bpb_bytes = 0
+        special_ids = ValidationMetrics._special_token_ids(tokenizer)
+        if special_ids and tokenizer is not None:
+            special_tensor = torch.tensor(
+                sorted(special_ids),
+                dtype=shift_labels.dtype,
+                device=shift_labels.device,
+            )
+            for row_index in range(shift_labels.size(0)):
+                row_mask = valid_mask[row_index]
+                row_targets = shift_labels[row_index][row_mask]
+                if row_targets.numel() == 0:
+                    continue
+                content_mask = ~torch.isin(row_targets, special_tensor)
+                if not content_mask.any():
+                    continue
+                content_ids = row_targets[content_mask].tolist()
+                decoded = tokenizer.decode(
+                    content_ids,
+                    skip_special_tokens=True,
+                )
+                bpb_bytes += len(decoded.encode("utf-8"))
+                bpb_nll_nats += token_losses[row_index][row_mask][
+                    content_mask
+                ].sum().item()
+        elif tokenizer is not None:
+            for row_index in range(shift_labels.size(0)):
+                row_mask = valid_mask[row_index]
+                row_targets = shift_labels[row_index][row_mask]
+                if row_targets.numel() == 0:
+                    continue
+                decoded = tokenizer.decode(
+                    row_targets.tolist(),
+                    skip_special_tokens=True,
+                )
+                bpb_bytes += len(decoded.encode("utf-8"))
+                bpb_nll_nats += token_losses[row_index][row_mask].sum().item()
+
+        return TokenStatistics(
+            nll_nats=float(selected_losses.sum().item()),
+            token_count=token_count,
+            correct_count=correct_count,
+            token_losses=selected_losses_cpu,
+            bpb_nll_nats=float(bpb_nll_nats),
+            bpb_bytes=bpb_bytes,
+        )
+
+    @staticmethod
+    def compute_empty_prefix_eos_metrics(
+        model: nn.Module,
+        bos_token_id: Optional[int],
+        eos_token_id: Optional[int],
+        device: torch.device,
+    ) -> Dict[str, Optional[float]]:
+        """Measure the explicit BOS -> EOS transition, or return N/A."""
+
+        result: Dict[str, Optional[float]] = {
+            "empty_prefix_eos_ce": None,
+            "empty_prefix_eos_ppl": None,
+        }
+        if bos_token_id is None or eos_token_id is None:
+            return result
+        if bos_token_id == eos_token_id:
+            return result
+        if bos_token_id < 0 or eos_token_id < 0:
+            return result
+
+        was_training = model.training
+        input_ids = torch.tensor(
+            [[bos_token_id, eos_token_id]],
+            dtype=torch.long,
+            device=device,
+        )
+        model.eval()
+        try:
+            with torch.no_grad():
+                loss = model(input_ids, labels=input_ids).loss
+        except (RuntimeError, ValueError):
+            return result
+        finally:
+            model.train(was_training)
+
+        if loss is None:
+            return result
+        ce = float(loss.item())
+        if not math.isfinite(ce) or ce < 0.0:
+            return result
+        result["empty_prefix_eos_ce"] = ce
+        result["empty_prefix_eos_ppl"] = ValidationMetrics.compute_perplexity(ce)
+        return result
 
     @staticmethod
     def compute_blank_ppl(model: nn.Module, tokenizer, blank_text: str = "",
-                          max_length: int = 50, device: torch.device = torch.device("cpu")) -> float:
-        """计算空白提示的困惑度（Blank PPL）。
+                          max_length: int = 50, device: torch.device = torch.device("cpu")) -> Optional[float]:
+        """Legacy blank-text perplexity helper.
 
-        空白提示评估模型在没有有用上下文时的“默认”行为。
-        本方法严格按照原有逻辑实现：
-            - 对空白文本进行编码（添加特殊 token）
-            - 若编码后的序列为空，返回 inf
-            - 否则计算模型在完整序列上的交叉熵损失，并取指数得到困惑度
-
-        注意：原有方法中 max_length 参数未被使用，此处保持原有行为（忽略该参数）。
+        New training and evaluation code should use
+        ``compute_empty_prefix_eos_metrics`` with explicit BOS/EOS IDs.
+        This compatibility helper returns None when the tokenizer does not
+        produce at least two supervised tokens.
 
         Args:
             model: 模型实例（已 eval 模式）。
@@ -616,61 +866,54 @@ class ValidationMetrics:
             device: 计算设备。
 
         Returns:
-            困惑度值（perplexity）。若损失超过 100，返回 inf 以避免数值溢出。
+            困惑度值；序列不足两个 Token 或结果非有限时返回 None。
         """
-        model.eval()
-        # 编码空白文本，通常会自动添加 BOS/EOS 等特殊 token
         encoding = tokenizer.encode(blank_text, add_special_tokens=True)
         input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=device)
-
-        # 原有空序列检查：若序列为空，返回 inf
-        if input_ids.numel() == 0 or input_ids.size(1) == 0:
-            return float('inf')
+        if input_ids.size(1) < 2:
+            return None
 
         # 标签与输入相同（模型内部会自动 shift）
         labels = input_ids.clone()
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                outputs = model(input_ids, labels=labels)
+                loss = outputs.loss
+        finally:
+            model.train(was_training)
 
-        with torch.no_grad():
-            outputs = model(input_ids, labels=labels)
-            loss = outputs.loss
-
-        # 数值稳定性处理：损失过大时返回 inf（原有逻辑）
-        if loss.item() >= 100:
-            return float('inf')
-
-        ppl = math.exp(loss.item())
-        return ppl
+        if loss is None:
+            return None
+        return ValidationMetrics.compute_perplexity(loss.item())
 
     @staticmethod
     def compute_bose_stability(model: nn.Module, tokenizer, num_runs: int = 3,
-                               device: torch.device = torch.device("cpu")) -> Dict[str, float]:
-        """简化版 BOSE 评估稳定性（通过多次前向传播的损失方差）。
+                               device: torch.device = torch.device("cpu")) -> Dict[str, Optional[float]]:
+        """Deprecated deterministic empty-prefix diagnostic.
 
-        真实 BOSE 需要构造无指令提示和空白 PPL 基线，这里提供一种轻量实现：
-        对同一空白提示多次计算损失，返回标准差作为稳定性指标。
-
-        Args:
-            model: 模型实例。
-            tokenizer: tokenizer。
-            num_runs: 重复次数。
-            device: 设备。
-
-        Returns:
-            字典，包含 "blank_ppl_mean", "blank_ppl_std"。
+        Eval-mode inference is deterministic, so repeated runs do not measure
+        stability. The helper remains only for API compatibility and returns
+        None when blank perplexity is undefined.
         """
         losses = []
         for _ in range(num_runs):
-            # 每次重新编码（避免缓存影响）
-            encoding = tokenizer.encode("", add_special_tokens=True)
-            input_ids = torch.tensor([encoding.ids], dtype=torch.long, device=device)
-            labels = input_ids.clone()
-            with torch.no_grad():
-                outputs = model(input_ids, labels=labels)
-                losses.append(outputs.loss.item())
+            ppl = ValidationMetrics.compute_blank_ppl(
+                model,
+                tokenizer,
+                device=device,
+            )
+            if ppl is None:
+                return {
+                    "blank_ppl_mean": None,
+                    "blank_ppl_std": None,
+                }
+            losses.append(math.log(ppl))
         mean_loss = sum(losses) / len(losses)
         std_loss = (sum((l - mean_loss) ** 2 for l in losses) / len(losses)) ** 0.5
-        mean_ppl = math.exp(mean_loss) if mean_loss < 100 else float("inf")
-        std_ppl = std_loss * mean_ppl  # 近似
+        mean_ppl = ValidationMetrics.compute_perplexity(mean_loss)
+        std_ppl = std_loss * mean_ppl if mean_ppl is not None else None
         return {"blank_ppl_mean": mean_ppl, "blank_ppl_std": std_ppl}
 
 

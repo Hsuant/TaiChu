@@ -66,6 +66,42 @@ class ModelInspector:
         return sum(p.numel() for p in model.parameters())
 
     @staticmethod
+    def get_peak_flops(default: float = 0.0) -> float:
+        """解析当前 GPU 的理论峰值算力（FLOPs/秒）。
+
+        通过设备名称匹配主流 GPU 的满血 FP16/BF16 Tensor Core 理论峰值；
+        未识别或非 CUDA 环境下回退到 default 值；默认禁用 MFU。
+
+        Args:
+            default: 未识别 GPU 时使用的默认峰值算力。
+
+        Returns:
+            峰值算力（FLOPs / 秒）。
+        """
+        if not torch.cuda.is_available():
+            return default
+        name = torch.cuda.get_device_name(0).lower()
+        table = {
+            "h100": 989e12,        # H100 SXM
+            "a100": 312e12,        # A100 40GB/80GB
+            "a800": 312e12,
+            "rtx 4090": 330e12,
+            "rtx 4080": 291e12,
+            "rtx 3090": 142e12,
+            "a6000": 155e12,
+            "a5000": 110e12,
+            "v100": 125e12,
+            "l40": 227e12,
+            "l20": 239e12,
+            "l4": 121e12,
+            "t4": 65e12,
+        }
+        for key, flops in table.items():
+            if key in name:
+                return flops
+        return default
+
+    @staticmethod
     def get_model_size_mb(model: nn.Module, precision: int = 4) -> float:
         """估算模型大小（以 MB 为单位）。
 
@@ -94,12 +130,16 @@ class ModelInspector:
         grad_norm = 0.0
         grad_max = float("-inf")
         grad_min = float("inf")
+        found_gradient = False
         for p in model.parameters():
             if p.grad is not None:
+                found_gradient = True
                 grad_norm += p.grad.norm(2).item() ** 2
                 grad_max = max(grad_max, p.grad.abs().max().item())
                 grad_min = min(grad_min, p.grad.abs().min().item())
         grad_norm = grad_norm ** 0.5
+        if not found_gradient:
+            return {"grad_norm": 0.0, "grad_max": 0.0, "grad_min": 0.0}
         return {"grad_norm": grad_norm, "grad_max": grad_max, "grad_min": grad_min}
 
     @staticmethod

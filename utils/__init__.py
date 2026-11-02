@@ -11,7 +11,8 @@ from utils.visualization import VisualizationManager
 from utils.config_loader import (
     OptimizerConfig,
     SchedulerConfig,
-    DataConfig,
+    DataLoaderRuntimeConfig,
+    UnifiedDataConfig,
     TrainingConfig,
     EvaluatingConfig,
     EarlyStoppingConfig,
@@ -53,7 +54,8 @@ __all__ = [
     # 配置
     "OptimizerConfig",
     "SchedulerConfig",
-    "DataConfig",
+    "DataLoaderRuntimeConfig",
+    "UnifiedDataConfig",
     "TrainingConfig",
     "EvaluatingConfig",
     "EarlyStoppingConfig",

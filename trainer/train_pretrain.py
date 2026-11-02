@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import math
 import time
+from dataclasses import replace
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler
@@ -43,7 +44,8 @@ from utils.logger import LogManager
 from utils.swanlab_logger import SwanLabLogger
 from utils.checkpoint import CheckpointManager
 from utils.model_utils import ModelInspector
-from dataset.llm_dataset import build_dataloader
+from dataset.runtime import UnifiedDataLoaderFactory as TaiChuDataLoaderFactory
+from dataset.runtime import DataState, skip_batches
 from utils.metrics import EvaluationMetricsManager, ValidationMetrics
 
 
@@ -99,8 +101,14 @@ class TaiChuTrainer:
         local_rank: int = 0,
         max_seq_len: int = 2048,
         global_rank: int = 0,
+        peak_flops: float = 0.0,
         generation_prompts: Optional[List[str]] = None,
         num_generate_tokens: int = 50,
+        max_grad_norm: float = 1.0,
+        bos_token_id: Optional[int] = None,
+        eos_token_id: Optional[int] = None,
+        compute_empty_prefix_eos_ppl: bool = False,
+        data_state: DataState | None = None,
     ):
         """初始化训练器。
 
@@ -133,8 +141,13 @@ class TaiChuTrainer:
             local_rank: 当前进程的本地 Rank（用于设备设置）。
             max_seq_len: 最大序列长度，用于计算 tokens/s。
             global_rank: 全局 Rank（0 为主进程）。
+            peak_flops: GPU 理论峰值算力（FLOPs/秒），用于 MFU 计算。
             generation_prompts: 测试 Prompts 列表。
             num_generate_tokens: 测试生成 token 长度。
+            max_grad_norm: 梯度裁剪的最大范数。
+            bos_token_id: BOS Token ID，用于可选空 Prompt 诊断。
+            eos_token_id: EOS Token ID，用于可选空 Prompt 诊断。
+            compute_empty_prefix_eos_ppl: 是否记录显式 BOS -> EOS 诊断。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -153,6 +166,11 @@ class TaiChuTrainer:
         self.eval_log_interval = eval_log_interval
         self.generation_prompts = generation_prompts
         self.num_generate_tokens = num_generate_tokens
+        self.max_grad_norm = max_grad_norm
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.compute_empty_prefix_eos_ppl = compute_empty_prefix_eos_ppl
+        self.data_state = data_state
         self.swanlab_logger = swanlab_logger
         self.device = device
         self.use_amp = use_amp
@@ -180,7 +198,6 @@ class TaiChuTrainer:
         # 日志时间窗口
         self.start_time = 0.0
         self.last_log_time = None
-        self.last_log_step = init_step
 
         # ========== 集成训练阶段专业评估指标 ==========
         # 创建评估指标管理器，配置平滑系数和梯度窗口
@@ -188,12 +205,12 @@ class TaiChuTrainer:
             "loss_beta": 0.9,        # 平滑损失系数
             "gns_window": 100        # 梯度噪声尺度滑动窗口
         })
-        # 初始化 MFU 计算器（RTX 4090 FP16 Tensor Core 理论峰值约为 330 TFLOPS）
-        # 若使用其他 GPU，请根据实际硬件修改峰值算力
-        self.eval_metrics.initialize_mfu(
-            peak_flops=330e12,
-            log_file=os.path.join(log_manager.log_dir, "mfu_log.jsonl")
-        )
+        if peak_flops > 0:
+            # 初始化 MFU 计算器（峰值算力可用 --peak_flops 显式指定）
+            self.eval_metrics.initialize_mfu(
+                peak_flops=peak_flops,
+                log_file=os.path.join(log_manager.log_dir, "mfu_log.jsonl")
+            )
         # 获取原始模型（处理 DDP 包装），用于表示稳定性钩子
         raw_model = model.module if hasattr(model, 'module') else model
         assert isinstance(raw_model, nn.Module)
@@ -208,32 +225,91 @@ class TaiChuTrainer:
             self.log_manager.info("训练开始")
 
             # 数据迭代器
+            data_epoch = 0 if self.data_state is None else self.data_state.epoch
+            batch_index = 0 if self.data_state is None else self.data_state.batch_index
+            consumed_samples = (
+                0 if self.data_state is None else self.data_state.consumed_samples
+            )
+            dataset_reader = getattr(
+                getattr(self.train_loader, "dataset", None),
+                "reader",
+                None,
+            )
+            if dataset_reader is None:
+                raise RuntimeError("training loader does not expose unified Storage Reader")
+            if self.data_state is not None and not self.data_state.compatible_with(
+                dataset_reader.dataset_id,
+                dataset_reader.version,
+            ):
+                raise ValueError(
+                    "checkpoint DataState does not match the configured dataset"
+                )
+            if hasattr(self.train_loader, "set_epoch"):
+                self.train_loader.set_epoch(data_epoch)
             train_iter = iter(self.train_loader)
+            if batch_index:
+                train_iter = skip_batches(train_iter, batch_index)
             accumulated_loss = 0.0          # 累积的原始损失（未除累积步数）
             samples_processed = 0           # 当前累积步内处理的样本数
+            tokens_processed = 0            # 当前优化步实际处理的 padded token 数
+            tokens_since_log = 0
             micro_step = 0                  # 当前累积步内已处理的微批次计数
 
             while self.global_step < self.max_steps and not self.early_stopped:
                 try:
                     batch = next(train_iter)
                 except StopIteration:
+                    data_epoch += 1
+                    batch_index = 0
+                    if hasattr(self.train_loader, "set_epoch"):
+                        self.train_loader.set_epoch(data_epoch)
                     train_iter = iter(self.train_loader)
-                    batch = next(train_iter)
+                    try:
+                        batch = next(train_iter)
+                    except StopIteration as exc:
+                        raise RuntimeError(
+                            "training data pipeline produced no batches"
+                        ) from exc
+
+                batch_index += 1
+                batch_sample_ids = batch.get("sample_ids")
+                consumed_samples += (
+                    len(batch_sample_ids)
+                    if batch_sample_ids is not None
+                    else int(batch["input_ids"].size(0))
+                )
+                self.data_state = DataState(
+                    dataset_id=dataset_reader.dataset_id,
+                    dataset_version=dataset_reader.version,
+                    epoch=data_epoch,
+                    batch_index=batch_index,
+                    consumed_samples=consumed_samples,
+                )
 
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+
+                # 标记当前微步边界（供 torch.compile 的 CUDA Graph 捕获对齐步进）
+                torch.compiler.cudagraph_mark_step_begin()
 
                 # 前向传播（混合精度）
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
-                    out = self.model(input_ids, labels=labels)
+                    out = self.model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
                     loss = out.loss
                     loss = loss.mean() / self.gradient_accumulation_steps   # 缩放损失
 
                 # 反向传播
                 self.scaler.scale(loss).backward()
-                torch.compiler.cudagraph_mark_step_begin()
                 accumulated_loss += loss.item() * self.gradient_accumulation_steps   # 恢复原始损失
                 samples_processed += input_ids.size(0)
+                tokens_processed += input_ids.numel()
                 micro_step += 1
 
                 # 达到梯度累积步数，执行参数更新
@@ -246,17 +322,17 @@ class TaiChuTrainer:
                     self.eval_metrics.update_gradient(self.model)
 
                     # 梯度裁剪
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.max_grad_norm,
+                    )
 
-                    # 优化器步进
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    self.scheduler.step()
 
                     # 更新全局步数
                     self.global_step += 1
-
-                    # 学习率调度器更新
-                    self.scheduler.step()
 
                     # 计算平均损失
                     avg_loss = accumulated_loss / self.gradient_accumulation_steps
@@ -264,12 +340,14 @@ class TaiChuTrainer:
                     # 更新训练阶段评估指标
                     # 平滑损失
                     self.eval_metrics.update_loss(avg_loss)
-                    # 梯度噪声尺度（需要在 backward 后、optimizer.step 之前调用）
-                    self.eval_metrics.update_gradient(self.model)
                     # 模型 FLOPs 利用率（MFU）
-                    step_batch_size = samples_processed   # 当前累积步内的总样本数
                     if self.eval_metrics.mfu is not None:
-                        step_flops = self.eval_metrics.mfu.estimate_model_flops(self.model, self.max_seq_len, step_batch_size)
+                        step_flops = (
+                            self.eval_metrics.mfu.estimate_model_flops_for_tokens(
+                                self.model,
+                                tokens_processed,
+                            )
+                        )
                     else:
                         step_flops = 0.0
                     self.eval_metrics.update_step(step_flops, self.global_step)
@@ -282,8 +360,13 @@ class TaiChuTrainer:
                             )
 
                     # 记录训练指标
+                    tokens_since_log += tokens_processed
                     if self.global_step % self.train_log_interval == 0:
-                        self._log_training(avg_loss, samples_processed)
+                        self._log_training(
+                            avg_loss,
+                            tokens_since_log,
+                        )
+                        tokens_since_log = 0
 
                     # 梯度清零
                     self.optimizer.zero_grad()
@@ -291,6 +374,7 @@ class TaiChuTrainer:
                     # 重置累积计数器
                     accumulated_loss = 0.0
                     samples_processed = 0
+                    tokens_processed = 0
                     micro_step = 0
 
                     # 验证
@@ -313,6 +397,7 @@ class TaiChuTrainer:
                             scheduler=self.scheduler,
                             scaler=self.scaler,
                             global_step=self.global_step,
+                            data_state=self.data_state.to_dict(),
                         )
                         self.log_manager.info(
                             f"当前最佳验证损失: {self.checkpoint_manager.best_metric_value:.4f}"
@@ -337,6 +422,7 @@ class TaiChuTrainer:
                                     global_step=self.global_step,
                                     metrics={"val_loss": val_loss},
                                     early_stopping_state=self.early_stopping.state_dict(),
+                                    data_state=self.data_state.to_dict(),
                                 )
                                 break
 
@@ -345,6 +431,7 @@ class TaiChuTrainer:
                         extra = {}
                         if self.early_stopping is not None:
                             extra["early_stopping_state"] = self.early_stopping.state_dict()
+                        extra["data_state"] = self.data_state.to_dict()
                         self.checkpoint_manager.save(
                             f"checkpoints/checkpoint-{self.global_step}.pt",
                             model=self.model,
@@ -353,6 +440,7 @@ class TaiChuTrainer:
                             scaler=self.scaler,
                             global_step=self.global_step,
                             metrics={"val_loss": val_loss if 'val_loss' in locals() else self.best_val_loss},
+                            **extra,
                         )
 
             # 训练结束，保存最终模型
@@ -363,6 +451,9 @@ class TaiChuTrainer:
                 scheduler=self.scheduler,
                 scaler=self.scaler,
                 global_step=self.global_step,
+                data_state=(
+                    None if self.data_state is None else self.data_state.to_dict()
+                ),
             )
             self.log_manager.info("训练完成!")
             if self.swanlab_logger:
@@ -387,6 +478,9 @@ class TaiChuTrainer:
         extra = {}
         if self.early_stopping is not None:
             extra["early_stopping_state"] = self.early_stopping.state_dict()
+        extra["data_state"] = (
+            None if self.data_state is None else self.data_state.to_dict()
+        )
         self.checkpoint_manager.save(
             f"checkpoints/checkpoint-emergency-step{self.global_step}.pt",
             model=self.model,
@@ -399,7 +493,7 @@ class TaiChuTrainer:
         )
         self.log_manager.info(f"紧急检查点已保存至 step {self.global_step}")
 
-    def _log_training(self, loss: float, samples: int) -> None:
+    def _log_training(self, loss: float, tokens: int) -> None:
         """记录训练指标到 TensorBoard 和日志文件。
 
         计算 tokens_per_sec 时，使用本次日志与上一次日志之间的时间窗口，
@@ -407,28 +501,25 @@ class TaiChuTrainer:
 
         Args:
             loss: 当前参数更新步的平均损失（已排除梯度累积的缩放）。
-            samples: 当前参数更新步内实际处理的样本数（batch_size × 累积步数）。
+            tokens: 上次日志以来实际处理的 padded token 数。
         """
         # 学习率
         lr = self.optimizer.param_groups[0]["lr"]
 
         # 困惑度
-        ppl = math.exp(loss) if loss < 100 else float("inf")
+        ppl = ValidationMetrics.compute_perplexity(loss)
+        ppl_text = "N/A" if ppl is None else f"{ppl:.2f}"
 
         # 瞬时 tokens/s
         current_time = time.time()
         if self.last_log_time is None:
             elapsed = current_time - self.start_time
-            steps_since_log = self.global_step - self.last_log_step
         else:
             elapsed = current_time - self.last_log_time
-            steps_since_log = self.global_step - self.last_log_step
 
-        total_tokens = steps_since_log * samples * self.max_seq_len
-        tokens_per_sec = total_tokens / max(elapsed, 1e-6)
+        tokens_per_sec = tokens / max(elapsed, 1e-6)
 
         self.last_log_time = current_time
-        self.last_log_step = self.global_step
 
         # 梯度统计
         grad_info = ModelInspector.gradient_summary(self.model) or {}
@@ -441,24 +532,34 @@ class TaiChuTrainer:
         # 构造完整指标字典（用于 SwanLab 和 TensorBoard）
         metrics = {
             "train/loss": loss,
-            "train/perplexity": ppl,
             "train/lr": lr,
             "train/tokens_per_sec": tokens_per_sec,
             "train/grad_norm": grad_norm,
             "train/grad_max": grad_max,
             "train/smoothed_loss": extra_metrics.get("smoothed_loss", 0.0),
-            "train/gradient_noise_scale": extra_metrics.get("gradient_noise_scale", 0.0),
-            "train/mfu_average": extra_metrics.get("mfu_average", 0.0),
-            "train/mfu_instant": extra_metrics.get("mfu_instant", 0.0),
+            "train/grad_norm_sq_variance_ratio": extra_metrics.get(
+                "grad_norm_sq_variance_ratio",
+                0.0,
+            ),
         }
+        if ppl is not None:
+            metrics["train/perplexity"] = ppl
+        if "mfu_average" in extra_metrics:
+            metrics["train/mfu_average"] = extra_metrics["mfu_average"]
+        if "mfu_instant" in extra_metrics:
+            metrics["train/mfu_instant"] = extra_metrics["mfu_instant"]
 
         # 构建控制台日志（包含关键指标）
+        mfu_average = extra_metrics.get("mfu_average")
+        mfu_text = (
+            "N/A" if mfu_average is None else f"{mfu_average:.3f}"
+        )
         log_line = (
             f"Step {self.global_step} | "
             f"loss={loss:.4f} | smooth_loss={extra_metrics.get('smoothed_loss', 0):.4f} | "
-            f"ppl={ppl:.2f} | lr={lr:.2e} | tok/s={tokens_per_sec:.0f} | "
-            f"gns={extra_metrics.get('gradient_noise_scale', 0):.2f} | "
-            f"mfu={extra_metrics.get('mfu_average', 0):.3f}"
+            f"ppl={ppl_text} | lr={lr:.2e} | tok/s={tokens_per_sec:.0f} | "
+            f"grad_ratio={extra_metrics.get('grad_norm_sq_variance_ratio', 0):.2f} | "
+            f"mfu={mfu_text}"
         )
         self.log_manager.logger.info(log_line)
 
@@ -480,150 +581,208 @@ class TaiChuTrainer:
             平均损失值（所有 token 的平均交叉熵）。
         """
         self.model.eval()
-        total_loss = 0.0
+        total_nll_nats = 0.0
         total_tokens = 0
+        total_correct = 0
+        total_bpb_nll_nats = 0.0
+        total_bpb_bytes = 0
+        all_token_losses = []
 
         # 生成测试的提示词列表
         if generate_prompts is None:
             generate_prompts = []
 
-        # 扩展指标累加器
-        total_accuracy = 0.0
-        total_valid_tokens = 0
-        all_token_losses = []   # 存储每个 token 的损失（用于分位数）
- 
         batch_cnt = 0
-        accum_loss = 0.0
+        accum_nll = 0.0
         accum_tokens = 0
+        try:
+            val_batch_count = len(self.val_loader)
+        except TypeError:
+            val_batch_count = None
 
         with torch.compiler.set_stance("force_eager"):  # 临时回退到 eager 模式，完全避免 CUDA Graph 问题
             for batch in self.val_loader:
                 input_ids = batch["input_ids"].to(self.device)
                 labels = batch["labels"].to(self.device)
+                attention_mask = batch.get("attention_mask")
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
-                    out = self.model(input_ids, labels=labels)
-                    loss = out.loss
-                    # 尝试获取 logits（如果模型返回）
+                    out = self.model(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
                     logits = getattr(out, "logits", None)
 
-                batch_tokens = input_ids.numel()
-                total_loss += loss.item() * batch_tokens
-                total_tokens += batch_tokens
+                if out.loss is None or not torch.isfinite(out.loss):
+                    raise RuntimeError("model returned a non-finite validation loss")
+                if logits is None:
+                    raise RuntimeError("model did not return logits for validation")
 
-                # ---- 计算准确率 ----
-                if logits is not None and isinstance(logits, torch.Tensor):
-                    # 直接调用 ValidationMetrics.compute_accuracy，函数内部已完成 shift 对齐
-                    acc = ValidationMetrics.compute_accuracy(logits, labels)
-                    # 获取该 batch 的有效 token 数量（需使用 shift 后的 labels）
-                    shift_labels = labels[..., 1:].contiguous()
-                    valid_mask = (shift_labels != -100)
-                    valid_count = valid_mask.sum().item()
-                    total_accuracy += acc * valid_count
-                    total_valid_tokens += valid_count
+                stats = ValidationMetrics.compute_token_statistics(
+                    logits,
+                    labels,
+                    tokenizer=self.tokenizer,
+                )
+                total_nll_nats += stats.nll_nats
+                total_tokens += stats.token_count
+                total_correct += stats.correct_count
+                total_bpb_nll_nats += stats.bpb_nll_nats
+                total_bpb_bytes += stats.bpb_bytes
+                if stats.token_losses.numel() > 0:
+                    all_token_losses.append(stats.token_losses)
 
-                # ---- 收集每个 token 的损失（用于分位数） ----
-                # 方法：手动计算 per-token cross entropy
-                # 注意：需要将 logits 和 labels 对齐（shift）
-                if logits is not None:
-                    # 标准 causal LM 的 shift 操作：预测下一个 token
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels[..., 1:].contiguous()
-                    ce_loss = nn.CrossEntropyLoss(reduction='none')
-                    token_losses = ce_loss(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)
-                    ).view(shift_labels.size())
-                    # 过滤掉标签为 -100 的位置
-                    valid_mask_shift = (shift_labels != -100)
-                    valid_token_losses = token_losses[valid_mask_shift]
-                    if valid_token_losses.numel() > 0:
-                        all_token_losses.append(valid_token_losses.cpu())
-
-                # 中间输出（与原有逻辑一致）
-                accum_loss += loss.item() * batch_tokens
-                accum_tokens += batch_tokens
+                accum_nll += stats.nll_nats
+                accum_tokens += stats.token_count
                 batch_cnt += 1
 
                 if self.global_rank == 0 and self.eval_log_interval > 0 and batch_cnt % self.eval_log_interval == 0:
-                    local_avg_loss = accum_loss / accum_tokens
-                    local_ppl = math.exp(local_avg_loss) if local_avg_loss < 100 else float("inf")
-                    self.log_manager.logger.info(
-                        f"[Eval] Step {self.global_step} (batch {batch_cnt}/{len(self.val_loader)}) | "
-                        f"loss={local_avg_loss:.4f} | ppl={local_ppl:.2f}"
+                    local_avg_loss = (
+                        accum_nll / accum_tokens
+                        if accum_tokens > 0
+                        else None
                     )
-                    accum_loss = 0.0
+                    local_ppl = ValidationMetrics.compute_perplexity(
+                        local_avg_loss
+                    )
+                    loss_text = (
+                        "N/A"
+                        if local_avg_loss is None
+                        else f"{local_avg_loss:.4f}"
+                    )
+                    ppl_text = (
+                        "N/A"
+                        if local_ppl is None
+                        else f"{local_ppl:.2f}"
+                    )
+                    self.log_manager.logger.info(
+                        f"[Eval] Step {self.global_step} "
+                        f"(batch {batch_cnt}/{val_batch_count or '?'}) | "
+                        f"loss={loss_text} | ppl={ppl_text}"
+                    )
+                    accum_nll = 0.0
                     accum_tokens = 0
 
-        # 分布式聚合
-        if self.device.type == 'cuda' and torch.distributed.is_initialized():
-            # 聚合损失和 token 数
-            loss_tensor = torch.tensor(total_loss, device=self.device)
-            tokens_tensor = torch.tensor(total_tokens, device=self.device)
-            torch.distributed.all_reduce(loss_tensor, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(tokens_tensor, op=torch.distributed.ReduceOp.SUM)
-            total_loss = loss_tensor.item()
-            total_tokens = tokens_tensor.item()
+        if batch_cnt == 0:
+            raise RuntimeError("validation data pipeline produced no batches")
 
-            # 聚合准确率
-            if total_valid_tokens > 0:
-                acc_tensor = torch.tensor(total_accuracy, device=self.device)
-                valid_tensor = torch.tensor(total_valid_tokens, device=self.device)
-                torch.distributed.all_reduce(acc_tensor, op=torch.distributed.ReduceOp.SUM)
-                torch.distributed.all_reduce(valid_tensor, op=torch.distributed.ReduceOp.SUM)
-                total_accuracy = acc_tensor.item()
-                total_valid_tokens = valid_tensor.item()
-
-            # 分位数 CE 的聚合：由于 all_token_losses 是列表，简单做法是每个进程独立计算后取平均
-            # 更精确的做法是收集所有 token 损失，但通信开销大。此处采用各进程独立计算再平均。
-            # 为简化，我们仅在主进程计算分位数（因为 all_token_losses 非空）
-            pass
-
-        avg_loss = total_loss / total_tokens if total_tokens > 0 else float("inf")
-        avg_accuracy = total_accuracy / total_valid_tokens if total_valid_tokens > 0 else 0.0
-
-        # 计算分位数交叉熵
-        if all_token_losses:
-            all_token_losses_tensor = torch.cat(all_token_losses, dim=0)
-            percentile_metrics = ValidationMetrics.compute_percentile_ce(
-                all_token_losses_tensor, percentiles=[0.5, 0.9, 0.95]
+        distributed = torch.distributed.is_initialized()
+        if distributed:
+            totals = torch.tensor(
+                [
+                    total_nll_nats,
+                    float(total_tokens),
+                    float(total_correct),
+                    total_bpb_nll_nats,
+                    float(total_bpb_bytes),
+                    float(batch_cnt),
+                ],
+                dtype=torch.float64,
+                device=self.device,
             )
+            torch.distributed.all_reduce(
+                totals,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+            (
+                total_nll_nats,
+                total_tokens_float,
+                total_correct_float,
+                total_bpb_nll_nats,
+                total_bpb_bytes_float,
+                total_batches_float,
+            ) = totals.tolist()
+            total_tokens = int(total_tokens_float)
+            total_correct = int(total_correct_float)
+            total_bpb_bytes = int(total_bpb_bytes_float)
+            total_batches = int(total_batches_float)
         else:
-            percentile_metrics = {"ce_p50": 0.0, "ce_p90": 0.0, "ce_p95": 0.0}
+            total_batches = batch_cnt
 
-        # （可选）计算空白提示困惑度（每 5 次验证计算一次，减少开销）
-        blank_ppl = None
-        if self.global_rank == 0 and (self.global_step // self.eval_interval) % 5 == 0:
+        if total_tokens <= 0:
+            raise RuntimeError(
+                "validation produced no supervised next-token positions"
+            )
+        avg_loss = total_nll_nats / total_tokens
+        avg_ppl = ValidationMetrics.compute_perplexity(avg_loss)
+        avg_accuracy = total_correct / total_tokens
+        val_bpb = ValidationMetrics.compute_bits_per_byte(
+            total_bpb_nll_nats,
+            total_bpb_bytes,
+        )
+
+        local_losses = (
+            torch.cat(all_token_losses)
+            if all_token_losses
+            else torch.empty(0, dtype=torch.float64)
+        )
+        if distributed:
+            gathered_losses = [
+                torch.empty(0, dtype=torch.float64)
+                for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather_object(
+                gathered_losses,
+                local_losses.cpu(),
+            )
+            local_losses = torch.cat(gathered_losses)
+        percentile_metrics = ValidationMetrics.compute_percentile_ce(
+            local_losses,
+            percentiles=[0.5, 0.9, 0.95],
+        )
+
+        empty_prefix_metrics = {
+            "empty_prefix_eos_ce": None,
+            "empty_prefix_eos_ppl": None,
+        }
+        if self.compute_empty_prefix_eos_ppl:
             raw_model = self.model.module if hasattr(self.model, 'module') else self.model
             assert isinstance(raw_model, nn.Module)
-            blank_ppl = ValidationMetrics.compute_blank_ppl(
-                raw_model, self.tokenizer, blank_text="", device=self.device
+            empty_prefix_metrics = (
+                ValidationMetrics.compute_empty_prefix_eos_metrics(
+                    raw_model,
+                    bos_token_id=self.bos_token_id,
+                    eos_token_id=self.eos_token_id,
+                    device=self.device,
+                )
             )
-            self.log_manager.logger.info(f"Step {self.global_step} - blank_ppl={blank_ppl:.2f}")
 
-        # 记录扩展指标到日志和 SwanLab
         if self.global_rank == 0:
             self.log_manager.set_step(self.global_step)
-            ppl = math.exp(avg_loss) if avg_loss < 100 else float("inf")
+            ppl_text = "N/A" if avg_ppl is None else f"{avg_ppl:.2f}"
+            bpb_text = "N/A" if val_bpb is None else f"{val_bpb:.4f}"
             log_msg = (
-                f"Step {self.global_step} - val/loss={avg_loss:.4f} | val/ppl={ppl:.2f} | "
-                f"val/acc={avg_accuracy:.4f} | val/ce_p50={percentile_metrics['ce_p50']:.4f} | "
+                f"Step {self.global_step} - val/loss={avg_loss:.4f} | "
+                f"val/ppl={ppl_text} | val/bpb={bpb_text} | "
+                f"val/acc={avg_accuracy:.4f} | val/tokens={total_tokens} | "
+                f"val/ce_p50={percentile_metrics['ce_p50']:.4f} | "
                 f"val/ce_p90={percentile_metrics['ce_p90']:.4f}"
             )
-            if blank_ppl is not None:
-                log_msg += f" | val/blank_ppl={blank_ppl:.2f}"
+            empty_prefix_ppl = empty_prefix_metrics[
+                "empty_prefix_eos_ppl"
+            ]
+            if empty_prefix_ppl is not None:
+                log_msg += f" | val/empty_prefix_eos_ppl={empty_prefix_ppl:.2f}"
             self.log_manager.logger.info(log_msg)
 
-            # 记录到 SwanLab
             if self.swanlab_logger:
                 val_metrics = {
                     "val/loss": avg_loss,
-                    "val/perplexity": ppl,
                     "val/accuracy": avg_accuracy,
+                    "val/tokens": total_tokens,
+                    "val/target_bytes": total_bpb_bytes,
+                    "val/batches": total_batches,
                     **{f"val/{k}": v for k, v in percentile_metrics.items()}
                 }
-                if blank_ppl is not None:
-                    val_metrics["val/blank_ppl"] = blank_ppl
+                if avg_ppl is not None:
+                    val_metrics["val/perplexity"] = avg_ppl
+                if val_bpb is not None:
+                    val_metrics["val/bpb"] = val_bpb
+                for name, value in empty_prefix_metrics.items():
+                    if value is not None:
+                        val_metrics[f"val/{name}"] = value
                 self.swanlab_logger.log_metrics(val_metrics, step=self.global_step)
 
         # 生成测试文本（与原有逻辑一致）
@@ -662,6 +821,9 @@ def main() -> None:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     # TF32加速
     torch.set_float32_matmul_precision('highest')
+    # 编译后端不可用（如 CPU 缺少 OpenCL 时首次编译抛 InductorError）时自动回退 eager，
+    # 避免训练进程在首次前向时中断
+    torch._dynamo.config.suppress_errors = True
 
     parser = argparse.ArgumentParser(description="TaiChu 预训练")
     parser.add_argument("--model_config", type=str, required=True, help="模型结构 YAML 配置")
@@ -685,8 +847,8 @@ def main() -> None:
     parser.add_argument("--eval_batch_size", type=int, default=None, help="覆盖验证阶段的批次大小（如 16）")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=None, help="覆盖梯度累积步数，用于模拟更大的全局批次（如 4）")
     parser.add_argument("--learning_rate", type=float, default=None, help="覆盖峰值学习率（如 3e-4）")
-    parser.add_argument("--warmup_ratio", type=float, default=None, help="覆盖预热步数占总训练步数的比例（如 0.01 表示 1%）")
-    parser.add_argument("--stable_ratio", type=float, default=None, help="覆盖 WSD 调度中恒定阶段占总步数的比例（如 0.8 表示 80%，推荐 0.7~0.8）")
+    parser.add_argument("--warmup_ratio", type=float, default=None, help="覆盖预热步数占总训练步数的比例（如 0.01 表示 1%%）")
+    parser.add_argument("--stable_ratio", type=float, default=None, help="覆盖 WSD 调度中恒定阶段占总步数的比例（如 0.8 表示 80%%，推荐 0.7~0.8）")
     parser.add_argument("--weight_decay", type=float, default=None, help="覆盖权重衰减系数（如 0.1）")
     parser.add_argument("--min_lr_ratio", type=float, default=None, help="覆盖最终学习率相对于峰值学习率的比例（WSD 衰减终点，推荐 0.0）")
     parser.add_argument("--decay_type", type=str, default=None, choices=["cosine", "linear"], help="覆盖 WSD 衰减阶段的曲线类型：cosine（余弦，推荐）或 linear（线性）")
@@ -696,6 +858,8 @@ def main() -> None:
     parser.add_argument("--save_interval", type=int, default=None, help="覆盖常规检查点保存间隔（步数）")
     parser.add_argument("--eval_interval", type=int, default=None, help="覆盖验证间隔（步数）")
     parser.add_argument("--log_interval", type=int, default=None, help="覆盖训练日志打印间隔（步数）")
+    parser.add_argument("--peak_flops", type=float, default=None,
+                        help="GPU 理论峰值算力（FLOPs/秒），用于 MFU 计算；默认按 GPU 型号自动识别")
 
     # 早停参数覆盖
     # ========== 早停参数覆盖 ==========
@@ -718,18 +882,26 @@ def main() -> None:
     if args.num_layers is not None:
         model_cfg.num_layers = args.num_layers
     if args.num_heads is not None:
-        model_cfg.num_heads = args.num_heads
+        model_cfg.num_attention_heads = args.num_heads
     if args.vocab_size is not None:
         model_cfg.vocab_size = args.vocab_size
     if args.max_seq_len is not None:
-        model_cfg.max_seq_len = args.max_seq_len
-        pretrain_cfg.data.max_seq_length = args.max_seq_len
+        model_cfg.max_position_embeddings = args.max_seq_len
+        pretrain_cfg.data = replace(
+            pretrain_cfg.data,
+            packing=replace(
+                pretrain_cfg.data.packing,
+                max_seq_length=args.max_seq_len,
+            ),
+        )
     if args.dropout is not None:
-        model_cfg.dropout = args.dropout
+        model_cfg.attention_dropout = args.dropout
+        model_cfg.hidden_dropout = args.dropout
+        model_cfg.embedding_dropout = args.dropout
     if args.num_experts is not None:
-        model_cfg.num_experts = args.num_experts
+        model_cfg.moe_num_experts = args.num_experts
     if args.top_k is not None:
-        model_cfg.top_k = args.top_k
+        model_cfg.moe_top_k = args.top_k
 
     # 覆盖训练超参数
     if args.target_tokens is not None:
@@ -779,15 +951,20 @@ def main() -> None:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = get_device(local_rank)
 
-    world_size = 1
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        torch.distributed.init_process_group(
-            backend="nccl", rank=local_rank, world_size=torch.cuda.device_count()
-        )
+    # 只有 torchrun/分布式启动器显式提供 WORLD_SIZE > 1 时才初始化进程组。
+    # 单进程脚本即使所在机器有多张 GPU，也不能自行假定其他 rank 存在。
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    global_rank = int(os.environ.get("RANK", local_rank if world_size > 1 else 0))
+    if world_size > 1:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend=backend,
+                rank=global_rank,
+                world_size=world_size,
+            )
         world_size = torch.distributed.get_world_size()
         global_rank = torch.distributed.get_rank()
-    else:
-        global_rank = 0
 
     # 4. 设置随机种子（不同进程不同，避免数据重复）
     base_seed = pretrain_cfg.training.seed
@@ -826,14 +1003,24 @@ def main() -> None:
     if is_main:
         log_manager.info(f"模型配置: {model_cfg.model_name}")
 
-    # 编译模型
-    model = torch.compile(model, dynamic=True, mode="reduce-overhead")
-    if is_main:
-        log_manager.info("已启用 torch.compile 动态编译优化（dynamic=True）")
+    if pretrain_cfg.training.compile_model:
+        # 后端不可用（如缺少 OpenCL 的 CPU 环境）时自动回退到 eager 运行
+        try:
+            model = torch.compile(model, dynamic=True, mode="reduce-overhead")
+            if is_main:
+                log_manager.info(
+                    "已启用 torch.compile 动态编译优化（后端不可用时首次前向自动回退 eager）"
+                )
+        except Exception:
+            if is_main:
+                log_manager.warning(
+                    "torch.compile 初始化失败，已回退到 eager 模式运行（不影响训练正确性）"
+                )
 
     # 封装 DDP
     if world_size > 1:
-        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+        ddp_kwargs = {"device_ids": [local_rank]} if torch.cuda.is_available() else {}
+        model = nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
 
     # 打印参数量（仅主进程）
     total_params = None
@@ -845,38 +1032,74 @@ def main() -> None:
         log_manager.info(f"模型大小: {ModelInspector.get_model_size_mb(model):.2f} MB")
 
     # 8. 加载 tokenizer
-    tokenizer = Tokenizer.from_file(pretrain_cfg.data.tokenizer_path)
+    tokenizer = Tokenizer.from_file(pretrain_cfg.tokenizer_path)
+    tokenizer_vocab_size = tokenizer.get_vocab_size()
+    if tokenizer_vocab_size > model_cfg.vocab_size:
+        raise ValueError(
+            f"Tokenizer 词表大小 {tokenizer_vocab_size} 超过模型 vocab_size "
+            f"{model_cfg.vocab_size}，会导致 Token Embedding 越界"
+        )
+    if tokenizer_vocab_size < model_cfg.vocab_size and is_main:
+        log_manager.warning(
+            f"Tokenizer 词表大小 {tokenizer_vocab_size} 小于模型 vocab_size "
+            f"{model_cfg.vocab_size}，尾部 Token 不会被训练"
+        )
 
-    # 9. 构建数据集
-    log_manager.info("构建数据集...")
-    pin_memory = torch.cuda.is_available()
-    train_loader = build_dataloader(
-        pretrain_cfg.data, tokenizer,
-        split="train",
-        batch_size=pretrain_cfg.training.batch_size,
-        rank=global_rank,
-        world_size=world_size,
-        pin_memory=pin_memory,
-    )
-    val_loader = build_dataloader(
-        pretrain_cfg.data, tokenizer,
-        split="val",
-        batch_size=pretrain_cfg.evaluating.batch_size,
-        rank=global_rank,
-        world_size=world_size,
-        pin_memory=pin_memory,
-    )
-
-    # 10. 优化器
-    optimizer = model.configure_optimizers(pretrain_cfg.optimizer)
-
-    # 11. 动态计算 max_steps（基于 target_tokens）
+    # 9. 动态计算 max_steps（基于 target_tokens）
     target_tokens = pretrain_cfg.training.target_tokens
     per_gpu_batch = pretrain_cfg.training.batch_size
     grad_accum = pretrain_cfg.training.gradient_accumulation_steps
     global_batch_size = per_gpu_batch * grad_accum * world_size
-    tokens_per_step = global_batch_size * pretrain_cfg.data.max_seq_length
+    tokens_per_step = global_batch_size * pretrain_cfg.data.packing.max_seq_length
     max_steps = math.ceil(target_tokens / tokens_per_step)
+
+    # 10. 构建统一数据管线
+    log_manager.info("构建数据集...")
+    pad_token_id = tokenizer.token_to_id(pretrain_cfg.data.pad_token)
+    if pad_token_id is None:
+        raise ValueError(
+            f"configured pad token {pretrain_cfg.data.pad_token!r} "
+            "does not exist in the tokenizer"
+        )
+    data_factory = TaiChuDataLoaderFactory(
+        pretrain_cfg.data,
+        pad_token_id=pad_token_id,
+    )
+    train_runtime = pretrain_cfg.training.dataloader
+    train_loader = data_factory.create(
+        split="train",
+        batch_size=pretrain_cfg.training.batch_size,
+        rank=global_rank,
+        world_size=world_size,
+        pin_memory=bool(train_runtime.pin_memory and torch.cuda.is_available()),
+        drop_last=train_runtime.drop_last,
+        persistent_workers=train_runtime.persistent_workers,
+    )
+    eval_runtime = pretrain_cfg.evaluating.dataloader
+    val_loader = (
+        data_factory.create(
+            split="validation",
+            batch_size=pretrain_cfg.evaluating.batch_size,
+            rank=global_rank,
+            world_size=world_size,
+            pin_memory=bool(eval_runtime.pin_memory and torch.cuda.is_available()),
+            drop_last=eval_runtime.drop_last,
+            persistent_workers=eval_runtime.persistent_workers,
+        )
+        if pretrain_cfg.data.storage.validation_path is not None
+        else None
+    )
+    if is_main:
+        log_manager.info(
+            "数据管线配置: "
+            + ", ".join(
+                f"{key}={value}"
+                for key, value in pretrain_cfg.data.to_dict().items()
+            )
+        )
+
+    # 11. 优化器
+    optimizer = model.configure_optimizers(pretrain_cfg.optimizer)
 
     warmup_ratio = pretrain_cfg.scheduler.warmup_ratio
     warmup_steps = max(1, int(max_steps * warmup_ratio))
@@ -954,7 +1177,8 @@ def main() -> None:
             "warmup_steps": warmup_steps,
             "max_steps": max_steps,
             "min_lr_ratio": pretrain_cfg.scheduler.min_lr_ratio,
-            "max_seq_length": pretrain_cfg.data.max_seq_length,
+            "max_seq_length": pretrain_cfg.data.packing.max_seq_length,
+            "data_pipeline": pretrain_cfg.data.to_dict(),
             "use_mixed_precision": use_amp,
             "dtype": pretrain_cfg.training.dtype,
             "seed": pretrain_cfg.training.seed,
@@ -981,6 +1205,7 @@ def main() -> None:
     resume_step = 0
     best_val_loss_restored = None
     checkpoint = None
+    data_state = None
     if args.resume:
         log_manager.info(f"从检查点恢复: {args.resume}")
         resume_step, best_val_loss_restored, checkpoint = checkpoint_manager.load(
@@ -992,7 +1217,17 @@ def main() -> None:
             map_location=str(device),
         )
         scheduler.last_epoch = resume_step - 1 if resume_step > 0 else -1
+        if checkpoint.get("data_state") is not None:
+            data_state = DataState.from_dict(checkpoint["data_state"])
         log_manager.info(f"恢复至全局步数: {resume_step}")
+
+    # 峰值算力：优先 --peak_flops，否则按 GPU 型号自动识别
+    peak_flops = args.peak_flops if args.peak_flops is not None else ModelInspector.get_peak_flops()
+    if is_main:
+        if peak_flops > 0:
+            log_manager.info(f"MFU 峰值算力: {peak_flops / 1e12:.0f} TFLOPS")
+        else:
+            log_manager.info("MFU 未启用：当前设备峰值算力未定义")
 
     # 17. 构建 Trainer 并开始训练
     trainer = TaiChuTrainer(
@@ -1022,10 +1257,18 @@ def main() -> None:
         use_amp=use_amp,
         dtype=pretrain_cfg.training.dtype,
         local_rank=local_rank,
-        max_seq_len=pretrain_cfg.data.max_seq_length,
+        max_seq_len=pretrain_cfg.data.packing.max_seq_length,
         global_rank=global_rank,
+        peak_flops=peak_flops,
         generation_prompts=pretrain_cfg.evaluating.prompts,
         num_generate_tokens=pretrain_cfg.evaluating.num_generate_tokens,
+        max_grad_norm=pretrain_cfg.training.max_grad_norm,
+        bos_token_id=tokenizer.token_to_id(pretrain_cfg.data.bos_token),
+        eos_token_id=tokenizer.token_to_id(pretrain_cfg.data.eos_token),
+        compute_empty_prefix_eos_ppl=(
+            pretrain_cfg.evaluating.empty_prefix_eos_ppl
+        ),
+        data_state=data_state,
     )
     if best_val_loss_restored is not None:
         trainer.best_val_loss = best_val_loss_restored

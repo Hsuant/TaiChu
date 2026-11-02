@@ -13,6 +13,31 @@ from typing import Optional, Dict, Any, Tuple
 from torch.optim.lr_scheduler import LRScheduler
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """移除 DDP 与 torch.compile 包装，返回实际模型。"""
+    while True:
+        if hasattr(model, "module"):
+            model = model.module
+        elif hasattr(model, "_orig_mod"):
+            model = model._orig_mod
+        else:
+            return model
+
+
+def strip_checkpoint_prefixes(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """去除 ``module.`` 与 ``_orig_mod.`` 包装前缀，兼容新旧检查点。"""
+    prefixes = ("module.", "_orig_mod.")
+    normalized = {}
+    for key, value in state_dict.items():
+        while key.startswith(prefixes):
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix):]
+                    break
+        normalized[key] = value
+    return normalized
+
+
 class CheckpointManager:
     """检查点管理器。
 
@@ -75,10 +100,14 @@ class CheckpointManager:
         Returns:
             检查点状态字典。
         """
+        raw_model = unwrap_model(model)
         state = {
             "global_step": global_step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": raw_model.state_dict(),
         }
+        model_config = getattr(raw_model, "config", None)
+        if model_config is not None and hasattr(model_config, "to_dict"):
+            state["model_config"] = model_config.to_dict()
         if optimizer is not None:
             state["optimizer_state_dict"] = optimizer.state_dict()
         if scheduler is not None:
@@ -217,7 +246,8 @@ class CheckpointManager:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"检查点文件不存在: {filepath}")
         checkpoint = torch.load(filepath, map_location=map_location)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model_state_dict = strip_checkpoint_prefixes(checkpoint["model_state_dict"])
+        unwrap_model(model).load_state_dict(model_state_dict)
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if scheduler is not None and "scheduler_state_dict" in checkpoint:
