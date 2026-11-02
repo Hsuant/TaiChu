@@ -1,0 +1,32 @@
+data:
+  schema_version: 1
+  task_type: pretraining
+  dataset_id: taichu-pretraining-v1
+
+  storage:
+    format: binary_mmap
+    train_path: ./data/unified/pretraining/train
+    validation_path: ./data/unified/pretraining/validation
+    verify_checksums: false
+    num_workers: 4
+    prefetch_factor: 2
+
+  sampling:
+    strategy: distributed
+    shuffle: true
+    seed: 42
+    drop_last: true
+    pad_to_world_size: true
+
+  packing:
+    enabled: true
+    strategy: stream
+    max_seq_length: 2048
+    pad_to_multiple_of: 8
+    drop_last_remainder: false
+
+  batching:
+    strategy: fixed_length
+    micro_batch_size: 2
+    pad_to_multiple_of: 8
+    padding_free: false

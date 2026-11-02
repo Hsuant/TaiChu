@@ -1,0 +1,25 @@
+data:
+  schema_version: 1
+  task_type: reward
+  dataset_id: taichu-reward-v1
+
+  storage:
+    format: binary_mmap
+    train_path: ./data/unified/reward/train
+    validation_path: ./data/unified/reward/validation
+    num_workers: 2
+
+  sampling:
+    strategy: distributed
+    shuffle: true
+    seed: 42
+
+  packing:
+    enabled: false
+    strategy: none
+    max_seq_length: 4096
+
+  batching:
+    strategy: reward_pair
+    micro_batch_size: 4
+    pad_to_multiple_of: 8

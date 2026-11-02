@@ -1,0 +1,29 @@
+data:
+  schema_version: 1
+  task_type: sft
+  dataset_id: taichu-sft-v1
+
+  storage:
+    format: binary_mmap
+    train_path: ./data/unified/sft/train
+    validation_path: ./data/unified/sft/validation
+    num_workers: 4
+    prefetch_factor: 2
+
+  sampling:
+    strategy: distributed
+    shuffle: true
+    seed: 42
+    drop_last: true
+
+  packing:
+    enabled: true
+    strategy: sample_isolated
+    max_seq_length: 4096
+    pad_to_multiple_of: 8
+
+  batching:
+    strategy: padding_free
+    micro_batch_size: 2
+    pad_to_multiple_of: 8
+    padding_free: true

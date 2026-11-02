@@ -1,0 +1,26 @@
+data:
+  schema_version: 1
+  task_type: ppo
+  dataset_id: taichu-online-rollouts-v1
+
+  storage:
+    format: binary_mmap
+    train_path: ./data/unified/trajectory/train
+    validation_path: ./data/unified/trajectory/validation
+    num_workers: 0
+
+  sampling:
+    strategy: distributed
+    shuffle: false
+    seed: 42
+    drop_last: false
+
+  packing:
+    enabled: false
+    strategy: none
+    max_seq_length: 4096
+
+  batching:
+    strategy: trajectory
+    micro_batch_size: 2
+    pad_to_multiple_of: 8

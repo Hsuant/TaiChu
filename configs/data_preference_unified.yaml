@@ -1,0 +1,27 @@
+data:
+  schema_version: 1
+  task_type: preference
+  dataset_id: taichu-preference-v1
+
+  storage:
+    format: binary_mmap
+    train_path: ./data/unified/preference/train
+    validation_path: ./data/unified/preference/validation
+    num_workers: 2
+    prefetch_factor: 2
+
+  sampling:
+    strategy: pair_aware
+    shuffle: true
+    seed: 42
+    drop_last: false
+
+  packing:
+    enabled: false
+    strategy: none
+    max_seq_length: 4096
+
+  batching:
+    strategy: preference_pair
+    micro_batch_size: 1
+    pad_to_multiple_of: 8
