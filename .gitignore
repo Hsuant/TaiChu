@@ -1,5 +1,11 @@
 pytest_cache/
 .pytest_cache/
 __pycache__/
+experiments/
 /swanlogs/
-/experiments/
+/data/raw/
+/data/packed/
+/data/processed/
+/data/unified/
+/tests/test_train/unified/
+/reports/
