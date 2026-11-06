@@ -11,6 +11,7 @@
 import math
 import time
 from dataclasses import dataclass
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -172,6 +173,37 @@ class GradientNoiseScale:
 
         return self.current_gns
 
+    def update_from_norm(self, grad_norm: torch.Tensor | float) -> float:
+        """Update the variance-ratio diagnostic from an already computed norm."""
+        if isinstance(grad_norm, torch.Tensor):
+            grad_norm_sq = float((grad_norm.detach().float().square()).item())
+        else:
+            grad_norm_sq = float(grad_norm) ** 2
+
+        self.grad_norms.append(grad_norm_sq)
+        if len(self.grad_norms) > self.window_size:
+            self.grad_norms.pop(0)
+
+        if self.ema_mean is None:
+            self.ema_mean = grad_norm_sq
+            self.ema_var = 0.0
+        else:
+            old_mean = self.ema_mean
+            old_var = self.ema_var
+            new_mean = self.ema_beta * old_mean + (1 - self.ema_beta) * grad_norm_sq
+            new_e2 = (
+                self.ema_beta * (old_var + old_mean ** 2)
+                + (1 - self.ema_beta) * grad_norm_sq ** 2
+            )
+            self.ema_mean = new_mean
+            self.ema_var = max(new_e2 - new_mean ** 2, 1e-12)
+
+        self.current_gns = min(
+            grad_norm_sq / (self.ema_var + 1e-8),
+            1e6,
+        )
+        return self.current_gns
+
     def get_metrics(self) -> Dict[str, float]:
         """获取梯度范数方差比及相关统计信息。
 
@@ -327,6 +359,7 @@ class ModelFlopsUtilization:
             import os
             os.makedirs(os.path.dirname(self.log_file) or '.', exist_ok=True)
         self.last_mfu_instant: float = 0.0
+        self._parameter_count: Optional[int] = None
 
     def start(self) -> None:
         """开始计时（在训练循环开始前调用）。"""
@@ -428,8 +461,9 @@ class ModelFlopsUtilization:
 
         if token_count <= 0:
             return 0.0
-        total_params = sum(p.numel() for p in model.parameters())
-        return 6 * total_params * token_count
+        if self._parameter_count is None:
+            self._parameter_count = sum(p.numel() for p in model.parameters())
+        return 6 * self._parameter_count * token_count
 
     def _log_to_file(self, step: int, metrics: Dict[str, float]) -> None:
         """将 MFU 指标写入日志文件（JSON Lines 格式）。"""
@@ -473,13 +507,6 @@ class RepresentationStability:
         self.hook_layer = hook_layer
         self.hook_handle: Optional[RemovableHandle] = None
         self.saved_embeddings: Optional[torch.Tensor] = None
-        self._register_hook()
-
-    def _register_hook(self) -> None:
-        """在最终归一化层注册前向钩子，捕获其输出的隐藏状态张量。"""
-        norm = getattr(self.model, "final_norm", None)
-        target = norm if norm is not None else self.model
-        self.hook_handle = target.register_forward_hook(self._capture_embedding)
 
     def _capture_embedding(self, module: nn.Module, input: Tuple[torch.Tensor, ...],
                            output: torch.Tensor) -> None:
@@ -493,7 +520,7 @@ class RepresentationStability:
         if isinstance(output, tuple):
             output = output[0]
         if isinstance(output, torch.Tensor):
-            self.saved_embeddings = output.detach().clone()
+            self.saved_embeddings = output[:1].detach().clone()
 
     def update(self, input_ids: torch.Tensor) -> Dict[str, float]:
         """对给定输入进行一次前向传播并计算表示稳定性指标。
@@ -510,8 +537,15 @@ class RepresentationStability:
                 - isotropy_score: 各向同性分数（协方差矩阵最小/最大特征值比）
         """
         metrics = {}
-        with torch.no_grad():
-            _ = self.model(input_ids.to(self.device))
+        target = getattr(self.model, "final_norm", None)
+        if target is None:
+            target = self.model
+        handle = target.register_forward_hook(self._capture_embedding)
+        try:
+            with torch.no_grad():
+                _ = self.model(input_ids[:1].to(self.device))
+        finally:
+            handle.remove()
         if self.saved_embeddings is not None:
             current_emb = self.saved_embeddings
             metrics["embedding_norm"] = current_emb.norm().item() / current_emb.numel() ** 0.5
@@ -543,7 +577,8 @@ class RepresentationStability:
         return metrics
 
     def close(self) -> None:
-        """移除钩子，释放资源。"""
+        """Release captured activations."""
+        self.saved_embeddings = None
         if self.hook_handle is not None:
             self.hook_handle.remove()
             self.hook_handle = None
@@ -564,6 +599,7 @@ class TokenStatistics:
     token_losses: torch.Tensor
     bpb_nll_nats: float
     bpb_bytes: int
+    max_token_loss: float = 0.0
 
 
 class ValidationMetrics:
@@ -645,14 +681,35 @@ class ValidationMetrics:
         losses = losses_per_token.detach().reshape(-1)
         if not torch.isfinite(losses).all():
             raise ValueError("per-token losses must be finite")
-        quantiles = torch.quantile(
-            losses.to(dtype=torch.float64),
-            torch.tensor(percentiles, dtype=torch.float64),
+        # torch.quantile rejects inputs above 2**24 elements. Partitioning
+        # avoids that limit and needs only one float32-sized scratch buffer.
+        values = losses.detach().to(device="cpu").numpy()
+        last_index = values.size - 1
+        required_indices = sorted(
+            {
+                index
+                for percentile in percentiles
+                for index in (
+                    math.floor(percentile * last_index),
+                    math.ceil(percentile * last_index),
+                )
+            }
         )
-        return {
-            f"ce_p{int(p * 100)}": float(value.item())
-            for p, value in zip(percentiles, quantiles)
-        }
+        partitioned = np.partition(values, required_indices)
+        result: Dict[str, Optional[float]] = {}
+        for percentile in percentiles:
+            position = percentile * last_index
+            lower_index = math.floor(position)
+            upper_index = math.ceil(position)
+            lower = float(partitioned[lower_index])
+            if lower_index == upper_index:
+                value = lower
+            else:
+                upper = float(partitioned[upper_index])
+                fraction = position - lower_index
+                value = lower + (upper - lower) * fraction
+            result[f"ce_p{int(percentile * 100)}"] = value
+        return result
 
     @staticmethod
     def compute_perplexity(loss: Optional[float]) -> Optional[float]:
@@ -712,6 +769,9 @@ class ValidationMetrics:
         logits: torch.Tensor,
         labels: torch.Tensor,
         tokenizer=None,
+        *,
+        loss_chunk_size: int = 256,
+        return_token_losses: bool = True,
     ) -> TokenStatistics:
         """Compute all core token-level metrics with one shift definition."""
 
@@ -723,21 +783,11 @@ class ValidationMetrics:
             empty = torch.empty(0, dtype=torch.float64)
             return TokenStatistics(0.0, 0, 0, empty, 0.0, 0)
 
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
         vocab_size = shift_logits.size(-1)
-        token_losses = F.cross_entropy(
-            shift_logits.reshape(-1, vocab_size).float(),
-            shift_labels.reshape(-1),
-            ignore_index=-100,
-            reduction="none",
-        ).reshape(shift_labels.shape)
         valid_mask = shift_labels != -100
-        selected_losses = token_losses[valid_mask]
-        if not torch.isfinite(selected_losses).all():
-            raise ValueError("token losses must be finite")
-
-        token_count = int(selected_losses.numel())
+        token_count = int(valid_mask.sum().item())
         if token_count == 0:
             return TokenStatistics(
                 nll_nats=0.0,
@@ -748,60 +798,182 @@ class ValidationMetrics:
                 bpb_bytes=0,
             )
 
-        predictions = torch.argmax(shift_logits, dim=-1)
-        correct_count = int(
-            ((predictions == shift_labels) & valid_mask).sum().item()
+        if loss_chunk_size <= 0:
+            raise ValueError("loss_chunk_size must be positive")
+        nll_nats_tensor = torch.zeros(
+            (),
+            dtype=torch.float32,
+            device=logits.device,
         )
-        selected_losses_cpu = selected_losses.detach().to(
-            device="cpu",
+        correct_count_tensor = torch.zeros(
+            (),
+            dtype=torch.int64,
+            device=logits.device,
+        )
+        row_nll = torch.zeros(
+            shift_labels.size(0),
             dtype=torch.float64,
+            device=logits.device,
         )
-        bpb_nll_nats = 0.0
-        bpb_bytes = 0
+        row_content_nll = torch.zeros_like(row_nll)
+        selected_losses_chunks: List[torch.Tensor] = []
         special_ids = ValidationMetrics._special_token_ids(tokenizer)
+        special_tensor = None
         if special_ids and tokenizer is not None:
             special_tensor = torch.tensor(
                 sorted(special_ids),
                 dtype=shift_labels.dtype,
                 device=shift_labels.device,
             )
-            for row_index in range(shift_labels.size(0)):
-                row_mask = valid_mask[row_index]
-                row_targets = shift_labels[row_index][row_mask]
-                if row_targets.numel() == 0:
-                    continue
-                content_mask = ~torch.isin(row_targets, special_tensor)
-                if not content_mask.any():
-                    continue
-                content_ids = row_targets[content_mask].tolist()
-                decoded = tokenizer.decode(
-                    content_ids,
-                    skip_special_tokens=True,
+
+        for start in range(0, shift_labels.size(1), loss_chunk_size):
+            end = min(start + loss_chunk_size, shift_labels.size(1))
+            chunk_logits = shift_logits[:, start:end, :]
+            chunk_labels = shift_labels[:, start:end]
+            chunk_valid = valid_mask[:, start:end]
+            token_losses = F.cross_entropy(
+                chunk_logits.reshape(-1, vocab_size).float(),
+                chunk_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).reshape(chunk_labels.shape)
+            selected = token_losses[chunk_valid]
+            if selected.numel() == 0:
+                continue
+            if not torch.isfinite(selected).all():
+                raise ValueError("token losses must be finite")
+            predictions = torch.argmax(chunk_logits, dim=-1)
+            correct_count_tensor += (
+                (predictions == chunk_labels) & chunk_valid
+            ).sum()
+            nll_nats_tensor += selected.sum()
+            row_nll += token_losses.double().sum(dim=1)
+            if special_tensor is not None:
+                content_valid = chunk_valid & ~torch.isin(
+                    chunk_labels,
+                    special_tensor,
                 )
-                bpb_bytes += len(decoded.encode("utf-8"))
-                bpb_nll_nats += token_losses[row_index][row_mask][
-                    content_mask
-                ].sum().item()
-        elif tokenizer is not None:
+                row_content_nll += token_losses.masked_fill(
+                    ~content_valid,
+                    0.0,
+                ).double().sum(dim=1)
+            if return_token_losses:
+                selected_losses_chunks.append(
+                    selected.detach().to(device="cpu", dtype=torch.float64)
+                )
+
+        nll_nats = float(nll_nats_tensor.item())
+        correct_count = int(correct_count_tensor.item())
+        bpb_nll_nats = 0.0
+        bpb_bytes = 0
+        if tokenizer is not None:
+            row_values = (
+                row_content_nll if special_tensor is not None else row_nll
+            ).tolist()
             for row_index in range(shift_labels.size(0)):
                 row_mask = valid_mask[row_index]
                 row_targets = shift_labels[row_index][row_mask]
                 if row_targets.numel() == 0:
                     continue
+                if special_tensor is not None:
+                    content_mask = ~torch.isin(row_targets, special_tensor)
+                    row_targets = row_targets[content_mask]
+                    if row_targets.numel() == 0:
+                        continue
                 decoded = tokenizer.decode(
                     row_targets.tolist(),
                     skip_special_tokens=True,
                 )
                 bpb_bytes += len(decoded.encode("utf-8"))
-                bpb_nll_nats += token_losses[row_index][row_mask].sum().item()
+                bpb_nll_nats += row_values[row_index]
+
+        selected_losses_cpu = (
+            torch.cat(selected_losses_chunks)
+            if selected_losses_chunks
+            else torch.empty(0, dtype=torch.float64)
+        )
 
         return TokenStatistics(
-            nll_nats=float(selected_losses.sum().item()),
+            nll_nats=nll_nats,
             token_count=token_count,
             correct_count=correct_count,
             token_losses=selected_losses_cpu,
             bpb_nll_nats=float(bpb_nll_nats),
             bpb_bytes=bpb_bytes,
+            max_token_loss=float(selected.max().item()),
+        )
+
+    @staticmethod
+    def compute_token_statistics_from_losses(
+        token_losses: torch.Tensor,
+        labels: torch.Tensor,
+        *,
+        correct_count: int,
+        tokenizer=None,
+    ) -> TokenStatistics:
+        """Build validation statistics from precomputed supervised-token CE."""
+        if labels.dim() != 2 or labels.size(1) < 2:
+            raise ValueError("labels must be a rank-2 sequence with length >= 2")
+        shift_labels = labels[..., 1:]
+        valid_mask = shift_labels != -100
+        selected = token_losses.detach().reshape(-1)
+        token_count = int(valid_mask.sum().item())
+        if selected.numel() != token_count:
+            raise ValueError(
+                "token_losses length must equal the number of valid targets"
+            )
+        if token_count == 0:
+            return TokenStatistics(
+                nll_nats=0.0,
+                token_count=0,
+                correct_count=0,
+                token_losses=torch.empty(0, dtype=torch.float64),
+                bpb_nll_nats=0.0,
+                bpb_bytes=0,
+            )
+        if not torch.isfinite(selected).all():
+            raise ValueError("token losses must be finite")
+
+        loss_matrix = selected.new_zeros(shift_labels.shape)
+        loss_matrix[valid_mask] = selected
+        bpb_nll_nats = 0.0
+        bpb_bytes = 0
+        if tokenizer is not None:
+            special_ids = ValidationMetrics._special_token_ids(tokenizer)
+            special_tensor = None
+            if special_ids:
+                special_tensor = torch.tensor(
+                    sorted(special_ids),
+                    dtype=shift_labels.dtype,
+                    device=shift_labels.device,
+                )
+            for row_index in range(shift_labels.size(0)):
+                row_mask = valid_mask[row_index]
+                row_targets = shift_labels[row_index][row_mask]
+                if row_targets.numel() == 0:
+                    continue
+                row_losses = loss_matrix[row_index][row_mask]
+                if special_tensor is not None:
+                    content_mask = ~torch.isin(row_targets, special_tensor)
+                    row_targets = row_targets[content_mask]
+                    row_losses = row_losses[content_mask]
+                    if row_targets.numel() == 0:
+                        continue
+                decoded = tokenizer.decode(
+                    row_targets.tolist(),
+                    skip_special_tokens=True,
+                )
+                bpb_bytes += len(decoded.encode("utf-8"))
+                bpb_nll_nats += float(row_losses.double().sum().item())
+
+        return TokenStatistics(
+            nll_nats=float(selected.sum().item()),
+            token_count=token_count,
+            correct_count=int(correct_count),
+            token_losses=selected.to(device="cpu", dtype=torch.float32),
+            bpb_nll_nats=bpb_nll_nats,
+            bpb_bytes=bpb_bytes,
+            max_token_loss=float(selected.max().item()),
         )
 
     @staticmethod
@@ -986,6 +1158,10 @@ class EvaluationMetricsManager:
             当前 GNS 值。
         """
         return self.gns.update(model)
+
+    def update_gradient_norm(self, grad_norm: torch.Tensor | float) -> float:
+        """Update gradient diagnostics without rescanning every parameter."""
+        return self.gns.update_from_norm(grad_norm)
 
     def update_step(self, step_flops: float, step: int) -> Dict[str, float]:
         """更新 MFU 指标。

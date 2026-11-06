@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -116,10 +117,14 @@ class TestValidationMetricFormulas(unittest.TestCase):
 
     def test_exact_percentiles_use_linear_quantiles(self):
         losses = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        result = ValidationMetrics.compute_percentile_ce(
-            losses,
-            [0.5, 0.9, 0.95],
-        )
+        with patch(
+            "utils.metrics.torch.quantile",
+            side_effect=RuntimeError("quantile() input tensor is too large"),
+        ):
+            result = ValidationMetrics.compute_percentile_ce(
+                losses,
+                [0.5, 0.9, 0.95],
+            )
         self.assertAlmostEqual(result["ce_p50"], 2.5)
         self.assertAlmostEqual(result["ce_p90"], 3.7)
         self.assertAlmostEqual(result["ce_p95"], 3.85)
@@ -306,7 +311,11 @@ class TestMoEAuxiliaryLossFormula(unittest.TestCase):
             ]
         )
         topk_indices = torch.topk(logits, k=2, dim=-1).indices
-        actual = moe._compute_auxiliary_loss(logits, topk_indices)
+        components = moe._compute_auxiliary_loss_components(
+            logits,
+            topk_indices,
+        )
+        actual = sum(components.values())
 
         probs = torch.softmax(logits, dim=-1)
         density = torch.zeros(3)

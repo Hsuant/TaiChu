@@ -20,11 +20,11 @@ labels，并在 padding 位置写入 `-100`。
 | `val_perplexity` | `loss >= 100` 时人为返回 `inf` | 非有限或溢出时返回 `None` |
 | `val_bpb` | 缺失 | 新增，排除特殊 Token 后按 UTF-8 字节计算 |
 | `val_accuracy` | 无有效 Token 时返回 `0.0` | 无定义时返回 `None` |
-| CE 分位数 | 空集返回 `0.0`，训练器使用固定范围近似 | 使用精确线性分位数 |
+| CE 分位数 | 空集返回 `0.0`，全量 gather 占用随验证集增长 | 保留逐 Token loss，使用精确线性分位数 |
 | 空白提示 PPL | 空序列返回 `inf`，单 Token 会异常 | 改为可选显式 BOS → EOS，无定义时 `None` |
 | CPU DDP 聚合 | 不执行 all-reduce | Gloo/NCCL 均聚合 |
-| 分布式分位数 | 固定 0 到 20 的直方图 | 汇总本地逐 Token 损失后精确计算 |
-| 训练吞吐 | 使用最大序列长度估算 | 使用实际 padded Token 数 |
+| 分布式分位数 | 各 rank 都保存全量 gather 结果 | 逐 Token 损失只 gather 到 rank 0 后精确计算 |
+| 训练吞吐 | 使用最大序列长度估算 | 使用全局有效监督 Token 数 |
 | MFU | CPU 环境使用虚构的 330 TFLOPS | 峰值未定义时禁用并显示 `N/A` |
 | 梯度指标 | 标为 Gradient Noise Scale，但公式不是标准 GNS | 改名为梯度范数平方/方差比 |
 
@@ -109,8 +109,9 @@ z_loss = mean(logsumexp(router_logits, dim=experts)^2)
 ## 6. 局限
 
 - 当前环境为 CPU，未验证 CUDA AMP、GPU FlashAttention 和多卡 NCCL。
-- 训练期间分布式分位数使用 `all_gather_object` 汇总逐 Token 损失；结果精确，
-  但验证集极大时会增加 CPU 内存和通信开销。
+- 训练期间分位数保留全部逐 Token loss，并在 rank 0 上使用线性插值精确计算；
+  rank 0 的 CPU 内存会随验证 token 数线性增长，这是换取准确性的显式代价。
+- `val_ce_max_exact` 逐批精确计算并经分布式 MAX 聚合，用于发现异常长尾。
 - MFU 使用 `6 × 参数量 × 实际 padded Token 数` 的近似公式，不包含注意力
   通信和所有算子开销，应视为估算值。
 - `GradientNoiseScale` 类名为兼容保留；当前日志已改名为
