@@ -375,28 +375,7 @@ class TaiChuCausalSelfAttention(nn.Module):
         # 若需要缓存，则保存当前拼接后的 K,V 用于后续步骤
         present_key_value = (k, v) if use_cache else None
 
-        # ========== 6. GQA 扩展：将 K,V 扩展至与 Q 相同头数 ==========
-        if self.num_key_value_groups > 1:
-            # ================================================================
-            #  GQA (分组查询注意力) 扩展：将键（K）和值（V）从较少的头数
-            #  复制到与查询（Q）相同的头数，以便进行多头注意力计算。
-            #
-            #  输入形状：
-            #    k, v: (batch_size, num_key_value_heads, total_len, head_dim)
-            #  输出形状：
-            #    k, v: (batch_size, num_attention_heads, total_len, head_dim)
-            #
-            #  实现方式：
-            #    repeat_interleave(dim=1, repeats=num_key_value_groups)
-            #    - dim=1 表示在“头维度”上复制每个 kv 头。
-            #    - 例如 num_kv_heads=2, num_q_heads=8 → groups=4，
-            #      则第 0 个 kv 头复制 4 次，第 1 个 kv 头复制 4 次，
-            #      最终得到 8 个头的 k/v。
-            # ================================================================
-            k = k.repeat_interleave(self.num_key_value_groups, dim=1)  # 显式复制，无隐式拷贝
-            v = v.repeat_interleave(self.num_key_value_groups, dim=1)
-
-        # ========== 7. 注意力计算 ==========
+        # ========== 6. 注意力计算 ==========
         # 训练时使用设定的 dropout 概率，推理时 dropout 为 0
         dropout_p = self.attn_dropout.p if self.training else 0.0
         total_len = k.size(2)
@@ -446,9 +425,10 @@ class TaiChuCausalSelfAttention(nn.Module):
                 attn_mask=mask.attn_mask,
                 dropout_p=dropout_p,
                 is_causal=mask.is_causal,
+                enable_gqa=self.num_key_value_groups > 1,
             )
 
-        # ========== 8. 重塑输出 ==========
+        # ========== 7. 重塑输出 ==========
         # attn_output 形状为 (batch, num_attention_heads, seq_len_q, head_dim)
         # 转换为 (batch, seq_len_q, hidden_size)
         attn_output = (

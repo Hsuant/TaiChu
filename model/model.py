@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,18 +18,34 @@ from model.transformer_block import TaiChuBlock
 from model.output_head import TaiChuOutputHead
 
 
+KVCache = List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
+
+
 @dataclass
 class CausalLMOutput:
-    """统一的前向传播返回值。
+    """TaiChu causal language model unified forward output.
 
     Attributes:
-        logits: 语言模型输出，形状 (batch, seq_len, vocab_size)
-        loss: 交叉熵损失（含 MoE 辅助损失），训练时有效，否则为 None
-        past_key_values: 各层的 KV 缓存，仅 use_cache=True 时返回，否则为 None
+        logits: Language modeling logits with shape
+            ``(batch, output_seq_len, vocab_size)``. ``None`` when not requested.
+        loss: Final optimization objective, including CE and auxiliary losses.
+        loss_sum: Sum of valid next-token CE. Never includes auxiliary losses.
+        num_loss_tokens: Number of valid next-token targets.
+        token_losses: Detached per-token CE in flattened valid-token layout.
+        correct_predictions: Number of correct valid next-token predictions.
+        aux_loss: Combined auxiliary optimization loss, excluding CE.
+        loss_components: Named primary and auxiliary loss components.
+        past_key_values: Updated autoregressive cache, or ``None`` when disabled.
     """
-    logits: torch.Tensor
+    logits: Optional[torch.Tensor] = None
     loss: Optional[torch.Tensor] = None
-    past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None
+    loss_sum: Optional[torch.Tensor] = None
+    num_loss_tokens: Optional[torch.Tensor] = None
+    token_losses: Optional[torch.Tensor] = None
+    correct_predictions: Optional[torch.Tensor] = None
+    aux_loss: Optional[torch.Tensor] = None
+    loss_components: Optional[Dict[str, torch.Tensor]] = None
+    past_key_values: Optional[Any] = None
 
 class TaiChuModel(nn.Module):
     """TaiChu 语言模型。
@@ -112,16 +128,22 @@ class TaiChuModel(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        past_key_values: Optional[KVCache] = None,
         use_cache: bool = False,
-    ) ->  CausalLMOutput:
+        *,
+        return_logits: bool = True,
+        validate_inputs: bool = True,
+        return_token_statistics: bool = False,
+    ) -> CausalLMOutput:
         """统一的前向传播入口，支持训练与 KV 缓存推理。
 
         根据 past_key_values 是否为 None 自动切换模式：
-        - 训练 / 完整序列推理：past_key_values=None，可提供 labels 计算损失，
-          返回 (logits, loss) 或 (logits,)。
-        - KV 缓存增量推理：past_key_values 不为 None，通常输入单个 token，
-          返回 (logits, new_past_key_values)，无 loss。
+        - 训练 / 完整序列推理：past_key_values=None，可提供 labels 计算损失。
+        - KV 缓存增量推理：past_key_values 为完整的逐层 Cache，通常输入单个
+          token，返回新的 Cache，且不计算 loss。
+
+        ``past_key_values=None`` 表示没有缓存对象；长度与层数一致且全为
+        ``None`` 的列表表示空 Cache。空列表不是合法的 Cache 对象。
 
         Args:
             input_ids: token ID 序列，训练/完整序列时形状 (batch, seq_len)，
@@ -132,22 +154,31 @@ class TaiChuModel(nn.Module):
             past_key_values: 各层上一时刻的 KV 缓存，列表长度 = num_layers，
                              每个元素为 (k, v) 元组或 None。
             use_cache: 是否返回新的 KV 缓存（增量推理时通常为 True）。
+            return_logits: 是否向调用方返回完整 logits。提供 labels 时即使设为
+                False，内部仍会计算完整 logits 用于损失计算。
+            validate_inputs: 是否执行需要设备同步的标签范围与 padding 校验。
+                可信数据管线可在热路径关闭；默认保持完整校验。
+            return_token_statistics: 是否返回逐 token CE 与 argmax 正确数。
 
         Returns:
-            根据调用模式返回不同元组：
-            - 训练/完整序列： (logits, loss) 或 (logits, None)
-            - 缓存推理： (logits, new_past_key_values)
+            所有模式均返回 :class:`CausalLMOutput`。未计算或未请求的统计字段为
+            ``None``；训练时 ``loss_sum`` 仅包含 Token CE，``aux_loss``
+            独立保存辅助优化目标。
         """
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError("input_ids 必须为 torch.Tensor")
         if input_ids.dim() != 2:
             raise ValueError(f"input_ids 必须为二维张量，当前形状为 {tuple(input_ids.shape)}")
         batch_size, cur_len = input_ids.shape
-        if cur_len == 0:
-            raise ValueError("input_ids 的序列长度不能为 0")
+        if batch_size == 0 or cur_len == 0:
+            raise ValueError("input_ids 的 batch 和序列长度必须非空")
         if past_key_values is not None and len(past_key_values) != len(self.layers):
             raise ValueError(
                 f"past_key_values 长度应为 {len(self.layers)}，"
                 f"当前为 {len(past_key_values)}"
             )
+        if labels is not None and not isinstance(labels, torch.Tensor):
+            raise TypeError("labels 必须为 torch.Tensor 或 None")
         if labels is not None and labels.shape != input_ids.shape:
             raise ValueError(
                 f"labels 形状 {tuple(labels.shape)} 必须与 input_ids 形状 "
@@ -158,17 +189,9 @@ class TaiChuModel(nn.Module):
                 raise ValueError("labels 必须使用 torch.long")
             if labels.device != input_ids.device:
                 raise ValueError("labels 与 input_ids 必须位于同一设备")
-            if cur_len < 2:
-                raise ValueError("训练损失至少需要两个 Token 才能构造 next-token 目标")
-            if not (labels[..., 1:] != -100).any():
-                raise ValueError("batch 中没有任何可监督的 next-token 标签")
-            valid_label_mask = labels != -100
-            if valid_label_mask.any() and (
-                (labels[valid_label_mask] < 0)
-                | (labels[valid_label_mask] >= self.config.vocab_size)
-            ).any():
-                raise ValueError("labels 中的有效 Token ID 超出词表范围")
         if attention_mask is not None:
+            if not isinstance(attention_mask, torch.Tensor):
+                raise TypeError("attention_mask 必须为 torch.Tensor 或 None")
             if attention_mask.dim() != 2:
                 raise ValueError(
                     "attention_mask 仅支持二维 Padding Mask，"
@@ -176,46 +199,107 @@ class TaiChuModel(nn.Module):
                 )
             if attention_mask.size(0) != batch_size:
                 raise ValueError("attention_mask 的 batch 维度与 input_ids 不一致")
+
+        # ========== 1. 计算位置信息与总序列长度 ==========
+        caches = list(past_key_values) if past_key_values is not None else []
+        populated_caches = [cache is not None for cache in caches]
+        if any(populated_caches) and not all(populated_caches):
+            raise ValueError("past_key_values 中的缓存必须全部存在或全部为 None")
+
+        if any(populated_caches):
+            first_cache = next(cache for cache in caches if cache is not None)
+            if (
+                not isinstance(first_cache, (tuple, list))
+                or len(first_cache) != 2
+                or not all(isinstance(tensor, torch.Tensor) for tensor in first_cache)
+            ):
+                raise ValueError("KV cache 的每一层必须为 (k, v) Tensor 元组")
+
+            cache_k, cache_v = first_cache
+            if cache_k.dim() != 4 or cache_v.dim() != 4:
+                raise ValueError("KV cache 的 K/V 必须为四维张量")
+            if cache_k.shape != cache_v.shape:
+                raise ValueError("KV cache 的 K/V 形状必须一致")
+
+            expected_head_dim = (
+                self.config.hidden_size // self.config.num_attention_heads
+            )
+            if (
+                cache_k.size(1) != self.config.num_key_value_heads
+                or cache_k.size(3) != expected_head_dim
+            ):
+                raise ValueError("KV cache 的 head 维度与模型配置不一致")
+            if cache_k.size(0) != batch_size:
+                raise ValueError("KV cache 的 batch 维度与当前输入不一致")
+            if cache_k.size(2) <= 0:
+                raise ValueError("KV cache 的序列长度必须为正整数")
+
+            past_len = cache_k.size(2)
+            total_len = past_len + cur_len
+            for layer_idx, cache in enumerate(caches):
+                assert cache is not None
+                if (
+                    not isinstance(cache, (tuple, list))
+                    or len(cache) != 2
+                    or not all(isinstance(tensor, torch.Tensor) for tensor in cache)
+                ):
+                    raise ValueError(
+                        f"past_key_values[{layer_idx}] 必须为 (k, v) Tensor 元组"
+                    )
+                cache_k, cache_v = cache
+                if cache_k.dim() != 4 or cache_v.dim() != 4:
+                    raise ValueError("KV cache 的 K/V 必须为四维张量")
+                if cache_k.shape != cache_v.shape:
+                    raise ValueError("KV cache 的 K/V 形状必须一致")
+                if cache_k.shape != first_cache[0].shape:
+                    raise ValueError("各层 KV cache 的形状必须一致")
+                if (
+                    cache_k.device != input_ids.device
+                    or cache_v.device != input_ids.device
+                ):
+                    raise ValueError("KV cache 的 device 与当前输入不一致")
+                if cache_v.device != cache_k.device:
+                    raise ValueError("KV cache 的 K/V device 必须一致")
+                if cache_v.dtype != cache_k.dtype:
+                    raise ValueError("KV cache 的 K/V dtype 必须一致")
+                if (
+                    cache_k.dtype != first_cache[0].dtype
+                    or cache_v.dtype != first_cache[1].dtype
+                ):
+                    raise ValueError("各层 KV cache 的 dtype 必须一致")
             if labels is not None:
+                raise ValueError("增量推理时 labels 必须为 None")
+        else:
+            # 完整序列前向（训练或首次推理）
+            past_len = 0
+            total_len = cur_len
+            if labels is not None and cur_len < 2:
+                raise ValueError("训练损失至少需要两个 Token 才能构造 next-token 目标")
+
+        if attention_mask is not None and attention_mask.size(1) != total_len:
+            raise ValueError(
+                "attention_mask 的序列长度必须等于当前输入长度与 Cache 长度之和，"
+                f"期望 {total_len}，当前为 {attention_mask.size(1)}"
+            )
+
+        if labels is not None and validate_inputs:
+            if not labels[..., 1:].ne(-100).any():
+                raise ValueError(
+                    "batch 中没有任何可监督的 next-token 标签；"
+                    "训练数据管线应过滤该 Batch"
+                )
+            valid_label_mask = labels != -100
+            if valid_label_mask.any() and (
+                (labels[valid_label_mask] < 0)
+                | (labels[valid_label_mask] >= self.config.vocab_size)
+            ).any():
+                raise ValueError("labels 中的有效 Token ID 超出词表范围")
+            if attention_mask is not None:
                 padding_positions = (attention_mask == 0).to(labels.device)
                 if (labels[padding_positions] != -100).any():
                     raise ValueError(
                         "attention_mask 为 0 的位置必须使用 labels=-100"
                     )
-
-        # ========== 1. 计算位置信息与总序列长度 ==========
-        first_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = (
-            past_key_values[0] if past_key_values else None
-        )
-        if first_cache is not None:
-            # 从缓存中获取已存储的序列长度
-            # 缓存 k 的布局为 (batch, num_kv_heads, total_len, head_dim)，
-            # 序列长度位于第 2 维。
-            past_len = first_cache[0].size(2)
-            total_len = past_len + cur_len
-            for layer_idx, cache in enumerate(past_key_values or []):
-                if cache is None:
-                    raise ValueError(
-                        f"past_key_values[{layer_idx}] 为 None，但其他层缓存存在"
-                    )
-                cache_k, cache_v = cache
-                if cache_k.dim() != 4 or cache_v.dim() != 4:
-                    raise ValueError("KV cache 的 K/V 必须为四维张量")
-                if cache_k.size(2) != past_len or cache_v.size(2) != past_len:
-                    raise ValueError("各层 KV cache 的序列长度必须一致")
-                if cache_k.size(0) != batch_size or cache_v.size(0) != batch_size:
-                    raise ValueError("KV cache 的 batch 维度与当前输入不一致")
-            # 增量推理模式，禁止提供 labels
-            if labels is not None:
-                raise ValueError("增量推理时 labels 必须为 None")
-        else:
-            if past_key_values is not None and any(
-                cache is not None for cache in past_key_values
-            ):
-                raise ValueError("past_key_values[0] 为 None，但其他层缓存存在")
-            # 完整序列前向（训练或首次推理）
-            past_len = 0
-            total_len = cur_len
 
         # ========== 2. 获取 RoPE 的 cos / sin，并截取当前步所需部分 ==========
         cos_full, sin_full = self.rope(total_len)
@@ -234,51 +318,115 @@ class TaiChuModel(nn.Module):
         )
 
         # ========== 4. 逐层传递 Transformer 层 ==========
-        new_past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = [] if use_cache else None
-        total_aux_loss = torch.tensor(0.0, device=input_ids.device)  # MoE 辅助损失累积
+        new_past_key_values: Optional[KVCache] = [] if use_cache else None
+        moe_aux_component_sums: Dict[str, torch.Tensor] = {}
 
         for idx, layer in enumerate(self.layers):
             # 获取本层的旧缓存（如果存在）
             past_kv = past_key_values[idx] if past_key_values is not None else None
 
             # 调用层的统一 forward（层需支持 past_key_value 参数）
-            hidden_states, present_kv, aux_loss = layer(
+            hidden_states, present_kv, layer_aux_components = layer(
                 hidden_states, cos, sin,
                 mask=mask,
                 past_key_value=past_kv,
                 use_cache=use_cache,
             )
 
-            # 收集 MoE 辅助损失（仅训练时需要）
-            total_aux_loss = total_aux_loss + aux_loss
+            if labels is not None and layer.is_moe:
+                for name, component in layer_aux_components.items():
+                    if not isinstance(component, torch.Tensor):
+                        raise TypeError(
+                            f"TransformerBlock[{idx}] 的 {name} 必须为 Tensor"
+                        )
+                    if component.dim() != 0 or not component.is_floating_point():
+                        raise ValueError(
+                            f"TransformerBlock[{idx}] 的 {name} 必须为浮点标量"
+                        )
+                    moe_aux_component_sums[name] = (
+                        component
+                        if name not in moe_aux_component_sums
+                        else moe_aux_component_sums[name] + component
+                    )
 
             if use_cache:
+                if present_kv is None:
+                    raise RuntimeError(
+                        f"TransformerBlock[{idx}] 未在 use_cache=True 时返回 Cache"
+                    )
                 assert new_past_key_values is not None
                 new_past_key_values.append(present_kv)
 
+        aux_loss = None
+        for component in moe_aux_component_sums.values():
+            aux_loss = component if aux_loss is None else aux_loss + component
+
         # ========== 5. 最终归一化与输出头 ==========
         hidden_states = self.final_norm(hidden_states)
-        logits = self.output_head(hidden_states)  # (batch, cur_len, vocab_size)
+        logits = (
+            self.output_head(hidden_states)
+            if labels is not None or return_logits
+            else None
+        )
+        returned_logits = logits if return_logits else None
 
         # ========== 6. 计算损失（若提供 labels） ==========
         loss = None
+        loss_sum = None
+        num_loss_tokens = None
+        token_losses = None
+        correct_predictions = None
+        loss_components = None
         if labels is not None:
-            # 偏移 logits 和 labels，对齐预测目标
-            shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
+            valid_mask = shift_labels.ne(-100)
+            num_loss_tokens = valid_mask.sum(dtype=torch.long)
+            assert logits is not None
+            shift_logits = logits[..., :-1, :].contiguous()
+            flat_shift_logits = shift_logits.float().reshape(
+                -1,
+                shift_logits.size(-1),
             )
-            # 将 MoE 辅助损失直接加到总损失上（权重已在损失计算内部处理），
-            # 并保持与主损失相同的数据类型
-            loss = loss + total_aux_loss.to(loss.dtype)
+            flat_shift_labels = shift_labels.reshape(-1)
+            if return_token_statistics:
+                per_token_losses = F.cross_entropy(
+                    flat_shift_logits,
+                    flat_shift_labels,
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                flat_valid_mask = valid_mask.view(-1)
+                token_losses = per_token_losses[flat_valid_mask].detach()
+                loss_sum = per_token_losses.sum()
+                correct_predictions = (
+                    shift_logits.argmax(dim=-1).eq(shift_labels) & valid_mask
+                ).sum(dtype=torch.long).detach()
+            else:
+                cross_entropy_sum = F.cross_entropy(
+                    flat_shift_logits,
+                    flat_shift_labels,
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                loss_sum = cross_entropy_sum
+            ce_loss = loss_sum / num_loss_tokens.clamp_min(1).to(loss_sum.dtype)
+            loss = ce_loss
+            loss_components = {"ce_loss": ce_loss}
+            if aux_loss is not None:
+                loss = loss + aux_loss.to(dtype=loss.dtype)
+                loss_components.update(moe_aux_component_sums)
+                loss_components["moe_aux_loss"] = aux_loss
 
         # ========== 7. 统一返回 CausalLMOutput 对象 ==========
         return CausalLMOutput(
-            logits=logits,
+            logits=returned_logits,
             loss=loss,
+            loss_sum=loss_sum,
+            num_loss_tokens=num_loss_tokens,
+            token_losses=token_losses,
+            correct_predictions=correct_predictions,
+            aux_loss=aux_loss,
+            loss_components=loss_components,
             past_key_values=new_past_key_values,
         )
 
@@ -454,11 +602,16 @@ class TaiChuModel(nn.Module):
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
 
+        optimizer_kwargs = {
+            "lr": config.learning_rate,
+            "betas": (config.beta1, config.beta2),
+            "eps": config.epsilon,
+        }
+        if next(self.parameters()).is_cuda:
+            optimizer_kwargs["fused"] = True
         optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=config.epsilon,
+            **optimizer_kwargs,
         )
         return optimizer
 

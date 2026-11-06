@@ -6,8 +6,8 @@
 
 import torch
 import torch.nn as nn
-from model.moe import MoEConfig, SparseMoE
-from typing import Optional
+from model.moe import AuxLossComponents, MoEConfig, SparseMoE
+from typing import Optional, Tuple
 
 
 class SwiGLUFeedForward(nn.Module):
@@ -79,12 +79,10 @@ class StandardFFN(nn.Module):
 class MoEFeedForward(nn.Module):
     """MoE 前馈网络适配器。
 
-    将 SparseMoE 封装为与普通 FFN 相同的接口，
-    并存储辅助损失供外部收集。
+    封装 SparseMoE，并将辅助损失分量显式返回给 TransformerBlock。
 
     Attributes:
         moe: SparseMoE 实例
-        aux_loss: 最近一次前向的辅助损失（标量张量）
     """
 
     def __init__(self, hidden_size: int, moe_config: MoEConfig):
@@ -96,27 +94,20 @@ class MoEFeedForward(nn.Module):
         """
         super().__init__()
         self.moe = SparseMoE(hidden_size, moe_config)
-        self.aux_loss = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, AuxLossComponents]:
         """前向传播。
 
         Args:
             x: 输入张量，形状 (batch_size, seq_len, hidden_size)
 
         Returns:
-            输出张量，形状与输入相同。
+            输出张量及未做重复加权的辅助损失分量。
         """
-        output, aux_loss = self.moe(x)
-        self.aux_loss = aux_loss
-        return output
-
-    def get_aux_loss(self):
-        """获取AUX损失
-        Returns：
-            aux_loss:返回最近一次前向的辅助损失，若未计算则返回 0 张量
-        """
-        return self.aux_loss if self.aux_loss is not None else torch.tensor(0.0)
+        return self.moe(x)
 
 
 def create_ffn(

@@ -9,11 +9,15 @@
 """
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+AuxLossComponents = Dict[str, torch.Tensor]
+
 
 @dataclass
 class MoEConfig:
@@ -224,7 +228,10 @@ class SparseMoE(nn.Module):
             for _ in range(self.num_experts)
         ])
 
-    def forward(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, AuxLossComponents]:
         """稀疏 MoE 前向传播。
 
         Args:
@@ -232,7 +239,7 @@ class SparseMoE(nn.Module):
 
         Returns:
             output: MoE 输出张量，形状 (batch_size, seq_len, hidden_size)
-            aux_loss: 辅助损失（负载均衡 + z‑loss），标量
+            aux_loss_components: 已加权的辅助损失分量
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
         num_tokens = batch_size * seq_len
@@ -242,7 +249,10 @@ class SparseMoE(nn.Module):
         # topk_indices: (S, K), topk_weights: (S, K)
 
         # ---- 2. 计算辅助损失 ----
-        aux_loss = self._compute_auxiliary_loss(router_logits, topk_indices)
+        aux_loss_components = self._compute_auxiliary_loss_components(
+            router_logits,
+            topk_indices,
+        )
 
         # ---- 3. 共享专家输出 ----
         if self.shared_expert is not None:
@@ -283,25 +293,14 @@ class SparseMoE(nn.Module):
         if isinstance(shared_output, torch.Tensor):
             output = output + shared_output
 
-        return output, aux_loss
+        return output, aux_loss_components
 
-    def _compute_auxiliary_loss(
+    def _compute_auxiliary_loss_components(
         self,
-        router_logits: torch.Tensor,   # (S, E)
-        topk_indices: torch.Tensor,    # (S, K)
-    ) -> torch.Tensor:
-        """计算负载均衡损失与路由器 z‑loss。
-
-        负载均衡损失：鼓励每个专家接收的 token 数量均衡。
-        z‑loss：鼓励路由器 logits 保持在较小数值，稳定训练。
-
-        Args:
-            router_logits: 原始路由 logits，形状 (S, E)
-            topk_indices: 选中的专家索引，形状 (S, K)
-
-        Returns:
-            total_aux_loss: 辅助损失标量
-        """
+        router_logits: torch.Tensor,
+        topk_indices: torch.Tensor,
+    ) -> AuxLossComponents:
+        """计算并分别返回已加权的负载均衡损失和 Router Z-loss。"""
         num_tokens, num_experts = router_logits.shape
 
         # --- 负载均衡损失 ---
@@ -331,8 +330,9 @@ class SparseMoE(nn.Module):
             load_bal_loss = torch.tensor(0.0, device=router_logits.device)
             z_loss = torch.tensor(0.0, device=router_logits.device)
 
-        total_aux_loss = (
-            self.load_balancing_loss_weight * load_bal_loss +
-            self.router_z_loss_weight * z_loss
-        )
-        return total_aux_loss
+        return {
+            "moe_load_balancing_loss": (
+                self.load_balancing_loss_weight * load_bal_loss
+            ),
+            "moe_router_z_loss": self.router_z_loss_weight * z_loss,
+        }

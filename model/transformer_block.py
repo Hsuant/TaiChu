@@ -10,6 +10,7 @@ from typing import Optional, Tuple
 
 from model.attention import AttentionMask, TaiChuCausalSelfAttention
 from model.feedforward import create_ffn
+from model.moe import AuxLossComponents
 from model.normalization import RMSNorm
 
 
@@ -79,19 +80,6 @@ class TaiChuBlock(nn.Module):
         else:
             self.hidden_dropout = nn.Identity()
 
-    def get_aux_loss(self) -> torch.Tensor:
-        """获取 MoE 层的辅助损失（负载均衡 + z-loss）。
-
-        Returns:
-            辅助损失标量张量，若当前层不是 MoE 则返回 0。
-        """
-        if self.is_moe and hasattr(self.feed_forward, 'get_aux_loss'):
-            return self.feed_forward.get_aux_loss()
-        # 返回 0 张量，设备与模型参数一致
-        device = next(self.parameters()).device
-        return torch.tensor(0.0, device=device)
-
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -101,7 +89,11 @@ class TaiChuBlock(nn.Module):
         mask: Optional[AttentionMask] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[Tuple[torch.Tensor, torch.Tensor]],
+        AuxLossComponents,
+    ]:
         """前向传播（支持 KV 缓存，用于自回归生成）。
 
         Args:
@@ -120,7 +112,8 @@ class TaiChuBlock(nn.Module):
                 - output: 该层的输出，形状 ``(batch, seq_len, hidden_size)``。
                 - present_key_value: 若 ``use_cache=True`` 则返回新的 KV 缓存，
                   ``(k, v)`` 元组，否则为 ``None``。
-                - aux_loss: MoE 辅助损失（标量），非 MoE 层为 0。
+                - aux_loss_components: 已加权的 MoE 辅助损失分量。
+                  非 MoE 层返回空字典。
         """
         # ========== 1.注意力子层（Pre-Norm + 残差） ==========
         residual = hidden_states
@@ -143,12 +136,13 @@ class TaiChuBlock(nn.Module):
         residual = hidden_states
         # FFN 前的归一化
         normed_hidden = self.post_attention_norm(hidden_states)
-        ffn_output = self.feed_forward(normed_hidden)
+        if self.is_moe:
+            ffn_output, aux_loss_components = self.feed_forward(normed_hidden)
+        else:
+            ffn_output = self.feed_forward(normed_hidden)
+            aux_loss_components = {}
 
         # 残差连接 + Dropout
         hidden_states = residual + self.hidden_dropout(ffn_output)
 
-        # 获取本层的 MoE 辅助损失（若不是 MoE 层则返回 0）
-        aux_loss = self.get_aux_loss()
-
-        return hidden_states, present_key_value, aux_loss
+        return hidden_states, present_key_value, aux_loss_components

@@ -91,34 +91,39 @@ class TestSparseMoE(unittest.TestCase):
     def test_forward_shape_and_aux_loss(self):
         moe = SparseMoE(self.hidden_size, self.moe_config)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        out, aux_loss = moe(x)
+        out, components = moe(x)
         self.assertEqual(out.shape, x.shape)
-        self.assertIsInstance(aux_loss, torch.Tensor)
-        self.assertEqual(aux_loss.dim(), 0)
+        self.assertEqual(
+            set(components),
+            {"moe_load_balancing_loss", "moe_router_z_loss"},
+        )
+        self.assertTrue(
+            all(component.dim() == 0 for component in components.values())
+        )
 
     def test_no_shared_expert(self):
         cfg = MoEConfig(num_shared_experts=0)
         moe = SparseMoE(self.hidden_size, cfg)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        out, aux_loss = moe(x)
+        out, components = moe(x)
         self.assertEqual(out.shape, x.shape)
+        self.assertEqual(len(components), 2)
 
     def test_load_balancing_loss_nonzero(self):
         moe = SparseMoE(self.hidden_size, self.moe_config)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
         moe.train()
-        _, aux_loss = moe(x)
+        _, components = moe(x)
         # 在随机输入下，负载均衡损失通常 > 0
-        self.assertGreater(aux_loss.item(), 0.0)
+        self.assertGreater(components["moe_load_balancing_loss"].item(), 0.0)
 
     def test_eval_mode_aux_loss_zero(self):
         moe = SparseMoE(self.hidden_size, self.moe_config)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
         moe.eval()
-        _, aux_loss = moe(x)
-        # 评估模式下负载均衡损失被设置为 0，但 z-loss 仍计算？查看代码：if self.training 时计算 load_bal_loss，否则为 0
-        # z_loss 在任何模式下都计算，因此 aux_loss 可能不为 0。这里只验证不崩溃
-        self.assertIsInstance(aux_loss, torch.Tensor)
+        _, components = moe(x)
+        self.assertEqual(float(components["moe_load_balancing_loss"]), 0.0)
+        self.assertEqual(float(components["moe_router_z_loss"]), 0.0)
 
 
 if __name__ == '__main__':

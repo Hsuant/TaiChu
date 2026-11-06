@@ -89,22 +89,28 @@ class TestMoEFeedForward(unittest.TestCase):
     def test_forward_shape_and_aux_loss(self):
         moe_ff = MoEFeedForward(self.hidden_size, self.moe_config)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        out = moe_ff(x)
+        out, components = moe_ff(x)
         self.assertEqual(out.shape, x.shape)
-        aux_loss = moe_ff.get_aux_loss()
-        self.assertIsInstance(aux_loss, torch.Tensor)
-        self.assertEqual(aux_loss.dim(), 0)  # 标量
+        self.assertEqual(
+            set(components),
+            {"moe_load_balancing_loss", "moe_router_z_loss"},
+        )
+        self.assertTrue(
+            all(component.dim() == 0 for component in components.values())
+        )
 
     def test_aux_loss_accumulation(self):
         moe_ff = MoEFeedForward(self.hidden_size, self.moe_config)
         x = torch.randn(self.batch, self.seq_len, self.hidden_size)
-        _ = moe_ff(x)
-        loss1 = moe_ff.get_aux_loss()
-        _ = moe_ff(x)
-        loss2 = moe_ff.get_aux_loss()
-        # 两次前向的损失应不同（因为 router 输出不同），但标量即可
-        self.assertIsInstance(loss1, torch.Tensor)
-        self.assertIsInstance(loss2, torch.Tensor)
+        _, first = moe_ff(x)
+        _, second = moe_ff(x)
+        self.assertEqual(set(first), set(second))
+        self.assertTrue(
+            all(
+                isinstance(value, torch.Tensor) and value.dim() == 0
+                for value in (first | second).values()
+            )
+        )
 
 
 class TestCreateFFN(unittest.TestCase):
