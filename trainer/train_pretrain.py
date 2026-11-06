@@ -27,7 +27,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import replace
+from datetime import timedelta
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler
@@ -39,10 +41,17 @@ from tokenizers import Tokenizer
 from typing import List, Optional
 
 from utils.config_loader import load_model_config, load_pretrain_config, parse_tokens_string
-from utils.train_utils import set_seed, get_device, get_wsd_lr_lambda, get_experiment_dir
+from utils.train_utils import (
+    compile_model_for_training,
+    get_device,
+    get_experiment_dir,
+    get_wsd_lr_lambda,
+    set_seed,
+    training_compile_preflight,
+)
 from utils.logger import LogManager
 from utils.swanlab_logger import SwanLabLogger
-from utils.checkpoint import CheckpointManager
+from utils.checkpoint import CheckpointManager, unwrap_model
 from utils.model_utils import ModelInspector
 from dataset.runtime import UnifiedDataLoaderFactory as TaiChuDataLoaderFactory
 from dataset.runtime import DataState, skip_batches
@@ -70,6 +79,8 @@ class TaiChuTrainer:
         early_stopping: 早停实例（可选）。
         eval_metrics: 训练阶段评估指标管理器。
     """
+
+    MAX_CONSECUTIVE_NONFINITE_SKIPS = 10
 
     def __init__(
         self,
@@ -109,6 +120,7 @@ class TaiChuTrainer:
         eos_token_id: Optional[int] = None,
         compute_empty_prefix_eos_ppl: bool = False,
         data_state: DataState | None = None,
+        compiled_model: bool = False,
     ):
         """初始化训练器。
 
@@ -148,6 +160,7 @@ class TaiChuTrainer:
             bos_token_id: BOS Token ID，用于可选空 Prompt 诊断。
             eos_token_id: EOS Token ID，用于可选空 Prompt 诊断。
             compute_empty_prefix_eos_ppl: 是否记录显式 BOS -> EOS 诊断。
+            compiled_model: 模型是否已通过 torch.compile 编译。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -158,7 +171,18 @@ class TaiChuTrainer:
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.scaler = scaler
+        self.nonfinite_skip_count = 0
+        self.consecutive_nonfinite_skips = 0
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        if max_grad_norm < 0:
+            raise ValueError("max_grad_norm cannot be negative")
+        self.world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
         self.max_steps = max_steps
         self.save_interval = save_interval
         self.eval_interval = eval_interval
@@ -170,11 +194,13 @@ class TaiChuTrainer:
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.compute_empty_prefix_eos_ppl = compute_empty_prefix_eos_ppl
+        self.compiled_model = compiled_model
         self.data_state = data_state
         self.swanlab_logger = swanlab_logger
         self.device = device
         self.use_amp = use_amp
         self.dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+        self.scaler_enabled = bool(use_amp and self.dtype == torch.float16)
         self.local_rank = local_rank
         self.global_rank = global_rank
         self.max_seq_len = max_seq_len
@@ -212,8 +238,7 @@ class TaiChuTrainer:
                 log_file=os.path.join(log_manager.log_dir, "mfu_log.jsonl")
             )
         # 获取原始模型（处理 DDP 包装），用于表示稳定性钩子
-        raw_model = model.module if hasattr(model, 'module') else model
-        assert isinstance(raw_model, nn.Module)
+        raw_model = unwrap_model(model)
         self.eval_metrics.initialize_repr_stability(raw_model, device, hook_layer=-1)
         # =================================================
 
@@ -249,147 +274,237 @@ class TaiChuTrainer:
             train_iter = iter(self.train_loader)
             if batch_index:
                 train_iter = skip_batches(train_iter, batch_index)
-            accumulated_loss = 0.0          # 累积的原始损失（未除累积步数）
-            samples_processed = 0           # 当前累积步内处理的样本数
-            tokens_processed = 0            # 当前优化步实际处理的 padded token 数
             tokens_since_log = 0
-            micro_step = 0                  # 当前累积步内已处理的微批次计数
 
             while self.global_step < self.max_steps and not self.early_stopped:
-                try:
-                    batch = next(train_iter)
-                except StopIteration:
-                    data_epoch += 1
-                    batch_index = 0
-                    if hasattr(self.train_loader, "set_epoch"):
-                        self.train_loader.set_epoch(data_epoch)
-                    train_iter = iter(self.train_loader)
+                micro_batches = []
+                local_loss_tokens = 0
+                for _ in range(self.gradient_accumulation_steps):
                     try:
                         batch = next(train_iter)
-                    except StopIteration as exc:
-                        raise RuntimeError(
-                            "training data pipeline produced no batches"
-                        ) from exc
+                    except StopIteration:
+                        data_epoch += 1
+                        batch_index = 0
+                        if hasattr(self.train_loader, "set_epoch"):
+                            self.train_loader.set_epoch(data_epoch)
+                        train_iter = iter(self.train_loader)
+                        try:
+                            batch = next(train_iter)
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "training data pipeline produced no batches"
+                            ) from exc
 
-                batch_index += 1
-                batch_sample_ids = batch.get("sample_ids")
-                consumed_samples += (
-                    len(batch_sample_ids)
-                    if batch_sample_ids is not None
-                    else int(batch["input_ids"].size(0))
-                )
-                self.data_state = DataState(
-                    dataset_id=dataset_reader.dataset_id,
-                    dataset_version=dataset_reader.version,
-                    epoch=data_epoch,
-                    batch_index=batch_index,
-                    consumed_samples=consumed_samples,
-                )
-
-                input_ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
-                attention_mask = batch.get("attention_mask")
-                if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
-
-                # 标记当前微步边界（供 torch.compile 的 CUDA Graph 捕获对齐步进）
-                torch.compiler.cudagraph_mark_step_begin()
-
-                # 前向传播（混合精度）
-                with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
-                    out = self.model(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
+                    batch_index += 1
+                    batch_sample_ids = batch.get("sample_ids")
+                    consumed_samples += (
+                        len(batch_sample_ids)
+                        if batch_sample_ids is not None
+                        else int(batch["input_ids"].size(0))
                     )
-                    loss = out.loss
-                    loss = loss.mean() / self.gradient_accumulation_steps   # 缩放损失
-
-                # 反向传播
-                self.scaler.scale(loss).backward()
-                accumulated_loss += loss.item() * self.gradient_accumulation_steps   # 恢复原始损失
-                samples_processed += input_ids.size(0)
-                tokens_processed += input_ids.numel()
-                micro_step += 1
-
-                # 达到梯度累积步数，执行参数更新
-                if micro_step == self.gradient_accumulation_steps:
-                    # 取消 AMP 缩放，恢复原始梯度
-                    if self.use_amp:
-                        self.scaler.unscale_(self.optimizer)
-
-                    # 更新梯度噪声尺度（裁剪前，使用原始梯度）
-                    self.eval_metrics.update_gradient(self.model)
-
-                    # 梯度裁剪
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        max_norm=self.max_grad_norm,
+                    group_data_state = DataState(
+                        dataset_id=dataset_reader.dataset_id,
+                        dataset_version=dataset_reader.version,
+                        epoch=data_epoch,
+                        batch_index=batch_index,
+                        consumed_samples=consumed_samples,
+                    )
+                    micro_batches.append(batch)
+                    local_loss_tokens += int(
+                        (batch["labels"][..., 1:] != -100).sum().item()
                     )
 
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                    self.scheduler.step()
+                if local_loss_tokens <= 0:
+                    raise RuntimeError("training batch contains no supervised tokens")
+                global_loss_tokens = self._global_sum(local_loss_tokens)
+                if global_loss_tokens <= 0:
+                    raise RuntimeError(
+                        "distributed training batch contains no supervised tokens"
+                    )
 
-                    # 更新全局步数
-                    self.global_step += 1
-
-                    # 计算平均损失
-                    avg_loss = accumulated_loss / self.gradient_accumulation_steps
-
-                    # 更新训练阶段评估指标
-                    # 平滑损失
-                    self.eval_metrics.update_loss(avg_loss)
-                    # 模型 FLOPs 利用率（MFU）
-                    if self.eval_metrics.mfu is not None:
-                        step_flops = (
-                            self.eval_metrics.mfu.estimate_model_flops_for_tokens(
-                                self.model,
-                                tokens_processed,
+                accumulated_loss_sum = torch.zeros(
+                    (),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                padded_tokens_processed = 0
+                loss_finite_flag = torch.ones(
+                    (),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+                for micro_index, batch in enumerate(micro_batches):
+                    input_ids = batch["input_ids"].to(
+                        self.device,
+                        non_blocking=self.device.type == "cuda",
+                    )
+                    labels = batch["labels"].to(
+                        self.device,
+                        non_blocking=self.device.type == "cuda",
+                    )
+                    attention_mask = batch.get("attention_mask")
+                    if attention_mask is not None:
+                        if batch.get("attention_mask_is_right_padded", False):
+                            # Right padding is causally invisible to every valid
+                            # query, so native causal SDPA is equivalent.
+                            attention_mask = None
+                        else:
+                            attention_mask = attention_mask.to(
+                                self.device,
+                                non_blocking=self.device.type == "cuda",
                             )
+
+                    if self.compiled_model:
+                        torch.compiler.cudagraph_mark_step_begin()
+
+                    use_no_sync = (
+                        self.world_size > 1
+                        and micro_index < len(micro_batches) - 1
+                        and hasattr(self.model, "no_sync")
+                    )
+                    sync_context = (
+                        self.model.no_sync()
+                        if use_no_sync
+                        else nullcontext()
+                    )
+                    with sync_context:
+                        with autocast(
+                            device_type=self.device.type,
+                            enabled=self.use_amp,
+                            dtype=self.dtype,
+                        ):
+                            out = self.model(
+                                input_ids,
+                                attention_mask=attention_mask,
+                                labels=labels,
+                                return_logits=False,
+                                validate_inputs=False,
+                            )
+                            if out.loss_sum is None:
+                                raise RuntimeError(
+                                    "model did not return a loss sum"
+                                )
+                            # DDP averages gradients across ranks. Scaling by
+                            # world_size yields a global token-weighted mean.
+                            backward_loss = (
+                                out.loss_sum
+                                * (self.world_size / global_loss_tokens)
+                            )
+                            if out.aux_loss is not None:
+                                # Current MoE auxiliary losses are means over
+                                # routed tokens in this forward. Keep them
+                                # separate from CE and token-weight them for
+                                # gradient accumulation and DDP averaging.
+                                backward_loss = (
+                                    backward_loss
+                                    + out.aux_loss
+                                    * (
+                                        self.world_size
+                                        * input_ids.numel()
+                                        / global_loss_tokens
+                                    )
+                                )
+                            loss_finite_flag = loss_finite_flag & torch.isfinite(
+                                backward_loss.detach()
+                            ).all()
+                        self.scaler.scale(backward_loss).backward()
+
+                    accumulated_loss_sum += out.loss_sum.detach().float()
+                    padded_tokens_processed += input_ids.numel()
+
+                loss_is_finite = bool(loss_finite_flag.item())
+                grad_norm_value, stepped, diagnostics = (
+                    self._apply_optimizer_step(
+                        loss_is_finite,
+                    )
+                )
+                if not stepped:
+                    self.nonfinite_skip_count += 1
+                    self.consecutive_nonfinite_skips += 1
+                    self.data_state = group_data_state
+                    if diagnostics:
+                        reason = (
+                            "local_nonfinite_gradients=["
+                            + ", ".join(diagnostics)
+                            + "]"
                         )
+                    elif not loss_is_finite:
+                        reason = "local_loss_is_nonfinite"
+                    elif not math.isfinite(grad_norm_value):
+                        reason = "local_gradient_norm_is_nonfinite"
                     else:
-                        step_flops = 0.0
-                    self.eval_metrics.update_step(step_flops, self.global_step)
-                    # 表示稳定性（开销较大，每 100 步更新一次）
-                    if self.global_step % 100 == 0:
-                        repr_metrics = self.eval_metrics.update_repr(input_ids)
-                        if self.global_rank == 0 and repr_metrics:
-                            self.log_manager.logger.info(
-                                f"Step {self.global_step} repr_metrics: {repr_metrics}"
-                            )
-
-                    # 记录训练指标
-                    tokens_since_log += tokens_processed
-                    if self.global_step % self.train_log_interval == 0:
-                        self._log_training(
-                            avg_loss,
-                            tokens_since_log,
+                        reason = (
+                            "local_state_is_finite_"
+                            "another_rank_rejected_update"
                         )
-                        tokens_since_log = 0
-
-                    # 梯度清零
-                    self.optimizer.zero_grad()
-
-                    # 重置累积计数器
-                    accumulated_loss = 0.0
-                    samples_processed = 0
-                    tokens_processed = 0
-                    micro_step = 0
-
-                    # 验证
-                    val_loss = 0.0
-                    if self.global_step % self.eval_interval == 0:
-                        self.log_manager.info("验证开始")
-                        # 调用 _evaluate 获取验证损失及其他扩展指标
-                        val_loss = self._evaluate(
-                            generate_prompts=self.generation_prompts,
-                            num_generate_tokens=self.num_generate_tokens,
+                    self.log_manager.warning(
+                        "检测到非有限训练状态，已原子跳过优化器更新: "
+                        f"candidate_step={self.global_step + 1}, "
+                        f"rank={self.global_rank}, "
+                        f"loss_finite={loss_is_finite}, "
+                        f"grad_norm={grad_norm_value}, "
+                        f"consecutive_skips={self.consecutive_nonfinite_skips}, "
+                        f"reason={reason}"
+                    )
+                    if (
+                        self.consecutive_nonfinite_skips
+                        >= self.MAX_CONSECUTIVE_NONFINITE_SKIPS
+                    ):
+                        raise RuntimeError(
+                            "training produced non-finite gradients for "
+                            f"{self.consecutive_nonfinite_skips} consecutive "
+                            "optimizer steps; stopped after atomically "
+                            "skipping every update"
                         )
-                        if val_loss < self.best_val_loss:
-                            self.best_val_loss = val_loss
+                    continue
 
-                        # 保存最佳模型
+                self.consecutive_nonfinite_skips = 0
+                self.eval_metrics.update_gradient_norm(grad_norm_value)
+                self.global_step += 1
+                self.data_state = group_data_state
+
+                avg_loss = float(
+                    (accumulated_loss_sum / global_loss_tokens).item()
+                )
+                self.eval_metrics.update_loss(avg_loss)
+                if self.eval_metrics.mfu is not None:
+                    step_flops = (
+                        self.eval_metrics.mfu.estimate_model_flops_for_tokens(
+                            self.model,
+                            padded_tokens_processed,
+                        )
+                    )
+                else:
+                    step_flops = 0.0
+                self.eval_metrics.update_step(step_flops, self.global_step)
+
+                tokens_since_log += global_loss_tokens
+                if (
+                    self.train_log_interval > 0
+                    and self.global_step % self.train_log_interval == 0
+                ):
+                    self._log_training(
+                        avg_loss,
+                        tokens_since_log,
+                        grad_norm_value,
+                    )
+                    tokens_since_log = 0
+
+                val_loss = None
+
+                if (
+                    self.eval_interval > 0
+                    and self.global_step % self.eval_interval == 0
+                ):
+                    self.log_manager.info("验证开始")
+                    val_loss = self._evaluate(
+                        generate_prompts=self.generation_prompts,
+                        num_generate_tokens=self.num_generate_tokens,
+                    )
+                    if val_loss < self.best_val_loss:
+                        self.best_val_loss = val_loss
+
+                    if self.global_rank == 0:
                         self.checkpoint_manager.save_best(
                             self.model,
                             metrics={"val_loss": val_loss},
@@ -399,20 +514,20 @@ class TaiChuTrainer:
                             global_step=self.global_step,
                             data_state=self.data_state.to_dict(),
                         )
-                        self.log_manager.info(
-                            f"当前最佳验证损失: {self.checkpoint_manager.best_metric_value:.4f}"
-                        )
+                    self.log_manager.info(
+                        f"当前最佳验证损失: {self.best_val_loss:.4f}"
+                    )
 
-                        # 早停检查
-                        if self.early_stopping is not None:
-                            stop = self.early_stopping.step(val_loss, self.global_step)
-                            if stop:
-                                self.log_manager.info(
-                                    f"早停触发于步数 {self.global_step}，"
-                                    f"最佳分数 {self.early_stopping.best_score:.4f} "
-                                    f"于步数 {self.early_stopping.best_step}"
-                                )
-                                self.early_stopped = True
+                    if self.early_stopping is not None:
+                        stop = self.early_stopping.step(val_loss, self.global_step)
+                        if stop:
+                            self.log_manager.info(
+                                f"早停触发于步数 {self.global_step}，"
+                                f"最佳分数 {self.early_stopping.best_score:.4f} "
+                                f"于步数 {self.early_stopping.best_step}"
+                            )
+                            self.early_stopped = True
+                            if self.global_rank == 0:
                                 self.checkpoint_manager.save(
                                     f"checkpoints/early_stop_step{self.global_step}.pt",
                                     model=self.model,
@@ -424,37 +539,47 @@ class TaiChuTrainer:
                                     early_stopping_state=self.early_stopping.state_dict(),
                                     data_state=self.data_state.to_dict(),
                                 )
-                                break
+                            break
 
-                    # 定期保存检查点
-                    if self.global_step % self.save_interval == 0:
-                        extra = {}
-                        if self.early_stopping is not None:
-                            extra["early_stopping_state"] = self.early_stopping.state_dict()
-                        extra["data_state"] = self.data_state.to_dict()
-                        self.checkpoint_manager.save(
-                            f"checkpoints/checkpoint-{self.global_step}.pt",
-                            model=self.model,
-                            optimizer=self.optimizer,
-                            scheduler=self.scheduler,
-                            scaler=self.scaler,
-                            global_step=self.global_step,
-                            metrics={"val_loss": val_loss if 'val_loss' in locals() else self.best_val_loss},
-                            **extra,
-                        )
+                if (
+                    self.global_rank == 0
+                    and self.save_interval > 0
+                    and self.global_step % self.save_interval == 0
+                ):
+                    extra = {}
+                    if self.early_stopping is not None:
+                        extra["early_stopping_state"] = self.early_stopping.state_dict()
+                    extra["data_state"] = self.data_state.to_dict()
+                    self.checkpoint_manager.save(
+                        f"checkpoints/checkpoint-{self.global_step}.pt",
+                        model=self.model,
+                        optimizer=self.optimizer,
+                        scheduler=self.scheduler,
+                        scaler=self.scaler,
+                        global_step=self.global_step,
+                        metrics={
+                            "val_loss": (
+                                val_loss
+                                if val_loss is not None
+                                else self.best_val_loss
+                            )
+                        },
+                        **extra,
+                    )
 
             # 训练结束，保存最终模型
-            self.checkpoint_manager.save(
-                "final_models/final_model.pt",
-                model=self.model,
-                optimizer=self.optimizer,
-                scheduler=self.scheduler,
-                scaler=self.scaler,
-                global_step=self.global_step,
-                data_state=(
-                    None if self.data_state is None else self.data_state.to_dict()
-                ),
-            )
+            if self.global_rank == 0:
+                self.checkpoint_manager.save(
+                    "final_models/final_model.pt",
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    scheduler=self.scheduler,
+                    scaler=self.scaler,
+                    global_step=self.global_step,
+                    data_state=(
+                        None if self.data_state is None else self.data_state.to_dict()
+                    ),
+                )
             self.log_manager.info("训练完成!")
             if self.swanlab_logger:
                 self.swanlab_logger.finish()
@@ -475,6 +600,8 @@ class TaiChuTrainer:
 
     def _save_interrupted_checkpoint(self) -> None:
         """保存中断/异常时的检查点。"""
+        if self.global_rank != 0:
+            return
         extra = {}
         if self.early_stopping is not None:
             extra["early_stopping_state"] = self.early_stopping.state_dict()
@@ -493,7 +620,119 @@ class TaiChuTrainer:
         )
         self.log_manager.info(f"紧急检查点已保存至 step {self.global_step}")
 
-    def _log_training(self, loss: float, tokens: int) -> None:
+    def _global_sum(self, value: int) -> int:
+        """Sum a scalar across ranks without changing the compile hot path."""
+        if not torch.distributed.is_initialized():
+            return int(value)
+        total = torch.tensor(float(value), dtype=torch.float64, device=self.device)
+        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        return int(total.item())
+
+    def _all_ranks_finite(self, finite: bool) -> bool:
+        """Return whether every rank agreed that the training state is finite."""
+        if not torch.distributed.is_initialized():
+            return bool(finite)
+        finite_flag = torch.tensor(
+            1 if finite else 0,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(
+            finite_flag,
+            op=torch.distributed.ReduceOp.MIN,
+        )
+        return bool(finite_flag.item())
+
+    def _nonfinite_gradient_diagnostics(self) -> List[str]:
+        """Describe a bounded sample of parameters whose gradients are invalid."""
+        diagnostics = []
+        for name, parameter in self.model.named_parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            finite_mask = torch.isfinite(grad)
+            if finite_mask.all().item():
+                continue
+            nonfinite_count = int((~finite_mask).sum().item())
+            diagnostics.append(
+                f"{name}: {nonfinite_count}/{grad.numel()} elements"
+            )
+            if len(diagnostics) >= 8:
+                diagnostics.append("...")
+                break
+        return diagnostics
+
+    def _gradient_total_norm(self) -> torch.Tensor:
+        """Compute the L2 gradient norm in FP32 without mutating gradients."""
+        norms = [
+            torch.linalg.vector_norm(
+                parameter.grad.detach().float(),
+                ord=2,
+            )
+            for parameter in self.model.parameters()
+            if parameter.grad is not None
+        ]
+        if not norms:
+            return torch.zeros(
+                (),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        return torch.linalg.vector_norm(torch.stack(norms), ord=2)
+
+    def _clip_gradients_with_norm(self, total_norm: torch.Tensor) -> None:
+        """Apply the standard max-norm coefficient after finite validation."""
+        clip_coefficient = torch.clamp(
+            self.max_grad_norm / (total_norm + 1e-6),
+            max=1.0,
+        )
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(
+                    clip_coefficient.to(dtype=parameter.grad.dtype)
+                )
+
+    def _apply_optimizer_step(
+        self,
+        loss_finite: bool,
+    ) -> tuple[float, bool, List[str]]:
+        """Clip and update atomically only when every rank accepts the update.
+
+        A non-finite loss or gradient is never passed to AdamW. All ranks must
+        make the same decision before optimizer, scaler, or scheduler state is
+        mutated, otherwise a rank-local anomaly can desynchronize DDP training.
+        """
+        if self.scaler_enabled:
+            self.scaler.unscale_(self.optimizer)
+        grad_norm = self._gradient_total_norm()
+        grad_norm_value = float(grad_norm.detach().float().item())
+        update_finite = self._all_ranks_finite(
+            loss_finite and math.isfinite(grad_norm_value)
+        )
+
+        if not update_finite:
+            diagnostics = self._nonfinite_gradient_diagnostics()
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scaler_enabled:
+                self.scaler.update()
+            return grad_norm_value, False, diagnostics
+
+        self._clip_gradients_with_norm(grad_norm)
+        if self.scaler_enabled:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return grad_norm_value, True, []
+
+    def _log_training(
+        self,
+        loss: float,
+        tokens: int,
+        grad_norm: float,
+    ) -> None:
         """记录训练指标到 TensorBoard 和日志文件。
 
         计算 tokens_per_sec 时，使用本次日志与上一次日志之间的时间窗口，
@@ -501,7 +740,8 @@ class TaiChuTrainer:
 
         Args:
             loss: 当前参数更新步的平均损失（已排除梯度累积的缩放）。
-            tokens: 上次日志以来实际处理的 padded token 数。
+            tokens: 上次日志以来全局有效监督 token 数。
+            grad_norm: 当前优化步裁剪前的全局梯度范数。
         """
         # 学习率
         lr = self.optimizer.param_groups[0]["lr"]
@@ -521,11 +761,6 @@ class TaiChuTrainer:
 
         self.last_log_time = current_time
 
-        # 梯度统计
-        grad_info = ModelInspector.gradient_summary(self.model) or {}
-        grad_norm = grad_info.get("grad_norm", 0.0)
-        grad_max = grad_info.get("grad_max", 0.0)
-
         # 获取训练阶段评估指标
         extra_metrics = self.eval_metrics.get_all_metrics(include_repr=False)
 
@@ -535,7 +770,6 @@ class TaiChuTrainer:
             "train/lr": lr,
             "train/tokens_per_sec": tokens_per_sec,
             "train/grad_norm": grad_norm,
-            "train/grad_max": grad_max,
             "train/smoothed_loss": extra_metrics.get("smoothed_loss", 0.0),
             "train/grad_norm_sq_variance_ratio": extra_metrics.get(
                 "grad_norm_sq_variance_ratio",
@@ -566,8 +800,7 @@ class TaiChuTrainer:
         # 记录到 SwanLab 和 TensorBoard（LogManager 内部已支持 TensorBoard）
         if self.swanlab_logger:
             self.swanlab_logger.log_metrics(metrics, step=self.global_step)
-        # 更新 LogManager 步数（用于 TensorBoard）
-        self.log_manager.set_step(self.global_step)
+        self.log_manager.log_metrics(metrics, step=self.global_step)
 
     @torch.no_grad()
     def _evaluate(self, generate_prompts: Optional[List[str]] = None, num_generate_tokens: int = 50) -> float:
@@ -586,7 +819,8 @@ class TaiChuTrainer:
         total_correct = 0
         total_bpb_nll_nats = 0.0
         total_bpb_bytes = 0
-        all_token_losses = []
+        max_token_loss = 0.0
+        local_token_losses = []
 
         # 生成测试的提示词列表
         if generate_prompts is None:
@@ -602,28 +836,45 @@ class TaiChuTrainer:
 
         with torch.compiler.set_stance("force_eager"):  # 临时回退到 eager 模式，完全避免 CUDA Graph 问题
             for batch in self.val_loader:
-                input_ids = batch["input_ids"].to(self.device)
-                labels = batch["labels"].to(self.device)
+                input_ids = batch["input_ids"].to(
+                    self.device,
+                    non_blocking=self.device.type == "cuda",
+                )
+                labels = batch["labels"].to(
+                    self.device,
+                    non_blocking=self.device.type == "cuda",
+                )
                 attention_mask = batch.get("attention_mask")
                 if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
+                    if batch.get("attention_mask_is_right_padded", False):
+                        attention_mask = None
+                    else:
+                        attention_mask = attention_mask.to(
+                            self.device,
+                            non_blocking=self.device.type == "cuda",
+                        )
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
                     out = self.model(
                         input_ids,
                         attention_mask=attention_mask,
                         labels=labels,
+                        return_logits=False,
+                        validate_inputs=False,
+                        return_token_statistics=True,
                     )
-                    logits = getattr(out, "logits", None)
 
                 if out.loss is None or not torch.isfinite(out.loss):
                     raise RuntimeError("model returned a non-finite validation loss")
-                if logits is None:
-                    raise RuntimeError("model did not return logits for validation")
+                if out.token_losses is None or out.correct_predictions is None:
+                    raise RuntimeError(
+                        "model did not return token statistics for validation"
+                    )
 
-                stats = ValidationMetrics.compute_token_statistics(
-                    logits,
+                stats = ValidationMetrics.compute_token_statistics_from_losses(
+                    out.token_losses,
                     labels,
+                    correct_count=int(out.correct_predictions.item()),
                     tokenizer=self.tokenizer,
                 )
                 total_nll_nats += stats.nll_nats
@@ -631,8 +882,9 @@ class TaiChuTrainer:
                 total_correct += stats.correct_count
                 total_bpb_nll_nats += stats.bpb_nll_nats
                 total_bpb_bytes += stats.bpb_bytes
+                max_token_loss = max(max_token_loss, stats.max_token_loss)
                 if stats.token_losses.numel() > 0:
-                    all_token_losses.append(stats.token_losses)
+                    local_token_losses.append(stats.token_losses)
 
                 accum_nll += stats.nll_nats
                 accum_tokens += stats.token_count
@@ -698,6 +950,16 @@ class TaiChuTrainer:
             total_correct = int(total_correct_float)
             total_bpb_bytes = int(total_bpb_bytes_float)
             total_batches = int(total_batches_float)
+            max_loss_device = torch.tensor(
+                max_token_loss,
+                dtype=torch.float64,
+                device=self.device,
+            )
+            torch.distributed.all_reduce(
+                max_loss_device,
+                op=torch.distributed.ReduceOp.MAX,
+            )
+            max_token_loss = float(max_loss_device.item())
         else:
             total_batches = batch_cnt
 
@@ -714,32 +976,62 @@ class TaiChuTrainer:
         )
 
         local_losses = (
-            torch.cat(all_token_losses)
-            if all_token_losses
-            else torch.empty(0, dtype=torch.float64)
+            torch.cat(local_token_losses)
+            if local_token_losses
+            else torch.empty(0, dtype=torch.float32)
         )
+        del local_token_losses
         if distributed:
-            gathered_losses = [
-                torch.empty(0, dtype=torch.float64)
-                for _ in range(torch.distributed.get_world_size())
-            ]
-            torch.distributed.all_gather_object(
-                gathered_losses,
-                local_losses.cpu(),
+            gathered_losses = (
+                [None] * torch.distributed.get_world_size()
+                if self.global_rank == 0
+                else None
             )
-            local_losses = torch.cat(gathered_losses)
-        percentile_metrics = ValidationMetrics.compute_percentile_ce(
-            local_losses,
-            percentiles=[0.5, 0.9, 0.95],
-        )
+            torch.distributed.gather_object(
+                local_losses,
+                object_gather_list=gathered_losses,
+                dst=0,
+            )
+            percentile_error = None
+            if self.global_rank == 0:
+                try:
+                    exact_losses = torch.cat(gathered_losses)
+                    percentile_metrics = ValidationMetrics.compute_percentile_ce(
+                        exact_losses,
+                        percentiles=[0.5, 0.9, 0.95],
+                    )
+                except Exception as exc:
+                    percentile_error = f"{type(exc).__name__}: {exc}"
+                    percentile_metrics = {
+                        "ce_p50": None,
+                        "ce_p90": None,
+                        "ce_p95": None,
+                    }
+            else:
+                percentile_metrics = {
+                    "ce_p50": None,
+                    "ce_p90": None,
+                    "ce_p95": None,
+                }
+            status = [percentile_error]
+            torch.distributed.broadcast_object_list(status, src=0)
+            torch.distributed.barrier()
+            if status[0] is not None:
+                raise RuntimeError(
+                    f"distributed percentile aggregation failed: {status[0]}"
+                )
+        else:
+            percentile_metrics = ValidationMetrics.compute_percentile_ce(
+                local_losses,
+                percentiles=[0.5, 0.9, 0.95],
+            )
 
         empty_prefix_metrics = {
             "empty_prefix_eos_ce": None,
             "empty_prefix_eos_ppl": None,
         }
         if self.compute_empty_prefix_eos_ppl:
-            raw_model = self.model.module if hasattr(self.model, 'module') else self.model
-            assert isinstance(raw_model, nn.Module)
+            raw_model = unwrap_model(self.model)
             empty_prefix_metrics = (
                 ValidationMetrics.compute_empty_prefix_eos_metrics(
                     raw_model,
@@ -757,6 +1049,7 @@ class TaiChuTrainer:
                 f"Step {self.global_step} - val/loss={avg_loss:.4f} | "
                 f"val/ppl={ppl_text} | val/bpb={bpb_text} | "
                 f"val/acc={avg_accuracy:.4f} | val/tokens={total_tokens} | "
+                f"val/ce_max={max_token_loss:.4f} | "
                 f"val/ce_p50={percentile_metrics['ce_p50']:.4f} | "
                 f"val/ce_p90={percentile_metrics['ce_p90']:.4f}"
             )
@@ -767,34 +1060,36 @@ class TaiChuTrainer:
                 log_msg += f" | val/empty_prefix_eos_ppl={empty_prefix_ppl:.2f}"
             self.log_manager.logger.info(log_msg)
 
+            val_metrics = {
+                "val/loss": avg_loss,
+                "val/accuracy": avg_accuracy,
+                "val/tokens": total_tokens,
+                "val/target_bytes": total_bpb_bytes,
+                "val/batches": total_batches,
+                "val/ce_max_exact": max_token_loss,
+                **{f"val/{k}": v for k, v in percentile_metrics.items()},
+            }
+            if avg_ppl is not None:
+                val_metrics["val/perplexity"] = avg_ppl
+            if val_bpb is not None:
+                val_metrics["val/bpb"] = val_bpb
+            for name, value in empty_prefix_metrics.items():
+                if value is not None:
+                    val_metrics[f"val/{name}"] = value
             if self.swanlab_logger:
-                val_metrics = {
-                    "val/loss": avg_loss,
-                    "val/accuracy": avg_accuracy,
-                    "val/tokens": total_tokens,
-                    "val/target_bytes": total_bpb_bytes,
-                    "val/batches": total_batches,
-                    **{f"val/{k}": v for k, v in percentile_metrics.items()}
-                }
-                if avg_ppl is not None:
-                    val_metrics["val/perplexity"] = avg_ppl
-                if val_bpb is not None:
-                    val_metrics["val/bpb"] = val_bpb
-                for name, value in empty_prefix_metrics.items():
-                    if value is not None:
-                        val_metrics[f"val/{name}"] = value
                 self.swanlab_logger.log_metrics(val_metrics, step=self.global_step)
+            self.log_manager.log_metrics(val_metrics, step=self.global_step)
 
         # 生成测试文本（与原有逻辑一致）
         if self.global_rank == 0 and generate_prompts:
-            raw_model = self.model.module if hasattr(self.model, 'module') else self.model
-            raw_model.eval() # type: ignore
+            raw_model = unwrap_model(self.model)
+            raw_model.eval()
             with torch.compiler.set_stance("force_eager"):
                 for idx, prompt in enumerate(generate_prompts):
                     encoding = self.tokenizer.encode(prompt, add_special_tokens=False)
                     prompt_ids = encoding.ids
                     input_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-                    generated_ids = raw_model.generate( # type: ignore
+                    generated_ids = raw_model.generate(
                         input_ids=input_tensor,
                         max_new_tokens=num_generate_tokens,
                         temperature=0.8,
@@ -811,16 +1106,77 @@ class TaiChuTrainer:
                             f"generation/prompt_{idx}", generated_text, step=self.global_step
                         )
 
+        if torch.distributed.is_initialized() and generate_prompts:
+            torch.distributed.barrier()
         self.model.train()
         return avg_loss
+
+
+def _warmup_compiled_training(
+    model: nn.Module,
+    *,
+    device: torch.device,
+    vocab_size: int,
+    batch_size: int,
+    sequence_length: int,
+    use_amp: bool,
+    dtype: torch.dtype,
+) -> None:
+    """Compile the forward/backward graph before DDP training starts."""
+    if batch_size <= 0 or sequence_length < 2:
+        raise ValueError("compile warmup requires a non-empty training shape")
+    if vocab_size <= 0:
+        raise ValueError("compile warmup requires a positive vocabulary size")
+
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = (
+        torch.cuda.get_rng_state_all()
+        if device.type == "cuda"
+        else None
+    )
+    model.train()
+    try:
+        input_ids = torch.randint(
+            0,
+            vocab_size,
+            (batch_size, sequence_length),
+            dtype=torch.long,
+            device=device,
+        )
+        labels = input_ids.clone()
+        with torch.enable_grad():
+            with autocast(
+                device_type=device.type,
+                enabled=use_amp,
+                dtype=dtype,
+            ):
+                out = model(
+                    input_ids,
+                    labels=labels,
+                    return_logits=False,
+                    validate_inputs=False,
+                )
+                if out.loss_sum is None:
+                    raise RuntimeError(
+                        "compile warmup did not produce a loss sum"
+                    )
+            out.loss_sum.backward()
+    finally:
+        model.zero_grad(set_to_none=True)
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
 
 
 def main() -> None:
     """主函数：解析参数、构建配置、启动训练。"""
     # 设置 CUDA 内存分配策略，减少显存碎片
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    # TF32加速
-    torch.set_float32_matmul_precision('highest')
+    # FP32 矩阵乘使用 TF32（仅 CUDA 生效）；最高精度会关闭该加速。
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     # 编译后端不可用（如 CPU 缺少 OpenCL 时首次编译抛 InductorError）时自动回退 eager，
     # 避免训练进程在首次前向时中断
     torch._dynamo.config.suppress_errors = True
@@ -858,6 +1214,30 @@ def main() -> None:
     parser.add_argument("--save_interval", type=int, default=None, help="覆盖常规检查点保存间隔（步数）")
     parser.add_argument("--eval_interval", type=int, default=None, help="覆盖验证间隔（步数）")
     parser.add_argument("--log_interval", type=int, default=None, help="覆盖训练日志打印间隔（步数）")
+    parser.add_argument(
+        "--compile_model",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖是否启用 torch.compile",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        choices=[
+            "auto",
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        ],
+        default=None,
+        help="覆盖 torch.compile 优化模式",
+    )
+    parser.add_argument(
+        "--compile_dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 torch.compile 动态形状模式",
+    )
     parser.add_argument("--peak_flops", type=float, default=None,
                         help="GPU 理论峰值算力（FLOPs/秒），用于 MFU 计算；默认按 GPU 型号自动识别")
 
@@ -936,6 +1316,12 @@ def main() -> None:
         pretrain_cfg.evaluating.eval_interval = args.eval_interval
     if args.log_interval is not None:
         pretrain_cfg.training.log_interval = args.log_interval
+    if args.compile_model is not None:
+        pretrain_cfg.training.compile_model = args.compile_model
+    if args.compile_mode is not None:
+        pretrain_cfg.training.compile_mode = args.compile_mode
+    if args.compile_dynamic is not None:
+        pretrain_cfg.training.compile_dynamic = args.compile_dynamic
 
     # 覆盖早停配置
     if args.early_stop_enabled is not None:
@@ -957,11 +1343,15 @@ def main() -> None:
     global_rank = int(os.environ.get("RANK", local_rank if world_size > 1 else 0))
     if world_size > 1:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
+        timeout_minutes = pretrain_cfg.training.distributed_timeout_minutes
+        if timeout_minutes <= 0:
+            raise ValueError("distributed_timeout_minutes must be positive")
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(
                 backend=backend,
                 rank=global_rank,
                 world_size=world_size,
+                timeout=timedelta(minutes=timeout_minutes),
             )
         world_size = torch.distributed.get_world_size()
         global_rank = torch.distributed.get_rank()
@@ -976,6 +1366,10 @@ def main() -> None:
     experiment_name = pretrain_cfg.training.experiment_name  # 从 YAML 读取，可能为空
     model_name = model_cfg.model_name
     experiment_dir = get_experiment_dir(base_output_dir, experiment_name, model_name)
+    if torch.distributed.is_initialized():
+        experiment_dirs = [experiment_dir if global_rank == 0 else None]
+        torch.distributed.broadcast_object_list(experiment_dirs, src=0)
+        experiment_dir = str(experiment_dirs[0])
 
     # 创建子目录
     best_dir = os.path.join(experiment_dir, "best_models")
@@ -1003,23 +1397,73 @@ def main() -> None:
     if is_main:
         log_manager.info(f"模型配置: {model_cfg.model_name}")
 
+    compiled_model = False
     if pretrain_cfg.training.compile_model:
-        # 后端不可用（如缺少 OpenCL 的 CPU 环境）时自动回退到 eager 运行
-        try:
-            model = torch.compile(model, dynamic=True, mode="reduce-overhead")
-            if is_main:
-                log_manager.info(
-                    "已启用 torch.compile 动态编译优化（后端不可用时首次前向自动回退 eager）"
-                )
-        except Exception:
+        compile_available, compile_reason = training_compile_preflight()
+        if not compile_available:
             if is_main:
                 log_manager.warning(
-                    "torch.compile 初始化失败，已回退到 eager 模式运行（不影响训练正确性）"
+                    f"跳过 torch.compile：{compile_reason}"
                 )
+        else:
+            try:
+                model = compile_model_for_training(
+                    model,
+                    mode=pretrain_cfg.training.compile_mode,
+                    dynamic=pretrain_cfg.training.compile_dynamic,
+                    distributed=world_size > 1,
+                )
+                compiled_model = True
+                if is_main:
+                    log_manager.info(
+                        "已启用 torch.compile: "
+                        f"mode={pretrain_cfg.training.compile_mode}, "
+                        f"dynamic={pretrain_cfg.training.compile_dynamic}"
+                    )
+            except Exception:
+                if is_main:
+                    log_manager.warning(
+                        "torch.compile 初始化失败，已回退到 eager 模式"
+                    )
+
+    if compiled_model:
+        if is_main:
+            log_manager.info("正在预编译训练图（forward + backward）...")
+        _warmup_compiled_training(
+            model,
+            device=device,
+            vocab_size=model_cfg.vocab_size,
+            batch_size=pretrain_cfg.training.batch_size,
+            sequence_length=pretrain_cfg.data.packing.max_seq_length,
+            use_amp=(
+                pretrain_cfg.training.use_mixed_precision
+                and torch.cuda.is_available()
+            ),
+            dtype=(
+                torch.bfloat16
+                if pretrain_cfg.training.dtype == "bfloat16"
+                else torch.float16
+            ),
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        if world_size > 1:
+            if torch.cuda.is_available():
+                torch.distributed.barrier(device_ids=[local_rank])
+            else:
+                torch.distributed.barrier()
+        if is_main:
+            log_manager.info("训练图预编译完成，开始构建 DDP")
 
     # 封装 DDP
     if world_size > 1:
-        ddp_kwargs = {"device_ids": [local_rank]} if torch.cuda.is_available() else {}
+        ddp_kwargs = (
+            {"device_ids": [local_rank], "gradient_as_bucket_view": True}
+            if torch.cuda.is_available()
+            else {"gradient_as_bucket_view": True}
+        )
+        if model_cfg.ffn_type == "moe":
+            ddp_kwargs["find_unused_parameters"] = True
         model = nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
 
     # 打印参数量（仅主进程）
@@ -1099,7 +1543,8 @@ def main() -> None:
         )
 
     # 11. 优化器
-    optimizer = model.configure_optimizers(pretrain_cfg.optimizer)
+    raw_model_for_optim = unwrap_model(model)
+    optimizer = raw_model_for_optim.configure_optimizers(pretrain_cfg.optimizer)
 
     warmup_ratio = pretrain_cfg.scheduler.warmup_ratio
     warmup_steps = max(1, int(max_steps * warmup_ratio))
@@ -1148,10 +1593,12 @@ def main() -> None:
     )
 
     # 13. 混合精度
-    use_amp = pretrain_cfg.training.use_mixed_precision and torch.cuda.is_available()
-    if use_amp and not torch.cuda.is_available():
+    requested_amp = pretrain_cfg.training.use_mixed_precision
+    use_amp = requested_amp and torch.cuda.is_available()
+    if requested_amp and not torch.cuda.is_available():
         log_manager.warning("CUDA 不可用，已自动禁用混合精度训练")
-    scaler = GradScaler('cuda', enabled=use_amp) if use_amp else GradScaler('cpu', enabled=False)
+    scaler_enabled = use_amp and pretrain_cfg.training.dtype == "float16"
+    scaler = GradScaler("cuda", enabled=scaler_enabled)
 
     # 14. 检查点管理器
     checkpoint_manager = CheckpointManager(
@@ -1216,7 +1663,8 @@ def main() -> None:
             scaler=scaler,
             map_location=str(device),
         )
-        scheduler.last_epoch = resume_step - 1 if resume_step > 0 else -1
+        if resume_step > 0 and "scheduler_state_dict" not in checkpoint:
+            scheduler.last_epoch = resume_step
         if checkpoint.get("data_state") is not None:
             data_state = DataState.from_dict(checkpoint["data_state"])
         log_manager.info(f"恢复至全局步数: {resume_step}")
@@ -1269,6 +1717,7 @@ def main() -> None:
             pretrain_cfg.evaluating.empty_prefix_eos_ppl
         ),
         data_state=data_state,
+        compiled_model=compiled_model,
     )
     if best_val_loss_restored is not None:
         trainer.best_val_loss = best_val_loss_restored

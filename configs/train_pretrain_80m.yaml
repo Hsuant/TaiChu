@@ -5,8 +5,8 @@
 # Data budget:
 #   Target tokens: 4.0B
 #   Filtered UTF-8 text: ~16GB
-#   Binary token shards: ~7-10GB
-#   Packed validation: ~0.2-0.4GB
+#   Binary token shards: ~30GB
+#   Validation shards: ~0.6GB
 #
 # Data loading:
 #   Indexed binary shards
@@ -58,11 +58,11 @@ tokenizer:
 data:
   schema_version: 1
   task_type: pretraining
-  dataset_id: taichu-80m-pretraining-v1
+  dataset_id: taichu-pretraining-v1
   storage:
     format: binary_mmap
-    train_path: "./data/unified/taichu_80m/train"
-    validation_path: "./data/unified/taichu_80m/validation"
+    train_path: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m/train"
+    validation_path: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m/validation"
     num_workers: 2
     prefetch_factor: 2
   sampling:
@@ -90,124 +90,85 @@ data:
 # ------------------------------------------------------------
 
 training:
-
   # Token budget
   target_tokens: "4B"
-
   # Batch configuration
-  batch_size: 8
-
-  gradient_accumulation_steps: 32
-
+  batch_size: 1
+  gradient_accumulation_steps: 4
 
   # Checkpoint and logging
-
   save_interval: 1000
   log_interval: 10
-
   output_dir: "./experiments/small_models"
-
   experiment_name: "taichu_80m_pretrain_v1"
 
-
   # Numerical precision
-
   use_mixed_precision: true
-
   dtype: "bfloat16"
-
   max_grad_norm: 1.0
 
-
   # Reproducibility
-
   seed: 42
-
   local_rank: -1
 
-
   # Model optimization
-
+  # DDP-compatible compile. "default" avoids rank-local max-autotune,
+  # whose first-use latency can exceed the NCCL watchdog timeout.
   compile_model: true
+  compile_mode: "default"
+  compile_dynamic: true
 
+  # Allow initial graph compilation and dynamic-shape recompilation to
+  # finish before DDP declares a collective timeout (PyTorch default: 10m).
+  distributed_timeout_minutes: 30
 
   # DataLoader runtime configuration
   # Passed explicitly to TaiChuDataLoaderFactory.create().
-
   dataloader:
-
     pin_memory: true
-
-    persistent_workers: false
-
+    persistent_workers: true
     drop_last: true
-
 
 # ------------------------------------------------------------
 # 6. Evaluation Configuration
 # ------------------------------------------------------------
 
 evaluating:
-
-  batch_size: 8
-
+  batch_size: 4
   eval_interval: 500
-
   log_interval: 10
-
   empty_prefix_eos_ppl: false
 
-
   prompts:
-
     - "清晨，阳光透过窗户洒进房间，小明起床后"
-
     - "On a quiet morning, Sarah walked into the garden and"
-
 
   num_generate_tokens: 32
 
-
   # Evaluation DataLoader runtime configuration
-
   dataloader:
-
     pin_memory: true
-
     persistent_workers: false
-
     drop_last: false
-
 
 # ------------------------------------------------------------
 # 7. Early Stopping
 # ------------------------------------------------------------
 
 early_stopping:
-
   enabled: false
-
   monitor: "val_loss"
-
   patience: 5
-
   min_delta: 1.0e-4
-
   mode: "min"
-
 
 # ------------------------------------------------------------
 # 8. SwanLab
 # ------------------------------------------------------------
 
 swanlab:
-
   use_swanlab: false
-
   swanlab_project: "TaiChu-Small"
-
   swanlab_experiment_name: "taichu_80m"
-
   swanlab_log_dir: "./swanlogs"
-
   swanlab_mode: "local"

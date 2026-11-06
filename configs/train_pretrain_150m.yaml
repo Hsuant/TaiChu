@@ -63,6 +63,8 @@ training:
   seed: 42
   local_rank: -1
   compile_model: true
+  compile_mode: "auto"
+  compile_dynamic: true
   max_grad_norm: 1.0
 
 evaluating:

@@ -107,6 +107,19 @@ class LogManager:
         """
         self.step = step
 
+    def log_metrics(
+        self,
+        metrics: Dict[str, float],
+        step: Optional[int] = None,
+    ) -> None:
+        """Write a metric dictionary to TensorBoard without duplicate log lines."""
+        if self.writer is None:
+            return
+        resolved_step = self.step if step is None else step
+        for tag, value in metrics.items():
+            if isinstance(value, (int, float)):
+                self.writer.add_scalar(tag, value, resolved_step)
+
     def log_scalar(self, tag: str, value: float, step: Optional[int] = None) -> None:
         """记录标量到 TensorBoard 并输出 INFO 日志。
 

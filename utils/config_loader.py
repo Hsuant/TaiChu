@@ -44,7 +44,7 @@ class DataLoaderRuntimeConfig:
     """Runtime options forwarded to TaiChuDataLoaderFactory.create()."""
 
     pin_memory: bool = True
-    persistent_workers: bool = False
+    persistent_workers: bool = True
     drop_last: bool | None = None
 
 
@@ -63,6 +63,9 @@ class TrainingConfig:
     seed: int = 42
     local_rank: int = -1  # 由环境变量自动填充
     compile_model: bool = True
+    compile_mode: str = "auto"
+    compile_dynamic: bool = True
+    distributed_timeout_minutes: int = 30
     max_grad_norm: float = 1.0
     dataloader: DataLoaderRuntimeConfig = field(
         default_factory=lambda: DataLoaderRuntimeConfig(drop_last=True)

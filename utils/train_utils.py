@@ -4,6 +4,8 @@
 """
 
 import os
+import shutil
+import sys
 from datetime import datetime
 
 import math
@@ -253,3 +255,59 @@ def get_experiment_dir(base_dir: str, experiment_name: str = "", model_name: str
         if not os.path.exists(new_dir):
             return new_dir
         counter += 1
+
+
+def compile_model_for_training(
+    model: torch.nn.Module,
+    *,
+    mode: str = "auto",
+    dynamic: bool = True,
+    distributed: bool = False,
+) -> torch.nn.Module:
+    """Compile a training model with a stable, explicit resource policy."""
+    supported_modes = {
+        "auto",
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    }
+    if mode not in supported_modes:
+        raise ValueError(
+            f"unsupported compile mode {mode!r}; expected one of "
+            f"{sorted(supported_modes)}"
+        )
+    resolved_mode = mode
+    if mode == "auto":
+        if distributed:
+            # Rank-local max-autotune can leave one DDP rank waiting on a
+            # collective for longer than the NCCL watchdog timeout.
+            resolved_mode = "default"
+        elif torch.cuda.is_available():
+            resolved_mode = (
+                "max-autotune-no-cudagraphs"
+                if dynamic
+                else "reduce-overhead"
+            )
+        else:
+            resolved_mode = "default"
+    return torch.compile(
+        model,
+        mode=resolved_mode,
+        dynamic=dynamic,
+        fullgraph=False,
+    )
+
+
+def training_compile_preflight() -> tuple[bool, str | None]:
+    """Check whether local torch.compile can build training kernels."""
+    if not hasattr(torch, "compile"):
+        return False, "torch.compile is unavailable"
+    if torch.cuda.is_available():
+        return True, None
+    if sys.platform == "win32" and shutil.which("cl") is None:
+        return (
+            False,
+            "Windows CPU torch.compile requires MSVC cl in PATH",
+        )
+    return True, None

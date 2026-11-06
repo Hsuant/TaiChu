@@ -129,7 +129,7 @@ input_ids
 
 | 规格 | 实际参数量 | Hidden | Layers | Q / KV Heads | FFN | 目标 Token |
 |---|---:|---:|---:|---:|---:|---:|
-| **80M** | 77,611,520 | 512 | 16 | 8 / 2 | 2,048 | 4.0B |
+| **80M** | 80,757,248 | 512 | 16 | 8 / 2 | 2,176 | 4.0B |
 | **150M** | 149,057,280 | 768 | 18 | 12 / 4 | 2,304 | 5.2B |
 | **190M** | 191,394,816 | 1,024 | 14 | 16 / 4 | 2,816 | 7.0B |
 
@@ -253,6 +253,26 @@ python -m trainer.train_pretrain `
 ```powershell
 python -m trainer.train_pretrain --help
 ```
+
+`torch.compile` 默认使用 `auto` 模式：单卡 CUDA 动态形状走
+`max-autotune-no-cudagraphs`，多卡 DDP 与 CPU 走 `default`。多卡时避免
+rank 本地自动调优长时间阻塞 NCCL collective。可用以下参数覆盖：
+
+```powershell
+--compile_model --compile_mode auto --compile_dynamic
+--no-compile_model
+```
+
+Windows CPU 编译需要 MSVC `cl`；缺少编译器时训练器会在启动阶段直接回退
+eager，避免在首个训练步反复尝试编译。
+
+多卡训练默认将进程组 `timeout` 设为 30 分钟，可通过预训练配置的
+`training.distributed_timeout_minutes` 调整，避免首次编译或动态形状
+重编译先触发 10 分钟 NCCL watchdog。启用 `torch.compile` 时，训练器会在
+包装 DDP 前用正式训练形状执行一次前向和反向，并同步所有 rank，确保编译
+不会与首个梯度 `ALLREDUCE` 交错。不要同时设置 `NCCL_P2P_DISABLE=1` 与
+`NCCL_SHM_DISABLE=1`，除非平台明确要求；后者会关闭同机共享内存通信路径，
+显著放大 rank 间速度差和超时风险。
 
 每次运行会创建独立实验目录，并生成：
 
@@ -410,7 +430,8 @@ loss = CrossEntropy(shift_logits, shift_labels, ignore_index=-100)
 | `val_perplexity` | `exp(val_loss)`，仅适合同 Tokenizer 内比较 |
 | `val_bpb` | 排除特殊 Token 后的 Bits per UTF-8 Byte |
 | `val_accuracy` | Next-Token Top-1 Accuracy |
-| `val_ce_p50/p90/p95` | 逐 Token CE 的精确分位数 |
+| `val_ce_p50/p90/p95` | 逐 Token CE 的精确线性分位数 |
+| `val_ce_max_exact` | 逐 Token CE 的精确最大值，用于发现异常长尾 |
 | `empty_prefix_eos_ce/ppl` | 可选 `[BOS, EOS]` 转移诊断，默认关闭 |
 
 无效指标返回 `None/null`，不会写入 `Infinity` 或 `NaN`。
@@ -496,9 +517,9 @@ TaiChu 的开发过程本身就是项目的一部分。以下时间线来自 Git
 | CUDA、AMP、FlashAttention 未完成实机审计 | 不能宣称 GPU 训练路径已稳定 | 在 Ampere/Hopper GPU 上复跑测试与短训练 |
 | 多卡 NCCL 未完成实机验证 | 不能宣称 DDP 稳定性 | 使用 2/4 卡 `torchrun` 做通信与恢复测试 |
 | 无 Activation Checkpointing | 低显存训练 150M/190M 受限制 | 在 Transformer Block 增加可配置重计算 |
-| Packing 未实现文档隔离 Attention | Packed 文档之间仍使用普通 Causal Mask | 使用 `document_ids` / `segment_ids` 构造块对角 Mask |
+| Packing 未实现文档隔离 Attention | 已屏蔽跨文档目标，但上下文仍需块对角 Mask 隔离 | 使用 `document_ids` / `segment_ids` 构造块对角 Mask |
 | 无下游 Benchmark | 无法评价知识、推理、代码与安全能力 | 接入 MMLU、C-Eval、HumanEval、GSM8K 等 |
-| 分布式分位数需要 gather 逐 Token Loss | 超大验证集增加 CPU 内存与通信 | 增加分块量化或可配置采样 |
+| 分布式精确分位数集中到 rank 0 | rank 0 CPU 内存随验证 token 数增长 | 超大验证集使用独立离线分位数评估 |
 | MFU 使用近似 FLOPs 公式 | 只能作为硬件效率参考 | 接入更精确的算子级 FLOP 统计 |
 | SFT/Preference/RLHF 仅完成数据契约 | 不能把 Schema 误认为算法已支持 | 分别实现训练器、Loss、Reference Model 与 Rollout |
 | Tokenizer 配置包含外部语料路径 | 直接运行生产训练会找不到数据 | 使用 `--data_files` 或维护本地配置副本 |

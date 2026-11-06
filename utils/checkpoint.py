@@ -153,7 +153,16 @@ class CheckpointManager:
         state = self._build_state(model, optimizer, scheduler, scaler, global_step, metrics, **kwargs)
         # 保存当前最佳指标值以便恢复
         state["best_metric_value"] = self.best_metric_value
-        torch.save(state, filepath)
+        temporary_path = f"{filepath}.tmp-{os.getpid()}"
+        try:
+            with open(temporary_path, "wb") as stream:
+                torch.save(state, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, filepath)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
 
         # 维护 saved_checkpoints 列表
         if managed:
