@@ -43,6 +43,17 @@ def _sequence_values(sample: Any) -> tuple[list[int], list[int], list[int], list
     raise TypeError(f"unsupported sequence batch item {type(sample).__name__}")
 
 
+def _is_right_padded(mask: list[int]) -> bool:
+    """Return whether a mask is a contiguous valid prefix followed by zeroes."""
+    zero_seen = False
+    for value in mask:
+        if value == 0:
+            zero_seen = True
+        elif zero_seen:
+            return False
+    return True
+
+
 class PretrainingBatchBuilder:
     def __init__(
         self,
@@ -90,6 +101,9 @@ class PretrainingBatchBuilder:
             "input_ids": input_ids,
             "labels": labels,
             "attention_mask": attention_mask,
+            "attention_mask_is_right_padded": all(
+                _is_right_padded(row[2]) for row in rows
+            ),
             "loss_mask": loss_mask,
             "segment_ids": aligned_segment_ids(attention_mask, segment_ids),
             "sample_ids": sample_ids,

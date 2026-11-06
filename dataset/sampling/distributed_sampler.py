@@ -65,7 +65,9 @@ class DistributedSampler:
     def __len__(self) -> int:
         if self.drop_last:
             return self.sample_count // self.world_size
-        return len(self._rank_indices())
+        if not self.pad_to_world_size:
+            return len(range(self.rank, self.sample_count, self.world_size))
+        return math.ceil(self.sample_count / self.world_size)
 
 
 __all__ = ["DistributedSampler"]

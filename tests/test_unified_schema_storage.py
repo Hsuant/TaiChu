@@ -1,6 +1,7 @@
 """Layer-one tests for unified schemas and mmap token storage."""
 from __future__ import annotations
 
+import pickle
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +134,11 @@ class TestBinaryStorage(unittest.TestCase):
                     list(range(5)),
                 )
                 self.assertEqual(reader[4].labels, None)
+                restored = pickle.loads(pickle.dumps(reader))
+                try:
+                    self.assertEqual(restored[4].sample_id, "sample-4")
+                finally:
+                    restored.close()
 
     def test_optional_arrays_and_floats_roundtrip(self):
         sample = TrajectorySample(

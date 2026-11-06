@@ -196,6 +196,7 @@ class TestSamplingPackingAndBatching(unittest.TestCase):
                 seed=7,
             )
             first = list(sampler)
+            self.assertEqual(len(sampler), 5)
             sampler.set_epoch(0)
             self.assertEqual(first, list(sampler))
             rank_values.append(first)

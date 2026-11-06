@@ -88,9 +88,14 @@ class PretrainingPacker:
                     yield emit(padded=self.pad_to_max)
                     remaining = self.max_length
                 take = min(remaining, len(sample.input_ids) - offset)
+                chunk_labels = labels[offset : offset + take]
+                chunk_documents = local_documents[offset : offset + take]
+                if buffer["document_ids"] and chunk_documents[0] != buffer["document_ids"][-1]:
+                    chunk_labels = list(chunk_labels)
+                    chunk_labels[0] = -100
                 append(buffer["sample_ids"], "sample_ids", [sample.sample_id] * take)
                 append(buffer["input_ids"], "input_ids", sample.input_ids[offset : offset + take])
-                append(buffer["labels"], "labels", labels[offset : offset + take])
+                append(buffer["labels"], "labels", chunk_labels)
                 append(
                     buffer["attention_mask"],
                     "attention_mask",
@@ -101,7 +106,7 @@ class PretrainingPacker:
                     "loss_mask",
                     [
                         int(label != -100)
-                        for label in labels[offset : offset + take]
+                        for label in chunk_labels
                     ],
                 )
                 append(
@@ -112,7 +117,7 @@ class PretrainingPacker:
                 append(
                     buffer["document_ids"],
                     "document_ids",
-                    local_documents[offset : offset + take],
+                    chunk_documents,
                 )
                 offset += take
                 if len(buffer["input_ids"]) == self.max_length:

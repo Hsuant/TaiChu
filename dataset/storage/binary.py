@@ -314,10 +314,11 @@ class BinaryDatasetReader(IndexedSampleReader):
         checksums: bool = False,
     ) -> None:
         self.path = Path(path)
+        self.checksums = bool(checksums)
         self.root = self.path if self.path.is_dir() else self.path.parent
         manifest_path = self.path if self.path.is_file() else self.root / MANIFEST_NAME
         self.manifest = DatasetManifest.load(manifest_path)
-        if checksums:
+        if self.checksums:
             self.manifest.verify(self.root, checksums=True)
         self.dataset_id = self.manifest.dataset_id
         self.sample_type = self.manifest.sample_type
@@ -369,6 +370,19 @@ class BinaryDatasetReader(IndexedSampleReader):
     def close(self) -> None:
         for shard in getattr(self, "_shards", ()):
             shard.close()
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize identity only; mmap handles must be reopened per worker."""
+        return {
+            "path": str(self.path),
+            "checksums": self.checksums,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(
+            state["path"],
+            checksums=bool(state.get("checksums", False)),
+        )
 
     def __enter__(self) -> "BinaryDatasetReader":
         return self
