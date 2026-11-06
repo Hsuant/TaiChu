@@ -1,0 +1,78 @@
+# Deterministic raw-JSONL sampling before dataset.offline.prepare.
+# The default 29GB raw sample is expected to yield about 28GB after cleaning.
+#
+# Usage:
+#   python -m dataset.offline.sample_sources `
+#     --config configs/sample_pretrain_mix.yaml
+#
+# Scale the same ratios for the smaller presets:
+#   --target-gb 17 --output-dir data/raw/taichu_80m
+#   --target-gb 22 --output-dir data/raw/taichu_150m
+
+target_total_gb: 29.0
+output_dir: "./data/raw/taichu_190m"
+seed: 42
+validation_fraction: 0.02
+min_chars: 16
+max_chars: 200000
+
+sources:
+  - name: "fineweb2_zh"
+    language: "zh"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/ch/fineweb2_cmn_hani_ch_*.jsonl"
+    weight_gb: 5.3
+
+  - name: "industrycorpus_zh"
+    language: "zh"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/ch/industrycorpus_ch_*.jsonl"
+    weight_gb: 5.4
+
+  - name: "cci_hq_zh"
+    language: "zh"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/ch/comprehensice_cci_3.0_hq_ch.jsonl"
+    weight_gb: 2.9
+
+  - name: "baike_wiki_zh"
+    language: "zh"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/ch/baike_wiki_ch_*.jsonl"
+    weight_gb: 3.8
+
+  - name: "fineweb_en"
+    language: "en"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/en/fineweb_en_*.jsonl"
+    weight_gb: 2.7
+
+  - name: "fineweb_edu_en"
+    language: "en"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/en/fineweb_edu_en_*.jsonl"
+    weight_gb: 3.1
+
+  - name: "pes2o_en"
+    language: "en"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/en/pes2o_en_*.jsonl"
+    weight_gb: 1.2
+
+  - name: "automath_arxiv_en"
+    language: "en"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/en/automath_arxiv_en_*.jsonl"
+    weight_gb: 1.1
+
+  - name: "automath_code_en"
+    language: "en"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/en/automath_code_en_*.jsonl"
+    weight_gb: 1.2
+
+  - name: "baike_wiki_en"
+    language: "en"
+    patterns:
+      - "E:/Academic/Datasets/TaiChu/Pretrain/en/baike_wiki_en.jsonl"
+    weight_gb: 2.3

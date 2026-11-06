@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from dataset.config import UnifiedDataConfig
 from dataset.offline.config import load_preparation_config
 from dataset.offline.prepare import UnifiedDataPreparation
+from dataset.offline.readers import RecordSourceReader
 from dataset.storage import BinaryDatasetReader
 
 
@@ -27,7 +28,15 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def write_config(path: Path, output: Path, train: Path, validation: Path) -> None:
+def write_config(
+    path: Path,
+    output: Path,
+    train: Path,
+    validation: Path,
+    *,
+    batch_size: int = 256,
+    workers: int = 1,
+) -> None:
     path.write_text(
         "\n".join(
             [
@@ -45,6 +54,8 @@ def write_config(path: Path, output: Path, train: Path, validation: Path) -> Non
                 "add_eos: true",
                 "invalid_policy: error",
                 "shard_size: 2",
+                f"preprocess_batch_size: {batch_size}",
+                f"preprocess_workers: {workers}",
                 "cleaning:",
                 "  unicode_form: NFC",
                 "  min_chars: 2",
@@ -66,6 +77,20 @@ def write_config(path: Path, output: Path, train: Path, validation: Path) -> Non
 
 
 class TestUnifiedOfflinePreparation(unittest.TestCase):
+    def test_reader_reports_processed_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.jsonl"
+            write_jsonl(source, [{"text": "first"}, {"text": "second"}])
+            observed = []
+            records = list(
+                RecordSourceReader().read(
+                    source,
+                    progress_callback=observed.append,
+                )
+            )
+            self.assertEqual(len(records), 2)
+            self.assertEqual(sum(observed), source.stat().st_size)
+
     def test_raw_jsonl_to_binary_dataset(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -128,6 +153,45 @@ class TestUnifiedOfflinePreparation(unittest.TestCase):
             with BinaryDatasetReader(output / "train") as reader:
                 self.assertEqual(len(reader), 2)
 
+    def test_parallel_preparation_writes_binary_dataset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = root / "train.jsonl"
+            validation = root / "validation.jsonl"
+            write_jsonl(
+                train,
+                [{"text": f"training document {index}"} for index in range(8)],
+            )
+            write_jsonl(validation, [{"text": "validation document"}])
+            output = root / "prepared"
+            config_path = root / "prepare.yaml"
+            write_config(
+                config_path,
+                output,
+                train,
+                validation,
+                batch_size=2,
+                workers=2,
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "dataset.offline.prepare",
+                    "--config",
+                    str(config_path),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("RuntimeWarning", result.stderr)
+            with BinaryDatasetReader(output / "train") as reader:
+                self.assertEqual(len(reader), 8)
+
     def test_cli_help_is_available(self):
         result = subprocess.run(
             [
@@ -144,6 +208,8 @@ class TestUnifiedOfflinePreparation(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--config", result.stdout)
+        self.assertIn("--restart", result.stdout)
+        self.assertNotIn("RuntimeWarning", result.stderr)
 
 
 class TestUnifiedConfigurationFiles(unittest.TestCase):

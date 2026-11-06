@@ -21,8 +21,8 @@ data:
   dataset_id: taichu-smoke-v1
   storage:
     format: binary_mmap
-    train_path: "./data/unified/smoke/train"
-    validation_path: "./data/unified/smoke/validation"
+    train_path: "./data/unified/sample/train"
+    validation_path: "./data/unified/sample/validation"
     num_workers: 0
     prefetch_factor: 2
   sampling:

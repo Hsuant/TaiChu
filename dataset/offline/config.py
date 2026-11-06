@@ -45,6 +45,8 @@ class PreparationConfig:
     truncation: str = "left"
     invalid_policy: str = "error"
     shard_size: int = 50_000
+    preprocess_batch_size: int = 256
+    preprocess_workers: int = 1
     cleaning: CleaningConfig = field(default_factory=CleaningConfig)
 
     def __post_init__(self) -> None:
@@ -66,6 +68,10 @@ class PreparationConfig:
             raise ValueError("invalid_policy must be error or skip")
         if self.shard_size <= 0:
             raise ValueError("shard_size must be positive")
+        if self.preprocess_batch_size <= 0:
+            raise ValueError("preprocess_batch_size must be positive")
+        if self.preprocess_workers <= 0:
+            raise ValueError("preprocess_workers must be positive")
 
 
 def load_preparation_config(path: str | Path) -> PreparationConfig:

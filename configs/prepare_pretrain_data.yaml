@@ -1,36 +1,100 @@
-# Raw text -> cleaned text -> typed sample -> tokenized binary shards.
-# Run from the project root:
+# =============================================================================
+# 预训练数据离线处理配置
+#
+# 处理流程：原始文本 -> 清洗文本 -> 类型化样本 -> 分片二进制
+# 运行方式（在项目根目录执行）：
 #   python -m dataset.offline.prepare --config configs/prepare_pretrain_data.yaml
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# 基本信息（写入样本元数据与最终 Manifest）
+# -----------------------------------------------------------------------------
+# 任务类型：pretraining（预训练）| cpt（增量预训练）
 task_type: "pretraining"
+
+# 数据集唯一标识
 dataset_id: "taichu-pretraining-v1"
+
+# 数据集版本号；修改数据内容后请同步升级
 version: "1"
 
+# -----------------------------------------------------------------------------
+# 路径配置
+# -----------------------------------------------------------------------------
+# Tokenizer 文件路径，用于将清洗后文本编码为 token IDs
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
-output_dir: "./data/unified/taichu_80m"
 
+# 统一二进制数据集输出目录（清洗 + tokenize 后）；目录已存在时不会覆盖
+output_dir: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m"
+
+# -----------------------------------------------------------------------------
+# 样本字段与序列长度
+# -----------------------------------------------------------------------------
+# JSONL 记录中保存文本内容的字段名
 text_column: "text"
+
+# 单条样本最大 token 数；超出部分在 tokenize 后截断
 max_seq_length: 2048
 
+# -----------------------------------------------------------------------------
+# 特殊 Token（以下三个均必须存在于 Tokenizer 词表中）
+# -----------------------------------------------------------------------------
+# Padding token
 pad_token: "<|pad|>"
+# 序列起始 / 结束 token；是否实际添加由下方 add_bos / add_eos 控制
 bos_token: "<|taichu_start|>"
 eos_token: "<|taichu_end|>"
+
+# 是否在样本首 / 尾添加 BOS / EOS
 add_bos: true
 add_eos: true
+
+# -----------------------------------------------------------------------------
+# 分片与异常处理
+# -----------------------------------------------------------------------------
+# 非法样本处理策略：error（立即报错）| skip（跳过并继续处理）
 invalid_policy: "error"
+
+# 每个 tcbin/tcidx 分片最多写入的样本数
 shard_size: 50000
 
+# tokenizer 批处理大小；增大可提高吞吐，但会占用更多内存
+preprocess_batch_size: 256
+
+# tokenizer 并行进程数；建议设为物理核心数以内，设置为 1 时关闭多进程
+preprocess_workers: 4
+
+# -----------------------------------------------------------------------------
+# 文本清洗与去重
+# -----------------------------------------------------------------------------
 cleaning:
+  # Unicode 标准化形式：NFC 保留兼容字符；NFKC 会进一步合并兼容字符
   unicode_form: "NFC"
+
+  # 清洗后允许保留的字符数区间；低于 min_chars 剔除，超过 max_chars 按 oversize_policy 处理
   min_chars: 16
   max_chars: 200000
-  collapse_whitespace: false
-  remove_control_chars: true
+
+  # 超长文本处理策略：skip 丢弃超长记录 | truncate 截断到 max_chars
   oversize_policy: "skip"
+
+  # 是否合并连续空格并压缩多余空行；false 保留原始空白结构
+  collapse_whitespace: false
+
+  # 是否删除控制字符（保留换行符和制表符）
+  remove_control_chars: true
+
+  # 是否启用精确文本去重（相同文本仅保留第一次出现的记录）
   deduplicate: true
 
+# -----------------------------------------------------------------------------
+# 数据来源
+#
+# - 目录下的 JSONL / JSONL.GZ / Parquet 文件都会被读取
+# - 验证集不能与训练集存在内容重叠
+# -----------------------------------------------------------------------------
 splits:
   train:
-    - "./data/raw/train"
+    - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train"
   validation:
-    - "./data/raw/validation"
+    - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation"

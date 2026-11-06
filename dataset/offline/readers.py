@@ -2,12 +2,17 @@
 from __future__ import annotations
 
 import gzip
-import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
+import orjson
+
 from ..exceptions import TaiChuDataFormatError
+
+
+ProgressCallback = Callable[[int], None]
+
 
 class RecordSourceReader:
     @staticmethod
@@ -44,24 +49,34 @@ class RecordSourceReader:
                 "use JSONL, JSONL.GZ or Parquet"
             )
 
-    def read(self, path: str | Path) -> Iterator[dict[str, Any]]:
+    def read(
+        self,
+        path: str | Path,
+        *,
+        progress_callback: ProgressCallback | None = None,
+    ) -> Iterator[dict[str, Any]]:
         source = Path(path)
         self._check(source)
         if source.suffix.lower() == ".parquet":
-            yield from self._read_parquet(source)
+            yield from self._read_parquet(source, progress_callback)
         else:
-            yield from self._read_jsonl(source)
+            yield from self._read_jsonl(source, progress_callback)
 
     @staticmethod
-    def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
+    def _read_jsonl(
+        path: Path,
+        progress_callback: ProgressCallback | None,
+    ) -> Iterator[dict[str, Any]]:
         opener = gzip.open if path.name.lower().endswith(".gz") else open
-        with opener(path, "rt", encoding="utf-8") as stream:
+        with opener(path, "rb") as stream:
             for line_number, line in enumerate(stream, start=1):
                 if not line.strip():
+                    if progress_callback is not None:
+                        progress_callback(len(line))
                     continue
                 try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
+                    record = orjson.loads(line)
+                except orjson.JSONDecodeError as exc:
                     raise TaiChuDataFormatError(
                         f"invalid JSONL in {path} at line {line_number}"
                     ) from exc
@@ -70,16 +85,28 @@ class RecordSourceReader:
                         f"JSONL record in {path} at line {line_number} must be an object"
                     )
                 yield record
+                if progress_callback is not None:
+                    progress_callback(len(line))
 
     @staticmethod
-    def _read_parquet(path: Path) -> Iterator[dict[str, Any]]:
+    def _read_parquet(
+        path: Path,
+        progress_callback: ProgressCallback | None,
+    ) -> Iterator[dict[str, Any]]:
         try:
             import pyarrow.parquet as parquet
         except ImportError as exc:
             raise ImportError("pyarrow is required to read Parquet sources") from exc
         with parquet.ParquetFile(path) as handle:
             for batch in handle.iter_batches(use_threads=False):
-                yield from batch.to_pylist()
+                records = batch.to_pylist()
+                if not records:
+                    continue
+                step = max(1, batch.nbytes // len(records))
+                for record in records:
+                    yield record
+                    if progress_callback is not None:
+                        progress_callback(step)
 
 
 __all__ = ["RecordSourceReader"]

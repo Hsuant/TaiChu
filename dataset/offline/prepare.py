@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from tokenizers import Tokenizer
+from tqdm import tqdm
 
 from ..storage import BinarySampleWriter
 from ..tasks import get_task
@@ -28,6 +31,7 @@ from .cleaning import ExactDeduplicator, TextCleaner
 from .config import PreparationConfig, load_preparation_config
 from .readers import RecordSourceReader
 from .unified import UnifiedPreparationPipeline
+from .workers import initialize_pretraining_worker, prepare_pretraining_batch
 
 
 @dataclass(slots=True)
@@ -143,7 +147,7 @@ class UnifiedDataPreparation:
         self.reader = RecordSourceReader()
         self.cleaner = TextCleaner(config.cleaning)
 
-    def run(self) -> dict[str, Any]:
+    def run(self, *, restart: bool = False) -> dict[str, Any]:
         if self.config.output_dir.exists():
             raise FileExistsError(
                 f"preparation output already exists: {self.config.output_dir}"
@@ -152,7 +156,12 @@ class UnifiedDataPreparation:
             f".{self.config.output_dir.name}.staging"
         )
         if staging.exists():
-            raise FileExistsError(f"preparation staging already exists: {staging}")
+            if not restart:
+                raise FileExistsError(
+                    f"preparation staging already exists: {staging}; "
+                    "use --restart to discard it"
+                )
+            shutil.rmtree(staging)
         staging.mkdir(parents=True)
         split_manifests: dict[str, Any] = {}
         try:
@@ -214,10 +223,36 @@ class UnifiedDataPreparation:
                 self.adapter,
                 writer,
                 invalid_policy=self.config.invalid_policy,
+                batch_size=self.config.preprocess_batch_size,
             )
-            pipeline_stats = pipeline.run(
-                self._records(paths, split, stats, deduplicator)
+            records = self._records(paths, split, stats, deduplicator)
+            workers = min(
+                self.config.preprocess_workers,
+                os.cpu_count() or 1,
             )
+            if workers > 1 and self.config.task_type in {"pretraining", "cpt"}:
+                with ProcessPoolExecutor(
+                    max_workers=workers,
+                    initializer=initialize_pretraining_worker,
+                    initargs=(
+                        str(self.config.tokenizer_path.resolve()),
+                        self.config.pad_token,
+                        self.config.bos_token,
+                        self.config.eos_token,
+                        self.config.text_column,
+                        self.config.add_bos,
+                        self.config.add_eos,
+                        self.config.max_seq_length,
+                    ),
+                ) as executor:
+                    pipeline_stats = pipeline.run_parallel(
+                        records,
+                        executor=executor,
+                        batch_worker=prepare_pretraining_batch,
+                        max_inflight=workers * 2,
+                    )
+            else:
+                pipeline_stats = pipeline.run(records)
         manifest = writer.commit()
         stats.written_records = pipeline_stats.written_samples
         stats.rejected_records += pipeline_stats.skipped_samples
@@ -236,30 +271,58 @@ class UnifiedDataPreparation:
         deduplicator: ExactDeduplicator,
     ) -> Iterator[dict[str, Any]]:
         index = 0
-        for path in self.reader.resolve(paths):
-            for raw in self.reader.read(path):
-                stats.source_records += 1
-                record = dict(raw)
-                record.setdefault(
-                    "sample_id",
-                    f"{self.config.dataset_id}-{split}-{index:010d}",
-                )
-                record.setdefault("dataset_id", self.config.dataset_id)
-                record.setdefault("source_id", str(path))
-                index += 1
-                if self.config.task_type in {"pretraining", "cpt"}:
-                    text, _ = self.cleaner.clean(
-                        record.get(self.config.text_column)
+        files = self.reader.resolve(paths)
+        total_bytes = sum(path.stat().st_size for path in files)
+        with tqdm(
+            total=total_bytes,
+            desc=f"prepare {split}",
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1000,
+            dynamic_ncols=True,
+        ) as progress:
+            for path in files:
+                plain_jsonl = path.suffix.lower() == ".jsonl"
+                callback = progress.update if plain_jsonl else None
+                for raw in self.reader.read(
+                    path,
+                    progress_callback=callback,
+                ):
+                    stats.source_records += 1
+                    record = dict(raw)
+                    record.setdefault(
+                        "sample_id",
+                        f"{self.config.dataset_id}-{split}-{index:010d}",
                     )
-                    if text is None:
-                        stats.rejected_records += 1
-                        continue
-                    if not deduplicator.accept(text):
-                        stats.duplicate_records += 1
-                        continue
-                    record[self.config.text_column] = text
-                stats.cleaned_records += 1
-                yield record
+                    record.setdefault("dataset_id", self.config.dataset_id)
+                    record.setdefault("source_id", str(path))
+                    index += 1
+                    if self.config.task_type in {"pretraining", "cpt"}:
+                        text, _ = self.cleaner.clean(
+                            record.get(self.config.text_column)
+                        )
+                        if text is None:
+                            stats.rejected_records += 1
+                            continue
+                        if not deduplicator.accept(text):
+                            stats.duplicate_records += 1
+                            continue
+                        record[self.config.text_column] = text
+                    stats.cleaned_records += 1
+                    if stats.source_records % 1000 == 0:
+                        progress.set_postfix(
+                            kept=stats.cleaned_records,
+                            duplicate=stats.duplicate_records,
+                            rejected=stats.rejected_records,
+                        )
+                    yield record
+                if not plain_jsonl:
+                    progress.update(path.stat().st_size)
+            progress.set_postfix(
+                kept=stats.cleaned_records,
+                duplicate=stats.duplicate_records,
+                rejected=stats.rejected_records,
+            )
 
 
 def main() -> None:
@@ -267,9 +330,14 @@ def main() -> None:
         description="Prepare raw task records into unified binary storage"
     )
     parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="discard an existing incomplete staging directory before preparation",
+    )
     args = parser.parse_args()
     config = load_preparation_config(args.config)
-    manifest = UnifiedDataPreparation(config).run()
+    manifest = UnifiedDataPreparation(config).run(restart=args.restart)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 

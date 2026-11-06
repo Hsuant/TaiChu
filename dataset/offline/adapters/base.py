@@ -1,6 +1,7 @@
 """Shared offline preprocessing adapter contracts."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
 
@@ -193,6 +194,9 @@ class BasePreprocessingAdapter:
         sample.metadata.update(self.build_metadata(record, formatted))
         sample.validate()
         return sample
+
+    def prepare_batch(self, records: Iterable[Mapping[str, Any]]) -> list:
+        return [self.prepare(record) for record in records]
 
     def validate(self, record: Mapping[str, Any]) -> None:
         if not isinstance(record, Mapping):

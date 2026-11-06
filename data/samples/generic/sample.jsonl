@@ -1,5 +1,0 @@
-{"text": "你好，世界"}
-{"text": "Hello, world. This is a short sentence."}
-{"text": "这是一段比较长的文本。它包含了多个句子。我们希望测试预处理脚本能否正确打包短文本以及切分长文本。后面会再加一些内容让这个文本的token数超过最大长度限制，以验证切分逻辑。"}
-{"text": "Another short English text."}
-{"text": "短"}

@@ -1,7 +1,7 @@
 """Raw document to pretraining or continued-pretraining adapter."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ...exceptions import TaiChuDataFormatError
@@ -55,7 +55,34 @@ class PretrainingPreprocessor(BasePreprocessingAdapter):
         record: Mapping[str, Any],
         formatted: str,
     ) -> PretrainingSample:
-        ids = self.tokenizer.encode(formatted)
+        return self._sample_from_ids(
+            record,
+            formatted,
+            self.tokenizer.encode(formatted),
+        )
+
+    def prepare_batch(
+        self,
+        records: Iterable[Mapping[str, Any]],
+    ) -> list[PretrainingSample]:
+        batch = list(records)
+        formatted = []
+        for record in batch:
+            self.validate(record)
+            formatted.append(self.format(record))
+        token_rows = self.tokenizer.encode_batch(formatted)
+        return [
+            self._sample_from_ids(record, text, ids)
+            for record, text, ids in zip(batch, formatted, token_rows, strict=True)
+        ]
+
+    def _sample_from_ids(
+        self,
+        record: Mapping[str, Any],
+        formatted: str,
+        token_ids: list[int],
+    ) -> PretrainingSample:
+        ids = list(token_ids)
         if self.add_bos and self.tokenizer.bos_token_id is not None:
             ids.insert(0, self.tokenizer.bos_token_id)
         if self.add_eos and self.tokenizer.eos_token_id is not None:
