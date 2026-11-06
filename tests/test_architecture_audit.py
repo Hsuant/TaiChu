@@ -154,9 +154,9 @@ class TestTokenizerAndConfig(unittest.TestCase):
             str(ROOT / "taichu_tokenizer" / "tokenizer.json")
         )
         cases = [
-            ("TaiChu_Small_80M.yaml", "train_small_80m.yaml", 77_611_520, 4_000_000_000),
-            ("TaiChu_Small_150M.yaml", "train_small_150m.yaml", 149_057_280, 5_200_000_000),
-            ("TaiChu_Small_190M.yaml", "train_small_190m.yaml", 191_394_816, 7_000_000_000),
+            ("TaiChu_80M.yaml", "train_pretrain_80m.yaml", 80_757_248, 4_000_000_000),
+            ("TaiChu_150M.yaml", "train_pretrain_150m.yaml", 149_057_280, 5_200_000_000),
+            ("TaiChu_190M.yaml", "train_pretrain_190m.yaml", 191_394_816, 7_000_000_000),
         ]
         for model_name, train_name, expected_params, expected_tokens in cases:
             with self.subTest(model=model_name):
