@@ -73,4 +73,7 @@ nohup.out
 *.npy
 *.npz
 /reports/
-/tests/
+/tests
+
+# Modele
+/taichu
