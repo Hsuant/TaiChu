@@ -1,78 +1,144 @@
-# Deterministic raw-JSONL sampling before dataset.offline.prepare.
-# The default 29GB raw sample is expected to yield about 28GB after cleaning.
+# 原始 JSONL 预训练语料的确定性抽样配置。
 #
-# Usage:
+# 抽样阶段只按来源权重和字节预算选择记录，不执行 Tokenization、
+# 跨来源近重复去重或最终 train/validation 划分；这些工作由
+# dataset.offline.prepare 在文档级完成。
+#
+# 运行示例：
 #   python -m dataset.offline.sample_sources `
-#     --config configs/sample_pretrain_mix.yaml
-#
-# Scale the same ratios for the smaller presets:
-#   --target-gb 17 --output-dir data/raw/taichu_80m
-#   --target-gb 22 --output-dir data/raw/taichu_150m
+#     --config configs/sample_pretrain_mix.yaml `
+#     --target-gb 18 `
+#     --output-dir "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m" `
+#     --min-chars 0 `
+#     --max-chars 10000000 `
+#     --no-progress
 
+# 默认抽样目标总量，单位十进制 GB；可通过 --target-gb 覆盖。
 target_total_gb: 29.0
+
+# 抽样输出目录；生成 sampling_manifest.json、train/ 和 validation/。
 output_dir: "./data/raw/taichu_190m"
+
+# 抽样 Hash 的固定随机种子；相同输入和配置必须产生相同结果。
 seed: 42
+
+# 抽样阶段划入 validation 的记录比例；最终 split 会在处理阶段重新生成。
 validation_fraction: 0.02
+
+# 抽样阶段最小字符数；0 表示不提前删除合法短文档。
 min_chars: 16
+
+# 抽样阶段最大字符数；超过该值的记录不会进入抽样输出。
 max_chars: 200000
 
+# 十个固定数据来源；sources 的顺序同时定义来源优先级展示顺序。
 sources:
+  # 中文 FineWeb2 来源。
   - name: "fineweb2_zh"
+    # 语言标识；写入抽样 Manifest。
     language: "zh"
+    # 原始 JSONL 路径模式；支持 glob，可匹配文件或目录内容。
     patterns:
+      # 中文 FineWeb2 全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/ch/fineweb2_cmn_hani_ch_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 5.3
 
+  # 中文行业语料来源。
   - name: "industrycorpus_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文行业语料全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/ch/industrycorpus_ch_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 5.4
 
+  # 中文高质量 CCI 来源。
   - name: "cci_hq_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文 CCI 高质量语料文件。
       - "E:/Academic/Datasets/TaiChu/Pretrain/ch/comprehensice_cci_3.0_hq_ch.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 2.9
 
+  # 中文百科与 Wiki 来源。
   - name: "baike_wiki_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文百科与 Wiki 全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/ch/baike_wiki_ch_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 3.8
 
+  # 英文 FineWeb 来源。
   - name: "fineweb_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文 FineWeb 全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/en/fineweb_en_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 2.7
 
+  # 英文 FineWeb-Edu 来源。
   - name: "fineweb_edu_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文 FineWeb-Edu 全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/en/fineweb_edu_en_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 3.1
 
+  # 英文 PES2O 来源，短文档较多。
   - name: "pes2o_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文 PES2O 全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/en/pes2o_en_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 1.2
 
+  # 英文数学论文来源。
   - name: "automath_arxiv_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文数学论文全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/en/automath_arxiv_en_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 1.1
 
+  # 英文数学与代码来源。
   - name: "automath_code_en"
+    # 语言标识；代码数据需要单独统计。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文数学与代码全部分片。
       - "E:/Academic/Datasets/TaiChu/Pretrain/en/automath_code_en_*.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 1.2
 
+  # 英文百科与 Wiki 来源。
   - name: "baike_wiki_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文百科与 Wiki 文件。
       - "E:/Academic/Datasets/TaiChu/Pretrain/en/baike_wiki_en.jsonl"
+    # 该来源在混合比例中的目标 GB 权重。
     weight_gb: 2.3

@@ -1,71 +1,132 @@
-# TaiChu 80M raw pretraining mixture.
-# Decimal GB. Expected to produce about 16GB clean training text / 4B tokens.
-# Chinese: 60% (10.8GB), English: 40% (7.2GB).
+# TaiChu 80M 原始预训练语料抽样配置。
+# 该配置仅做来源配比和字节预算控制，不做 Tokenization、去重或最终 split。
 
+# 原始抽样目标总量，单位十进制 GB。
 target_total_gb: 18.0
+
+# 抽样输出目录；处理配置必须指向该目录下的同名来源文件。
 output_dir: "./data/raw/taichu_80m"
+
+# 抽样 Hash 的固定随机种子。
 seed: 42
+
+# 原始抽样阶段划入 validation 的比例；最终划分会在处理阶段重建。
 validation_fraction: 0.02
+
+# 抽样阶段最小字符数；0 表示保留合法短文档。
 min_chars: 16
+
+# 抽样阶段最大字符数；避免在文档级处理前丢弃长文档。
 max_chars: 200000
 
+# 十个固定来源。
 sources:
+  # 中文 FineWeb2 来源。
   - name: "fineweb2_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文 FineWeb2 全部分片。
       - "G:/Datasets/TaiChu/Pretrain/ch/fineweb2_cmn_hani_ch_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 3.289655
 
+  # 中文行业语料来源。
   - name: "industrycorpus_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文行业语料全部分片。
       - "G:/Datasets/TaiChu/Pretrain/ch/industrycorpus_ch_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 3.351724
 
+  # 中文高质量 CCI 来源。
   - name: "cci_hq_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文 CCI 高质量语料文件。
       - "G:/Datasets/TaiChu/Pretrain/ch/comprehensice_cci_3.0_hq_ch.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 1.800000
 
+  # 中文百科与 Wiki 来源。
   - name: "baike_wiki_zh"
+    # 语言标识。
     language: "zh"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 中文百科与 Wiki 全部分片。
       - "G:/Datasets/TaiChu/Pretrain/ch/baike_wiki_ch_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 2.358621
 
+  # 英文 FineWeb 来源。
   - name: "fineweb_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文 FineWeb 全部分片。
       - "G:/Datasets/TaiChu/Pretrain/en/fineweb_en_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 1.675862
 
+  # 英文 FineWeb-Edu 来源。
   - name: "fineweb_edu_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文 FineWeb-Edu 全部分片。
       - "G:/Datasets/TaiChu/Pretrain/en/fineweb_edu_en_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 1.924138
 
+  # 英文 PES2O 来源。
   - name: "pes2o_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文 PES2O 全部分片。
       - "G:/Datasets/TaiChu/Pretrain/en/pes2o_en_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 0.744828
 
+  # 英文数学论文来源。
   - name: "automath_arxiv_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文数学论文全部分片。
       - "G:/Datasets/TaiChu/Pretrain/en/automath_arxiv_en_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 0.682759
 
+  # 英文数学与代码来源。
   - name: "automath_code_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文数学与代码全部分片。
       - "G:/Datasets/TaiChu/Pretrain/en/automath_code_en_*.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 0.744828
 
+  # 英文百科与 Wiki 来源。
   - name: "baike_wiki_en"
+    # 语言标识。
     language: "en"
+    # 原始 JSONL 路径模式。
     patterns:
+      # 英文百科与 Wiki 文件。
       - "G:/Datasets/TaiChu/Pretrain/en/baike_wiki_en.jsonl"
+    # 来源目标 GB 权重。
     weight_gb: 1.427586
