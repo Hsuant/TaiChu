@@ -6,6 +6,7 @@ from .binary import (
     BinaryShardReader,
     BinaryStorageInfo,
 )
+from .fs import atomic_replace_directory
 from .manifest import DatasetManifest, MANIFEST_NAME, ShardInfo
 from .shard_manager import IndexRange, ShardManager
 
@@ -14,6 +15,7 @@ __all__ = [
     "BinarySampleWriter",
     "BinaryShardReader",
     "BinaryStorageInfo",
+    "atomic_replace_directory",
     "DatasetManifest",
     "IndexRange",
     "IndexedSampleReader",

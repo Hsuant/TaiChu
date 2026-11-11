@@ -221,6 +221,7 @@ def build_manifest(
     root: Path,
     metadata: dict[str, Any] | None = None,
     parent_version: str | None = None,
+    checksums: bool = True,
 ) -> DatasetManifest:
     shards = []
     for data_path, index_path, samples in shard_files:
@@ -230,8 +231,8 @@ def build_manifest(
                 index_path=index_path.relative_to(root).as_posix(),
                 samples=samples,
                 bytes=data_path.stat().st_size,
-                sha256=_sha256_file(data_path),
-                index_sha256=_sha256_file(index_path),
+                sha256=_sha256_file(data_path) if checksums else "",
+                index_sha256=_sha256_file(index_path) if checksums else "",
             )
         )
     manifest = DatasetManifest(

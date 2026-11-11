@@ -50,6 +50,31 @@ class PretrainingSample(CommonSample):
         "document_ids",
     )
 
+    @classmethod
+    def _from_trusted(
+        cls,
+        *,
+        sample_id: str,
+        dataset_id: str,
+        source_id: str,
+        input_ids: list[int],
+        labels: list[int],
+        attention_mask: list[int] | None,
+        document_ids: list[int],
+        metadata: dict,
+    ) -> "PretrainingSample":
+        """Build a sample from tokenizer-produced arrays without revalidation."""
+        sample = object.__new__(cls)
+        sample.sample_id = sample_id
+        sample.dataset_id = dataset_id
+        sample.source_id = source_id
+        sample.metadata = metadata
+        sample.input_ids = input_ids
+        sample.labels = labels
+        sample.attention_mask = attention_mask
+        sample.document_ids = document_ids
+        return sample
+
     def __post_init__(self) -> None:
         CommonSample.__post_init__(self)
         self.input_ids = token_ids(self.input_ids)

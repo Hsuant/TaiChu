@@ -10,13 +10,13 @@ import sys
 from array import array
 from collections.abc import Iterator
 from dataclasses import dataclass
-from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
 from ..exceptions import TaiChuDataFormatError
 from ..schema import CommonSample, sample_from_storage, sample_to_storage
 from .base import IndexedSampleReader, PathLike
+from .fs import atomic_replace_directory
 from .manifest import DatasetManifest, MANIFEST_NAME, build_manifest
 
 
@@ -28,31 +28,61 @@ RECORD_HEADER = struct.Struct("<IH")
 ARRAY_HEADER = struct.Struct("<HBI")
 INDEX_ENTRY = struct.Struct("<Q")
 
-DTYPE_CODES = {1: "int32", 2: "int64", 3: "float32", 4: "uint16"}
-ARRAY_TYPECODES = {1: "i", 2: "q", 3: "f", 4: "H"}
-ARRAY_WIDTHS = {1: 4, 2: 8, 3: 4, 4: 2}
+DTYPE_CODES = {
+    1: "int32",
+    2: "int64",
+    3: "float32",
+    4: "uint16",
+    5: "int16",
+}
+ARRAY_TYPECODES = {1: "i", 2: "q", 3: "f", 4: "H", 5: "h"}
+ARRAY_WIDTHS = {1: 4, 2: 8, 3: 4, 4: 2, 5: 2}
 
 
-def _encode_array(values: list[Any], name: str) -> tuple[int, bytes]:
+def _encode_array(
+    values: list[Any],
+    name: str,
+    *,
+    trusted_integers: bool = False,
+) -> tuple[int, bytes]:
     if not values:
         return 1, b""
-    if all(isinstance(item, Integral) and not isinstance(item, bool) for item in values):
-        numbers = [int(item) for item in values]
-        if min(numbers) < -(2**31) or max(numbers) >= 2**31:
-            values_array = array("q", numbers)
+    if not trusted_integers and any(isinstance(item, bool) for item in values):
+        raise TaiChuDataFormatError(f"array {name!r} must contain only numbers")
+    if trusted_integers:
+        try:
+            values_array = array("h", values)
+            if sys.byteorder != "little":
+                values_array.byteswap()
+            return 5, values_array.tobytes()
+        except (OverflowError, TypeError, ValueError):
+            pass
+    try:
+        values_array = array("i", values)
+        dtype = 1
+    except OverflowError:
+        try:
+            values_array = array("q", values)
             dtype = 2
-        else:
-            values_array = array("i", numbers)
-            dtype = 1
+        except (OverflowError, TypeError) as exc:
+            raise TaiChuDataFormatError(
+                f"array {name!r} contains integers outside the int64 range"
+            ) from exc
+    except (TypeError, ValueError):
+        try:
+            values_array = array("f", values)
+            dtype = 3
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise TaiChuDataFormatError(
+                f"array {name!r} must contain only numbers"
+            ) from exc
+    if dtype in (1, 2):
         if sys.byteorder != "little":
             values_array.byteswap()
         return dtype, values_array.tobytes()
-    if all(isinstance(item, Real) and not isinstance(item, bool) for item in values):
-        values_array = array("f", (float(item) for item in values))
-        if sys.byteorder != "little":
-            values_array.byteswap()
-        return 3, values_array.tobytes()
-    raise TaiChuDataFormatError(f"array {name!r} must contain only numbers")
+    if sys.byteorder != "little":
+        values_array.byteswap()
+    return dtype, values_array.tobytes()
 
 
 def _read_array(buffer: mmap.mmap, offset: int, dtype: int, count: int) -> list:
@@ -83,6 +113,8 @@ class BinarySampleWriter:
         parent_version: str | None = None,
         shard_size: int = 50_000,
         metadata: dict[str, Any] | None = None,
+        sync_on_close: bool = True,
+        checksums_on_commit: bool = True,
     ) -> None:
         if shard_size <= 0:
             raise ValueError("shard_size must be positive")
@@ -100,6 +132,8 @@ class BinarySampleWriter:
         self.parent_version = parent_version
         self.shard_size = int(shard_size)
         self.metadata = dict(metadata or {})
+        self.sync_on_close = bool(sync_on_close)
+        self.checksums_on_commit = bool(checksums_on_commit)
         self._data_stream = None
         self._index_stream = None
         self._data_path: Path | None = None
@@ -120,7 +154,7 @@ class BinarySampleWriter:
         self._index_stream.write(HEADER.pack(INDEX_MAGIC, STORAGE_VERSION))
         self._shard_samples = 0
 
-    def write(self, sample: CommonSample) -> None:
+    def write(self, sample: CommonSample, *, trusted_arrays: bool = False) -> None:
         if self._closed:
             raise RuntimeError("writer is closed")
         if sample.sample_type != self.sample_type:
@@ -143,7 +177,11 @@ class BinarySampleWriter:
         self._data_stream.write(metadata_bytes)
         for name in sorted(arrays):
             name_bytes = name.encode("utf-8")
-            dtype, payload = _encode_array(arrays[name], name)
+            dtype, payload = _encode_array(
+                arrays[name],
+                name,
+                trusted_integers=trusted_arrays,
+            )
             self._data_stream.write(
                 ARRAY_HEADER.pack(len(name_bytes), dtype, len(arrays[name]))
             )
@@ -163,7 +201,8 @@ class BinarySampleWriter:
         assert self._index_path is not None
         for stream in (self._data_stream, self._index_stream):
             stream.flush()
-            os.fsync(stream.fileno())
+            if self.sync_on_close:
+                os.fsync(stream.fileno())
             stream.close()
         self._shard_files.append(
             (self._data_path, self._index_path, self._shard_samples)
@@ -189,9 +228,10 @@ class BinarySampleWriter:
             root=self.staging_dir,
             metadata=self.metadata,
             parent_version=self.parent_version,
+            checksums=self.checksums_on_commit,
         )
         manifest.write(self.staging_dir)
-        self.staging_dir.replace(self.output_dir)
+        atomic_replace_directory(self.staging_dir, self.output_dir)
         self._closed = True
         return manifest
 
@@ -247,25 +287,7 @@ class BinaryShardReader:
         return self._count
 
     def read_sample(self, index: int) -> CommonSample:
-        if not 0 <= index < self._count:
-            raise IndexError(index)
-        (offset,) = INDEX_ENTRY.unpack_from(
-            self._index,
-            HEADER.size + index * INDEX_ENTRY.size,
-        )
-        try:
-            metadata_length, array_count = RECORD_HEADER.unpack_from(self._data, offset)
-        except struct.error as exc:
-            raise TaiChuDataFormatError("truncated binary record header") from exc
-        position = offset + RECORD_HEADER.size
-        metadata_end = position + metadata_length
-        if metadata_end > len(self._data):
-            raise TaiChuDataFormatError("binary metadata extends beyond shard")
-        try:
-            metadata = json.loads(self._data[position:metadata_end].decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise TaiChuDataFormatError("invalid binary sample metadata") from exc
-        position = metadata_end
+        metadata, position, array_count = self._read_metadata_record(index)
         arrays: dict[str, list] = {}
         for _ in range(array_count):
             try:
@@ -284,6 +306,34 @@ class BinaryShardReader:
             arrays[name] = _read_array(self._data, position, dtype, count)
             position += count * ARRAY_WIDTHS[dtype]
         return sample_from_storage(metadata, arrays)
+
+    def read_metadata(self, index: int) -> dict[str, Any]:
+        metadata, _, _ = self._read_metadata_record(index)
+        return metadata
+
+    def _read_metadata_record(
+        self,
+        index: int,
+    ) -> tuple[dict[str, Any], int, int]:
+        if not 0 <= index < self._count:
+            raise IndexError(index)
+        (offset,) = INDEX_ENTRY.unpack_from(
+            self._index,
+            HEADER.size + index * INDEX_ENTRY.size,
+        )
+        try:
+            metadata_length, array_count = RECORD_HEADER.unpack_from(self._data, offset)
+        except struct.error as exc:
+            raise TaiChuDataFormatError("truncated binary record header") from exc
+        position = offset + RECORD_HEADER.size
+        metadata_end = position + metadata_length
+        if metadata_end > len(self._data):
+            raise TaiChuDataFormatError("binary metadata extends beyond shard")
+        try:
+            metadata = json.loads(self._data[position:metadata_end].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TaiChuDataFormatError("invalid binary sample metadata") from exc
+        return metadata, metadata_end, array_count
 
     def close(self) -> None:
         for value in ("_data", "_index"):
@@ -359,6 +409,14 @@ class BinaryDatasetReader(IndexedSampleReader):
     def __getitem__(self, index: int) -> CommonSample:
         shard_index, local_index = self._locate(index)
         return self._shards[shard_index].read_sample(local_index)
+
+    def metadata_at(self, index: int) -> dict[str, Any]:
+        shard_index, local_index = self._locate(index)
+        return self._shards[shard_index].read_metadata(local_index)
+
+    def iter_metadata(self) -> Iterator[dict[str, Any]]:
+        for index in range(len(self)):
+            yield self.metadata_at(index)
 
     def __iter__(self) -> Iterator[CommonSample]:
         for index in range(len(self)):
