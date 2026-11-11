@@ -1,12 +1,76 @@
-.idea
-pytest_cache/
-.pytest_cache/
+# Python
 __pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Local dependencies
+node_modules/
+
+# Training and evaluation artifacts
 experiments/
-/swanlogs/
+swanlogs/
+wandb/
+mlruns/
+lightning_logs/
+checkpoints/
+best_models/
+final_models/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.log
+events.out.tfevents.*
+nohup.out
+
+# Temporary and cache files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+.ipynb_checkpoints/
+
+# Large or generated datasets
 /data/raw/
 /data/packed/
 /data/processed/
 /data/unified/
-/tests/test_train/unified/
+*.tcbin
+*.tcidx
+*.arrow
+*.parquet
+*.npy
+*.npz
 /reports/
+/tests/
