@@ -13,9 +13,23 @@ JSONL / JSONL.GZ / Parquet
 
 ## Commands
 
+Document-aware pretraining preparation (the canonical pretraining entry):
+
 ```powershell
 python -m dataset.offline.prepare `
   --config configs/prepare_pretrain_data.yaml
+```
+
+This path performs document-level exact and 13-gram MinHash/LSH near deduplication,
+cluster-level train/validation/diagnostic isolation, full-document tokenization,
+and 2046/128 sliding windows. Each window is stored as an independent sample with
+true-document BOS/EOS semantics and `labels=-100` on overlap context.
+
+Generic preparation for non-pretraining tasks:
+
+```powershell
+python -m dataset.offline.prepare `
+  --config configs/prepare_sft_data.yaml
 ```
 
 For production pretraining, sample the configured source mixture first:
@@ -27,8 +41,8 @@ python -m dataset.offline.sample_sources `
 
 Use the size-specific configs for the 80M, 150M and 190M presets. Sampling is
 deterministic for a fixed seed and writes a per-source manifest with selected
-bytes, train records and validation records. Point the preparation config's
-`splits` entries at the generated `train` and `validation` directories.
+bytes, train records and validation records. Point each pretraining source's
+`paths` entries at the generated per-source JSONL files.
 Records outside `min_chars`/`max_chars` are removed before sampling. Both the
 length-statistics pass and the sampling pass show byte-based progress bars.
 Thresholds can be overridden from the command line:
@@ -65,13 +79,27 @@ data/unified/taichu_80m/
     └── data-00000.tcidx
 ```
 
-Task Adapters:
+Pretraining implementation:
 
-- `PretrainingPreprocessor`
+```text
+dataset/offline/pretraining/
+├── config.py          # strict config and validation
+├── hashing.py         # exact digest, MinHash and LSH buckets
+├── fingerprinting.py  # parallel document fingerprint computation
+├── segmentation.py    # sliding windows, BOS/EOS and labels
+├── store.py           # SQLite staging and resumable state
+├── deduplication.py   # exact/near duplicate clusters
+├── output.py          # split writing and leakage verification
+├── reporting.py       # statistics and manifest
+└── pipeline.py        # atomic orchestration
+```
+
+Non-pretraining adapters:
+
 - `SFTPreprocessor`
 - `PreferencePreprocessor`
 - `RewardPreprocessor`
 - `TrajectoryPreprocessor`
 
-All adapters share `TextTokenizer`, validation, metadata and Binary Storage. Each adapter
-owns only task-specific formatting and mask semantics.
+All adapters share `TextTokenizer`, validation, metadata and Binary Storage.
+The legacy pretraining truncation adapter and process worker have been removed.

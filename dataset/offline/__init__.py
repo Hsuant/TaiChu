@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 from .adapters import (
     BasePreprocessingAdapter,
     PreferencePreprocessor,
-    PretrainingPreprocessor,
     RewardPreprocessor,
     RoleTagRenderer,
     SFTPreprocessor,
@@ -14,6 +13,15 @@ from .adapters import (
     TrajectoryPreprocessor,
 )
 from .config import PreparationConfig, load_preparation_config
+from .pretraining import (
+    DedupConfig,
+    PretrainingConfig,
+    PretrainingDataPreparation,
+    PretrainingSource,
+    SegmentationConfig,
+    SplitConfig,
+    load_pretraining_config,
+)
 
 if TYPE_CHECKING:
     from .prepare import UnifiedDataPreparation
@@ -28,14 +36,20 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "BasePreprocessingAdapter",
+    "DedupConfig",
     "PreferencePreprocessor",
     "PreparationConfig",
-    "PretrainingPreprocessor",
+    "PretrainingConfig",
+    "PretrainingDataPreparation",
+    "PretrainingSource",
     "RewardPreprocessor",
     "RoleTagRenderer",
     "SFTPreprocessor",
+    "SegmentationConfig",
+    "SplitConfig",
     "TextTokenizer",
     "TrajectoryPreprocessor",
     "UnifiedDataPreparation",
     "load_preparation_config",
+    "load_pretraining_config",
 ]

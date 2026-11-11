@@ -6,7 +6,6 @@ from .base import (
     TextTokenizer,
 )
 from .preference import PreferencePreprocessor
-from .pretraining import PretrainingPreprocessor
 from .reward import RewardPreprocessor
 from .sft import SFTPreprocessor
 from .trajectory import TrajectoryPreprocessor
@@ -15,7 +14,6 @@ __all__ = [
     "BasePreprocessingAdapter",
     "ConversationRenderer",
     "PreferencePreprocessor",
-    "PretrainingPreprocessor",
     "RewardPreprocessor",
     "RoleTagRenderer",
     "SFTPreprocessor",

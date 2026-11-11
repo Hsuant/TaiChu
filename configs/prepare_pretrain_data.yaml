@@ -1,100 +1,223 @@
-# =============================================================================
-# 预训练数据离线处理配置
+# 文档级预训练数据处理配置。
 #
-# 处理流程：原始文本 -> 清洗文本 -> 类型化样本 -> 分片二进制
-# 运行方式（在项目根目录执行）：
-#   python -m dataset.offline.prepare --config configs/prepare_pretrain_data.yaml
-# =============================================================================
+# 流程：
+#   原始 JSONL/GZ/Parquet
+#   -> 文档清洗
+#   -> 精确去重与 13-gram MinHash/LSH 近重复检测
+#   -> cluster 级 train/validation/diagnostic 隔离
+#   -> 完整文档 Tokenization
+#   -> 2046 Token 滑窗、128 Token 重叠、1918 Token 步长
+#   -> Binary Shard 与 Manifest
+#
+# 运行：
+#   python -m dataset.offline.prepare `
+#     --config configs/prepare_pretrain_data.yaml
 
-# -----------------------------------------------------------------------------
-# 基本信息（写入样本元数据与最终 Manifest）
-# -----------------------------------------------------------------------------
-# 任务类型：pretraining（预训练）| cpt（增量预训练）
-task_type: "pretraining"
-
-# 数据集唯一标识
-dataset_id: "taichu-pretraining-v1"
-
-# 数据集版本号；修改数据内容后请同步升级
-version: "1"
-
-# -----------------------------------------------------------------------------
-# 路径配置
-# -----------------------------------------------------------------------------
-# Tokenizer 文件路径，用于将清洗后文本编码为 token IDs
+# Tokenizer 文件路径；必须与模型词表和特殊 Token 一致。
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
 
-# 统一二进制数据集输出目录（清洗 + tokenize 后）；目录已存在时不会覆盖
+# 处理后数据集的输出目录；目录已存在时不会覆盖。
 output_dir: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m"
 
-# -----------------------------------------------------------------------------
-# 样本字段与序列长度
-# -----------------------------------------------------------------------------
-# JSONL 记录中保存文本内容的字段名
+# 任务类型；预训练固定为 pretraining，增量预训练可使用 cpt。
+task_type: "pretraining"
+
+# 数据集稳定标识；用于 Manifest、追踪和训练恢复。
+dataset_id: "taichu-pretraining"
+
+# 数据处理版本；处理逻辑或输入语义变化时应同步升级。
+version: "1"
+
+# 原始 JSONL/Parquet 记录中正文文本的字段名。
 text_column: "text"
 
-# 单条样本最大 token 数；超出部分在 tokenize 后截断
-max_seq_length: 2048
-
-# -----------------------------------------------------------------------------
-# 特殊 Token（以下三个均必须存在于 Tokenizer 词表中）
-# -----------------------------------------------------------------------------
-# Padding token
+# Padding Token；必须存在于 Tokenizer 词表中。
 pad_token: "<|pad|>"
-# 序列起始 / 结束 token；是否实际添加由下方 add_bos / add_eos 控制
+
+# 文档起始 Token；仅添加到单窗口文档或长文档首窗口。
 bos_token: "<|taichu_start|>"
+
+# 文档结束 Token；仅添加到单窗口文档或长文档末窗口。
 eos_token: "<|taichu_end|>"
 
-# 是否在样本首 / 尾添加 BOS / EOS
-add_bos: true
-add_eos: true
-
-# -----------------------------------------------------------------------------
-# 分片与异常处理
-# -----------------------------------------------------------------------------
-# 非法样本处理策略：error（立即报错）| skip（跳过并继续处理）
+# 非法记录策略；error 立即失败并保留错误上下文，skip 隔离错误记录后继续。
 invalid_policy: "error"
 
-# 每个 tcbin/tcidx 分片最多写入的样本数
+# 每个 Binary Shard 最多写入的样本数；影响文件大小和读取并行度。
 shard_size: 50000
 
-# tokenizer 批处理大小；增大可提高吞吐，但会占用更多内存
-preprocess_batch_size: 256
+# 指纹计算与 Tokenization 并行进程数；建议不超过物理 CPU 核心数。
+processing_workers: 10
 
-# tokenizer 并行进程数；建议设为物理核心数以内，设置为 1 时关闭多进程
-preprocess_workers: 4
+# 输出阶段使用单线程 Tokenizer 的并行进程数。
+output_workers: 16
 
-# -----------------------------------------------------------------------------
-# 文本清洗与去重
-# -----------------------------------------------------------------------------
+# 每个多进程任务包含的文档数；过大增加内存峰值，过小降低并行效率。
+fingerprint_batch_size: 256
+
+# 长文档滑窗与特殊 Token 长度约束。
+segmentation:
+  # 单个训练样本允许的最大输入长度，包含 BOS/EOS。
+  max_sequence_length: 2048
+  # 单个窗口允许的最大正文 Token 数，不包含 BOS/EOS。
+  max_segment_content_tokens: 2046
+  # 相邻窗口保留的正文重叠 Token 数，只作为上下文、不重复计算 Loss。
+  overlap_tokens: 128
+  # 短文档和尾段质量诊断阈值；不会据此删除合法数据。
+  min_fragment_tokens: 32
+
+# 文档级去重配置。
+dedup:
+  # 是否启用近重复检测；精确去重始终用于生成稳定文档 cluster。
+  enabled: true
+  # 字符 n-gram 长度；用于中文、英文和代码的统一指纹。
+  ngram_size: 13
+  # 近重复判定的精确 Jaccard 阈值。
+  similarity_threshold: 0.80
+  # 每个文档的 MinHash 签名长度。
+  num_hashes: 128
+  # LSH 分带数；num_hashes 必须能被 bands 整除。
+  bands: 16
+  # 是否强制使用精确 Jaccard 二次验证；当前必须为 true。
+  exact_jaccard: true
+
+# 固定、可复现的数据集划分配置。
+splits:
+  # 训练集目标比例。
+  train_ratio: 0.99
+  # 主验证集目标比例。
+  validation_ratio: 0.005
+  # 来源诊断集目标比例。
+  diagnostic_ratio: 0.005
+  # 划分 Hash 的固定随机种子；不得随训练轮次改变。
+  seed: 42
+
+# 文本清洗与规范化配置。
 cleaning:
-  # Unicode 标准化形式：NFC 保留兼容字符；NFKC 会进一步合并兼容字符
+  # Unicode 规范化形式；NFC 保留兼容字符，不破坏代码和公式。
   unicode_form: "NFC"
-
-  # 清洗后允许保留的字符数区间；低于 min_chars 剔除，超过 max_chars 按 oversize_policy 处理
-  min_chars: 16
-  max_chars: 200000
-
-  # 超长文本处理策略：skip 丢弃超长记录 | truncate 截断到 max_chars
-  oversize_policy: "skip"
-
-  # 是否合并连续空格并压缩多余空行；false 保留原始空白结构
+  # 最小字符数；0 表示不按字符长度删除合法短文档。
+  min_chars: 0
+  # 最大字符数；超过后按 oversize_policy 处理。
+  max_chars: 10000000
+  # 是否压缩连续空格和空行；false 保留段落、缩进和 Markdown 结构。
   collapse_whitespace: false
-
-  # 是否删除控制字符（保留换行符和制表符）
+  # 是否删除控制字符；换行符和制表符始终保留。
   remove_control_chars: true
-
-  # 是否启用精确文本去重（相同文本仅保留第一次出现的记录）
+  # 超长文本策略；skip 隔离超长记录，truncate 截断到 max_chars。
+  oversize_policy: "skip"
+  # 精确去重开关；文档级预训练应保持 true。
   deduplicate: true
 
-# -----------------------------------------------------------------------------
-# 数据来源
-#
-# - 目录下的 JSONL / JSONL.GZ / Parquet 文件都会被读取
-# - 验证集不能与训练集存在内容重叠
-# -----------------------------------------------------------------------------
-splits:
-  train:
-    - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train"
-  validation:
-    - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation"
+# 十个固定来源。每个来源同时读取抽样阶段生成的 train 与 validation 文件，
+# 然后在去重后重新执行 cluster 级划分，避免原始 split 泄漏。
+sources:
+  # 中文 FineWeb2 来源。
+  - name: "fineweb2_zh"
+    # 语言标识；写入样本元数据和语言统计。
+    language: "ch"
+    # 来源文件路径；支持文件、目录、JSONL、JSONL.GZ 和 Parquet。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/fineweb2_zh.jsonl"
+      # 抽样生成的验证侧文件，后续会与训练侧一起重新聚类划分。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/fineweb2_zh.jsonl"
+
+  # 中文行业语料来源。
+  - name: "industrycorpus_zh"
+    # 语言标识。
+    language: "ch"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/industrycorpus_zh.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/industrycorpus_zh.jsonl"
+
+  # 中文百科与 Wiki 来源。
+  - name: "baike_wiki_zh"
+    # 语言标识。
+    language: "ch"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/baike_wiki_zh.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/baike_wiki_zh.jsonl"
+
+  # 中文高质量 CCI 来源。
+  - name: "cci_hq_zh"
+    # 语言标识。
+    language: "ch"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/cci_hq_zh.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/cci_hq_zh.jsonl"
+
+  # 英文 FineWeb 来源。
+  - name: "fineweb_en"
+    # 语言标识。
+    language: "en"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/fineweb_en.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/fineweb_en.jsonl"
+
+  # 英文 FineWeb-Edu 来源。
+  - name: "fineweb_edu_en"
+    # 语言标识。
+    language: "en"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/fineweb_edu_en.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/fineweb_edu_en.jsonl"
+
+  # 英文百科与 Wiki 来源。
+  - name: "baike_wiki_en"
+    # 语言标识。
+    language: "en"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/baike_wiki_en.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/baike_wiki_en.jsonl"
+
+  # 英文 PES2O 来源，短文档较多，不应按长度降权。
+  - name: "pes2o_en"
+    # 语言标识。
+    language: "en"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/pes2o_en.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/pes2o_en.jsonl"
+
+  # 英文数学与代码来源。
+  - name: "automath_code_en"
+    # 语言标识；代码单独统计。
+    language: "code"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/automath_code_en.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/automath_code_en.jsonl"
+
+  # 英文数学论文来源，优先保留完整长文档。
+  - name: "automath_arxiv_en"
+    # 语言标识。
+    language: "en"
+    # 来源文件路径。
+    paths:
+      # 抽样生成的训练侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/automath_arxiv_en.jsonl"
+      # 抽样生成的验证侧文件。
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/automath_arxiv_en.jsonl"

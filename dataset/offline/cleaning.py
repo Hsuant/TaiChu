@@ -11,6 +11,9 @@ from typing import Any
 from .config import CleaningConfig
 
 
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
 class TextCleaner:
     def __init__(self, config: CleaningConfig) -> None:
         self.config = config
@@ -21,12 +24,7 @@ class TextCleaner:
         text = unicodedata.normalize(self.config.unicode_form, value)
         text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
         if self.config.remove_control_chars:
-            text = "".join(
-                character
-                for character in text
-                if character in "\n\t"
-                or not unicodedata.category(character).startswith("C")
-            )
+            text = _CONTROL_CHARACTERS.sub("", text)
         if self.config.collapse_whitespace:
             text = re.sub(r"[^\S\n]+", " ", text)
             text = re.sub(r" *\n *", "\n", text)

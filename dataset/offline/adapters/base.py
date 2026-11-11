@@ -129,14 +129,29 @@ class TextTokenizer:
         return list(rows[0])
 
     def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        rows = self.encode_batch_unchecked(texts)
+        return self._validate_rows(rows, len(texts))
+
+    def encode_batch_unchecked(self, texts: list[str]) -> list[list[int]]:
         if not texts:
             return []
         method = getattr(self.tokenizer, "encode_batch", None)
         if callable(method):
             try:
                 encoded = method(texts, add_special_tokens=False)
-                rows = [self._ids(item) for item in encoded]
-                return self._validate_rows(rows, len(texts))
+                rows = []
+                for item in encoded:
+                    values = getattr(item, "ids", None)
+                    rows.append(
+                        list(values)
+                        if values is not None
+                        else self._ids(item)
+                    )
+                if len(rows) != len(texts):
+                    raise TaiChuDataFormatError(
+                        "tokenizer did not return one sequence per input"
+                    )
+                return rows
             except TypeError:
                 pass
         if callable(self.tokenizer):
@@ -147,7 +162,11 @@ class TextTokenizer:
                 truncation=False,
             )
             rows = [self._ids(row) for row in encoded["input_ids"]]
-            return self._validate_rows(rows, len(texts))
+            if len(rows) != len(texts):
+                raise TaiChuDataFormatError(
+                    "tokenizer did not return one sequence per input"
+                )
+            return rows
         encode = getattr(self.tokenizer, "encode", None)
         if callable(encode):
             rows = []
@@ -159,7 +178,11 @@ class TextTokenizer:
                         "tokenizer.encode() must accept add_special_tokens=False"
                     ) from exc
                 rows.append(self._ids(encoded))
-            return self._validate_rows(rows, len(texts))
+            if len(rows) != len(texts):
+                raise TaiChuDataFormatError(
+                    "tokenizer did not return one sequence per input"
+                )
+            return rows
         raise TypeError("tokenizer must expose encode_batch(), __call__() or encode()")
 
     @staticmethod

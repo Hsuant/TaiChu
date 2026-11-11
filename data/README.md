@@ -50,12 +50,7 @@ python -m dataset.offline.prepare `
   --config configs/prepare_pretrain_data.yaml
 ```
 
-仅使用仓库样例做快速验证时：
-
-```powershell
-python -m dataset.offline.prepare `
-  --config configs/prepare_pretrain_sample.yaml
-```
+`dataset.offline.prepare` 会按 `task_type` 选择文档级预训练管线或通用任务适配器。
 
 最终 Binary Shard、Manifest、Sample Schema、Packing 和配置约束见
 [`../dataset/offline/README.md`](../dataset/offline/README.md)。

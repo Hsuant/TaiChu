@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
-from concurrent.futures import ProcessPoolExecutor
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -16,22 +14,20 @@ from tokenizers import Tokenizer
 from tqdm import tqdm
 
 from ..storage import BinarySampleWriter
+from ..storage.fs import atomic_replace_directory
 from ..tasks import get_task
 from .adapters import (
     BasePreprocessingAdapter,
     PreferencePreprocessor,
-    PretrainingPreprocessor,
     RewardPreprocessor,
     RoleTagRenderer,
     SFTPreprocessor,
     TextTokenizer,
     TrajectoryPreprocessor,
 )
-from .cleaning import ExactDeduplicator, TextCleaner
 from .config import PreparationConfig, load_preparation_config
 from .readers import RecordSourceReader
 from .unified import UnifiedPreparationPipeline
-from .workers import initialize_pretraining_worker, prepare_pretraining_batch
 
 
 @dataclass(slots=True)
@@ -44,19 +40,6 @@ class SplitPreparationStats:
 
 
 AdapterFactory = Callable[[PreparationConfig, TextTokenizer], BasePreprocessingAdapter]
-
-
-def _pretraining_adapter(
-    config: PreparationConfig,
-    tokenizer: TextTokenizer,
-) -> BasePreprocessingAdapter:
-    return PretrainingPreprocessor(
-        tokenizer,
-        text_column=config.text_column,
-        add_bos=config.add_bos,
-        add_eos=config.add_eos,
-        max_length=config.max_seq_length,
-    )
 
 
 def _sft_adapter(
@@ -109,8 +92,6 @@ def _trajectory_adapter(
 
 
 ADAPTER_REGISTRY: dict[str, AdapterFactory] = {
-    "pretraining": _pretraining_adapter,
-    "cpt": _pretraining_adapter,
     "sft": _sft_adapter,
     "instruction_tuning": _sft_adapter,
     "preference": _preference_adapter,
@@ -145,7 +126,6 @@ class UnifiedDataPreparation:
         )
         self.adapter = adapter_factory(config, self.tokenizer)
         self.reader = RecordSourceReader()
-        self.cleaner = TextCleaner(config.cleaning)
 
     def run(self, *, restart: bool = False) -> dict[str, Any]:
         if self.config.output_dir.exists():
@@ -185,7 +165,7 @@ class UnifiedDataPreparation:
             ) as stream:
                 json.dump(root_index, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
-            staging.replace(self.config.output_dir)
+            atomic_replace_directory(staging, self.config.output_dir)
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
@@ -212,47 +192,13 @@ class UnifiedDataPreparation:
             },
         )
         stats = SplitPreparationStats()
-        dedup_path = (
-            staging / f".{split}.dedup.sqlite3"
-            if self.config.cleaning.deduplicate
-            and self.config.task_type in {"pretraining", "cpt"}
-            else None
+        pipeline = UnifiedPreparationPipeline(
+            self.adapter,
+            writer,
+            invalid_policy=self.config.invalid_policy,
+            batch_size=self.config.preprocess_batch_size,
         )
-        with ExactDeduplicator(dedup_path) as deduplicator:
-            pipeline = UnifiedPreparationPipeline(
-                self.adapter,
-                writer,
-                invalid_policy=self.config.invalid_policy,
-                batch_size=self.config.preprocess_batch_size,
-            )
-            records = self._records(paths, split, stats, deduplicator)
-            workers = min(
-                self.config.preprocess_workers,
-                os.cpu_count() or 1,
-            )
-            if workers > 1 and self.config.task_type in {"pretraining", "cpt"}:
-                with ProcessPoolExecutor(
-                    max_workers=workers,
-                    initializer=initialize_pretraining_worker,
-                    initargs=(
-                        str(self.config.tokenizer_path.resolve()),
-                        self.config.pad_token,
-                        self.config.bos_token,
-                        self.config.eos_token,
-                        self.config.text_column,
-                        self.config.add_bos,
-                        self.config.add_eos,
-                        self.config.max_seq_length,
-                    ),
-                ) as executor:
-                    pipeline_stats = pipeline.run_parallel(
-                        records,
-                        executor=executor,
-                        batch_worker=prepare_pretraining_batch,
-                        max_inflight=workers * 2,
-                    )
-            else:
-                pipeline_stats = pipeline.run(records)
+        pipeline_stats = pipeline.run(self._records(paths, split, stats))
         manifest = writer.commit()
         stats.written_records = pipeline_stats.written_samples
         stats.rejected_records += pipeline_stats.skipped_samples
@@ -268,7 +214,6 @@ class UnifiedDataPreparation:
         paths: tuple[Path, ...],
         split: str,
         stats: SplitPreparationStats,
-        deduplicator: ExactDeduplicator,
     ) -> Iterator[dict[str, Any]]:
         index = 0
         files = self.reader.resolve(paths)
@@ -297,17 +242,6 @@ class UnifiedDataPreparation:
                     record.setdefault("dataset_id", self.config.dataset_id)
                     record.setdefault("source_id", str(path))
                     index += 1
-                    if self.config.task_type in {"pretraining", "cpt"}:
-                        text, _ = self.cleaner.clean(
-                            record.get(self.config.text_column)
-                        )
-                        if text is None:
-                            stats.rejected_records += 1
-                            continue
-                        if not deduplicator.accept(text):
-                            stats.duplicate_records += 1
-                            continue
-                        record[self.config.text_column] = text
                     stats.cleaned_records += 1
                     if stats.source_records % 1000 == 0:
                         progress.set_postfix(
@@ -327,7 +261,10 @@ class UnifiedDataPreparation:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prepare raw task records into unified binary storage"
+        description=(
+            "Prepare document-aware pretraining data or generic task records "
+            "into unified binary storage"
+        )
     )
     parser.add_argument("--config", required=True)
     parser.add_argument(
@@ -336,6 +273,22 @@ def main() -> None:
         help="discard an existing incomplete staging directory before preparation",
     )
     args = parser.parse_args()
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ImportError("PyYAML is required to load preparation configs") from exc
+    with Path(args.config).open("r", encoding="utf-8") as stream:
+        raw_config = yaml.safe_load(stream) or {}
+    if (
+        isinstance(raw_config, dict)
+        and raw_config.get("task_type") in {"pretraining", "cpt"}
+    ):
+        from .pretraining import PretrainingDataPreparation, load_pretraining_config
+
+        config = load_pretraining_config(args.config)
+        manifest = PretrainingDataPreparation(config).run(restart=args.restart)
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return
     config = load_preparation_config(args.config)
     manifest = UnifiedDataPreparation(config).run(restart=args.restart)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
