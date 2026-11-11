@@ -22,6 +22,7 @@ from .pretraining import (
     SplitConfig,
     load_pretraining_config,
 )
+from .subset_validation import subset_validation_dataset
 
 if TYPE_CHECKING:
     from .prepare import UnifiedDataPreparation
@@ -52,4 +53,5 @@ __all__ = [
     "UnifiedDataPreparation",
     "load_preparation_config",
     "load_pretraining_config",
+    "subset_validation_dataset",
 ]

@@ -17,21 +17,31 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 os.chdir(_PROJECT_ROOT)
 sys.path.insert(0, _PROJECT_ROOT)
 
-from dataset.offline.config import load_preparation_config
-from dataset.offline.prepare import UnifiedDataPreparation
+from dataset.offline.pretraining import (
+    PretrainingDataPreparation,
+    load_pretraining_config,
+)
 
-data_dir = Path(_PROJECT_ROOT) / "tests" / "test_train" / "unified"
-if not data_dir.exists():
-    config = load_preparation_config(
-        Path(_PROJECT_ROOT) / "tests" / "test_train" / "prepare_sim.yaml"
-    )
-    UnifiedDataPreparation(config).run()
+def main() -> None:
+    data_dir = Path(_PROJECT_ROOT) / "tests" / "test_train" / "unified"
+    if not data_dir.exists():
+        config = load_pretraining_config(
+            Path(_PROJECT_ROOT) / "tests" / "test_train" / "prepare_sim.yaml"
+        )
+        PretrainingDataPreparation(config).run(restart=True)
 
-sys.argv = [
-    "train_pretrain",
-    "--model_config", "tests/test_train/model_sim.yaml",
-    "--pretrain_config", "tests/test_train/pretrain_sim.yaml",
-]
+    sys.argv = [
+        "train_pretrain",
+        "--model_config",
+        "tests/test_train/model_sim.yaml",
+        "--pretrain_config",
+        "tests/test_train/pretrain_sim.yaml",
+    ]
 
-import runpy
-runpy.run_module("trainer.train_pretrain", run_name="__main__")
+    import runpy
+
+    runpy.run_module("trainer.train_pretrain", run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()

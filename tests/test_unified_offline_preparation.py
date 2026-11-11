@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from dataset.config import UnifiedDataConfig
 from dataset.offline.config import load_preparation_config
 from dataset.offline.prepare import UnifiedDataPreparation
+from dataset.offline.pretraining import load_pretraining_config
 from dataset.offline.readers import RecordSourceReader
 from dataset.storage import BinaryDatasetReader
 
@@ -28,6 +29,16 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def sft_record(text: str, index: int = 0) -> dict:
+    return {
+        "sample_id": f"sft-{index}",
+        "messages": [
+            {"role": "user", "content": text},
+            {"role": "assistant", "content": f"answer {index}"},
+        ],
+    }
+
+
 def write_config(
     path: Path,
     output: Path,
@@ -40,30 +51,22 @@ def write_config(
     path.write_text(
         "\n".join(
             [
-                "task_type: pretraining",
+                "task_type: sft",
                 "dataset_id: offline-test",
                 'version: "1"',
                 f'tokenizer_path: "{TOKENIZER_PATH.as_posix()}"',
                 f'output_dir: "{output.as_posix()}"',
-                'text_column: text',
-                "max_seq_length: 32",
+                "max_seq_length: 128",
                 f'pad_token: "<|pad|>"',
                 f'bos_token: "<|taichu_start|>"',
                 f'eos_token: "<|taichu_end|>"',
-                "add_bos: true",
                 "add_eos: true",
+                "assistant_only_loss: true",
+                "train_on_eos: true",
                 "invalid_policy: error",
                 "shard_size: 2",
                 f"preprocess_batch_size: {batch_size}",
                 f"preprocess_workers: {workers}",
-                "cleaning:",
-                "  unicode_form: NFC",
-                "  min_chars: 2",
-                "  max_chars: 200000",
-                "  collapse_whitespace: false",
-                "  remove_control_chars: true",
-                '  oversize_policy: skip',
-                "  deduplicate: true",
                 "splits:",
                 "  train:",
                 f'    - "{train.as_posix()}"',
@@ -99,35 +102,31 @@ class TestUnifiedOfflinePreparation(unittest.TestCase):
             write_jsonl(
                 train,
                 [
-                    {"text": "first training document"},
-                    {"text": "second training document"},
-                    {"text": "second training document"},
+                    sft_record("first training document", 0),
+                    sft_record("second training document", 1),
+                    sft_record("third training document", 2),
                 ],
             )
-            write_jsonl(validation, [{"text": "validation document"}])
+            write_jsonl(validation, [sft_record("validation document", 3)])
             output = root / "prepared"
             config_path = root / "prepare.yaml"
             write_config(config_path, output, train, validation)
 
             config = load_preparation_config(config_path)
             manifest = UnifiedDataPreparation(config).run()
-            self.assertEqual(manifest["sample_type"], "pretraining")
-            self.assertEqual(
-                manifest["splits"]["train"]["stats"]["duplicate_records"],
-                1,
-            )
+            self.assertEqual(manifest["sample_type"], "sft")
             self.assertTrue((output / "dataset_manifest.json").is_file())
 
             with BinaryDatasetReader(output / "train") as reader:
-                self.assertEqual(reader.sample_type, "pretraining")
-                self.assertEqual(len(reader), 2)
+                self.assertEqual(reader.sample_type, "sft")
+                self.assertEqual(len(reader), 3)
                 self.assertTrue(reader[0].input_ids)
 
     def test_existing_output_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "train.jsonl"
-            write_jsonl(source, [{"text": "document one"}])
+            write_jsonl(source, [sft_record("document one")])
             output = root / "prepared"
             config_path = root / "prepare.yaml"
             write_config(config_path, output, source, source)
@@ -141,7 +140,14 @@ class TestUnifiedOfflinePreparation(unittest.TestCase):
             root = Path(directory)
             source = root / "source.parquet"
             pq.write_table(
-                pa.table({"text": ["first document", "second document"]}),
+                pa.table(
+                    {
+                        "messages": [
+                            sft_record("first document", 0)["messages"],
+                            sft_record("second document", 1)["messages"],
+                        ]
+                    }
+                ),
                 source,
                 row_group_size=1,
             )
@@ -160,9 +166,12 @@ class TestUnifiedOfflinePreparation(unittest.TestCase):
             validation = root / "validation.jsonl"
             write_jsonl(
                 train,
-                [{"text": f"training document {index}"} for index in range(8)],
+                [
+                    sft_record(f"training document {index}", index)
+                    for index in range(8)
+                ],
             )
-            write_jsonl(validation, [{"text": "validation document"}])
+            write_jsonl(validation, [sft_record("validation document", 99)])
             output = root / "prepared"
             config_path = root / "prepare.yaml"
             write_config(
@@ -228,8 +237,12 @@ class TestUnifiedConfigurationFiles(unittest.TestCase):
                 self.assertEqual(config.storage.format, "binary_mmap")
 
     def test_unified_preparation_examples_parse(self):
+        pretraining = load_pretraining_config(
+            ROOT / "configs" / "prepare_pretrain_data.yaml"
+        )
+        self.assertTrue(pretraining.dataset_id)
+        self.assertTrue(pretraining.sources)
         names = (
-            "prepare_pretrain_data.yaml",
             "prepare_sft_data.yaml",
             "prepare_preference_data.yaml",
             "prepare_reward_data.yaml",

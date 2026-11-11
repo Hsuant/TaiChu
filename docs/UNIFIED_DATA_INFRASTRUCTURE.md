@@ -403,34 +403,25 @@ Storage、Manifest、Sampler、Distributed Sampler、Mixer 和 Checkpoint 不应
 - 统一离线 JSONL 到 Binary 数据集。
 - 配置严格校验和单一 Runtime 路径。
 
-当前完整 unittest 回归为 `204 tests, 2 skipped`。
+当前完整回归为 `243 passed, 2 skipped, 150 subtests passed`。
 
 CPU 端到端验证还覆盖了：
 
-- `500` 条 JSONL -> Unified Binary Dataset。
+- `600` 条 JSONL -> Unified Binary Dataset。
 - 预训练 `79` 步、验证、生成诊断和 Checkpoint。
-- 从 `checkpoint-30` 恢复并在校验 Dataset ID/Version 后继续到第 `79` 步。
+- 从 `checkpoint-60` 恢复并在校验 Dataset ID/Version 后继续到第 `79` 步。
 
-本地 CPU 微基准：
-
-```powershell
-python benchmarks/benchmark_unified_data.py `
-  --config tests/test_train/pretrain_sim.yaml `
-  --batches 20 --batch-size 4 --num-workers 0
-```
-
-当前审计环境的一次结果为约 `1,094 samples/s`、`70,033 tokens/s`。该数字只用于
-验证监控链路可用，不作为 GPU 或多 Worker 生产吞吐结论。
-
-训练前 next-token 与模型正确性预检：
+完整测试与 CPU 端到端预检：
 
 ```powershell
-python benchmarks/preflight_next_token.py `
-  --model-config configs/TaiChu_Small_80M.yaml `
-  --report reports/next_token_pipeline_report_80m.json
+python -m pytest -q
+python tests/test_train/run.py
 ```
 
-该工具会输出并保存：
+`tests/test_train/run.py` 会完成文档级数据准备、79 步训练、验证、生成诊断、
+Checkpoint 和最终模型保存。吞吐数字不作为 GPU 或多 Worker 生产结论。
+
+测试覆盖：
 
 - 离线数据生成结果与 Binary 读取结果。
 - `input_ids`、`labels`、`attention_mask` 的逐位置对比。

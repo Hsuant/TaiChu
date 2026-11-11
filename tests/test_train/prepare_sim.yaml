@@ -1,32 +1,50 @@
 task_type: "pretraining"
 dataset_id: "taichu-sim-v1"
-version: "1"
-
+version: "2"
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
 output_dir: "./tests/test_train/unified"
-
 text_column: "text"
-max_seq_length: 64
-
 pad_token: "<|pad|>"
 bos_token: "<|taichu_start|>"
 eos_token: "<|taichu_end|>"
-add_bos: true
-add_eos: true
 invalid_policy: "skip"
-shard_size: 16
+shard_size: 32
+processing_workers: 1
+output_workers: 1
+fingerprint_batch_size: 16
+
+segmentation:
+  max_sequence_length: 64
+  max_segment_content_tokens: 62
+  overlap_tokens: 8
+  min_fragment_tokens: 1
+
+dedup:
+  enabled: true
+  ngram_size: 5
+  similarity_threshold: 0.8
+  num_hashes: 32
+  bands: 8
+  exact_jaccard: true
+
+splits:
+  train_ratio: 0.8
+  validation_ratio: 0.2
+  diagnostic_ratio: 0.0
+  seed: 42
 
 cleaning:
   unicode_form: "NFC"
-  min_chars: 2
+  min_chars: 1
   max_chars: 200000
   collapse_whitespace: false
   remove_control_chars: true
   oversize_policy: "skip"
   deduplicate: true
 
-splits:
-  train:
-    - "./tests/test_train/train.jsonl"
-  validation:
-    - "./tests/test_train/val.jsonl"
+sources:
+  - name: "simulation"
+    language: "mixed"
+    paths:
+      - "./tests/test_train/experiments/train.jsonl"
+      - "./tests/test_train/experiments/val.jsonl"
