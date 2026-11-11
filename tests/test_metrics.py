@@ -5,7 +5,6 @@ import json
 import math
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -14,12 +13,15 @@ from tokenizers import Tokenizer
 from model.config import ModelConfig
 from model.model import TaiChuModel
 from model.moe import MoEConfig, SparseMoE
-from utils.metrics import (
-    EfficientGradientNoiseScale,
-    EvaluationMetricsManager,
-    ValidationMetrics,
+from training.diagnostics import GradientNormMonitor, TrainingDiagnostics
+from training.model_info import gradient_summary, peak_flops
+from training.validation import (
+    compute_bits_per_byte,
+    compute_empty_prefix_eos_metrics,
+    compute_percentile_ce,
+    compute_perplexity,
+    compute_token_statistics,
 )
-from utils.model_utils import ModelInspector
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,7 +64,7 @@ class TestValidationMetricFormulas(unittest.TestCase):
             tokenizer.get_vocab_size(),
         )
 
-        stats = ValidationMetrics.compute_token_statistics(
+        stats = compute_token_statistics(
             logits,
             labels,
             tokenizer=tokenizer,
@@ -105,7 +107,7 @@ class TestValidationMetricFormulas(unittest.TestCase):
         self.assertEqual(stats.bpb_bytes, expected_bytes)
         self.assertAlmostEqual(stats.bpb_nll_nats, expected_nll, places=5)
 
-        bpb = ValidationMetrics.compute_bits_per_byte(
+        bpb = compute_bits_per_byte(
             stats.bpb_nll_nats,
             stats.bpb_bytes,
         )
@@ -117,37 +119,33 @@ class TestValidationMetricFormulas(unittest.TestCase):
 
     def test_exact_percentiles_use_linear_quantiles(self):
         losses = torch.tensor([1.0, 2.0, 3.0, 4.0])
-        with patch(
-            "utils.metrics.torch.quantile",
-            side_effect=RuntimeError("quantile() input tensor is too large"),
-        ):
-            result = ValidationMetrics.compute_percentile_ce(
-                losses,
-                [0.5, 0.9, 0.95],
-            )
+        result = compute_percentile_ce(
+            losses,
+            [0.5, 0.9, 0.95],
+        )
         self.assertAlmostEqual(result["ce_p50"], 2.5)
         self.assertAlmostEqual(result["ce_p90"], 3.7)
         self.assertAlmostEqual(result["ce_p95"], 3.85)
-        empty = ValidationMetrics.compute_percentile_ce(
+        empty = compute_percentile_ce(
             torch.empty(0),
             [0.5],
         )
         self.assertIsNone(empty["ce_p50"])
 
     def test_perplexity_is_none_instead_of_inf(self):
-        self.assertEqual(ValidationMetrics.compute_perplexity(0.0), 1.0)
-        self.assertIsNotNone(ValidationMetrics.compute_perplexity(10.0))
-        self.assertIsNone(ValidationMetrics.compute_perplexity(float("inf")))
-        self.assertIsNone(ValidationMetrics.compute_perplexity(float("nan")))
-        self.assertIsNone(ValidationMetrics.compute_perplexity(-1.0))
-        self.assertIsNone(ValidationMetrics.compute_perplexity(1000.0))
+        self.assertEqual(compute_perplexity(0.0), 1.0)
+        self.assertIsNotNone(compute_perplexity(10.0))
+        self.assertIsNone(compute_perplexity(float("inf")))
+        self.assertIsNone(compute_perplexity(float("nan")))
+        self.assertIsNone(compute_perplexity(-1.0))
+        self.assertIsNone(compute_perplexity(1000.0))
 
     def test_empty_prefix_metric_is_explicit_and_restores_mode(self):
         torch.manual_seed(73)
         model = _tiny_model()
         model.train()
         bos_id, eos_id = 1, 2
-        result = ValidationMetrics.compute_empty_prefix_eos_metrics(
+        result = compute_empty_prefix_eos_metrics(
             model,
             bos_token_id=bos_id,
             eos_token_id=eos_id,
@@ -171,7 +169,7 @@ class TestValidationMetricFormulas(unittest.TestCase):
             places=5,
         )
 
-        invalid = ValidationMetrics.compute_empty_prefix_eos_metrics(
+        invalid = compute_empty_prefix_eos_metrics(
             model,
             bos_token_id=2,
             eos_token_id=2,
@@ -185,23 +183,10 @@ class TestValidationMetricFormulas(unittest.TestCase):
             },
         )
 
-    def test_legacy_blank_ppl_returns_none_and_restores_mode(self):
-        model = _tiny_model()
-        model.train()
-        tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
-        self.assertIsNone(
-            ValidationMetrics.compute_blank_ppl(
-                model,
-                tokenizer,
-                device=torch.device("cpu"),
-            )
-        )
-        self.assertTrue(model.training)
-
     def test_metrics_json_is_strict(self):
         metrics = {
             "val_loss": 1.5,
-            "val_perplexity": ValidationMetrics.compute_perplexity(1.5),
+            "val_perplexity": compute_perplexity(1.5),
             "empty_prefix_eos_ppl": None,
         }
         encoded = json.dumps(metrics, allow_nan=False)
@@ -214,32 +199,35 @@ class TestValidationMetricFormulas(unittest.TestCase):
             labels=torch.tensor([[1, 2, 3]]),
         ).loss
         loss.backward()
-        manager = EvaluationMetricsManager()
-        manager.update_gradient(model)
-        metrics = manager.get_all_metrics()
+        manager = TrainingDiagnostics()
+        grad_norm = torch.linalg.vector_norm(
+            torch.stack(
+                [
+                    torch.linalg.vector_norm(parameter.grad.float())
+                    for parameter in model.parameters()
+                    if parameter.grad is not None
+                ]
+            )
+        )
+        manager.update_gradient(grad_norm)
+        metrics = manager.metrics()
         self.assertIn("grad_norm_sq_variance_ratio", metrics)
         self.assertNotIn("gradient_noise_scale", metrics)
 
     @unittest.skipIf(torch.cuda.is_available(), "CPU-only MFU assertion")
     def test_cpu_peak_flops_disables_mfu(self):
-        self.assertEqual(ModelInspector.get_peak_flops(), 0.0)
-        manager = EvaluationMetricsManager()
-        self.assertNotIn("mfu_average", manager.get_all_metrics())
+        self.assertEqual(peak_flops(), 0.0)
+        manager = TrainingDiagnostics()
+        self.assertNotIn("mfu_average", manager.metrics())
 
-    def test_efficient_gradient_diagnostic_collects_rmsnorm(self):
+    def test_gradient_diagnostic_updates_from_norm(self):
         model = _tiny_model()
-        tracker = EfficientGradientNoiseScale(model)
-        self.assertGreater(len(tracker.norm_layers), 0)
-        loss = model(
-            torch.tensor([[1, 2, 3]]),
-            labels=torch.tensor([[1, 2, 3]]),
-        ).loss
-        loss.backward()
-        value = tracker.update(model)
+        tracker = GradientNormMonitor()
+        value = tracker.update(3.0)
         self.assertTrue(math.isfinite(value))
         self.assertIn(
             "grad_norm_sq_variance_ratio",
-            tracker.get_metrics(),
+            tracker.metrics(),
         )
 
 
@@ -283,7 +271,7 @@ class TestModelLossValidation(unittest.TestCase):
             model(input_ids, labels=invalid)
 
     def test_gradient_summary_without_gradients_is_finite(self):
-        summary = ModelInspector.gradient_summary(_tiny_model())
+        summary = gradient_summary(_tiny_model())
         self.assertEqual(summary["grad_norm"], 0.0)
         self.assertEqual(summary["grad_max"], 0.0)
         self.assertEqual(summary["grad_min"], 0.0)

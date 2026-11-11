@@ -1,17 +1,20 @@
-"""检查点管理器。
+"""原子化训练检查点与恢复状态管理。"""
 
-提供模型、优化器、调度器等的保存与恢复功能，支持：
-- 按指定步数/评估指标保存最佳模型
-- 自动保存最近 N 个检查点（滚动删除）
-- 从检查点完整恢复训练状态
-"""
+from __future__ import annotations
 
 import os
+import random
+import re
+from dataclasses import dataclass
 from pathlib import Path
-import torch
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, Mapping, Optional
 
+import numpy as np
+import torch
 from torch.optim.lr_scheduler import LRScheduler
+
+
+CHECKPOINT_VERSION = 2
 
 
 def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -47,15 +50,44 @@ def resolve_experiment_dir_from_checkpoint(filepath: str) -> str:
     return str(checkpoint_path.parent)
 
 
+def capture_rng_state() -> dict[str, Any]:
+    """Capture Python, NumPy, CPU Torch, and CUDA RNG state."""
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: Mapping[str, Any] | None) -> None:
+    """Restore a state produced by :func:`capture_rng_state`."""
+    if state is None:
+        return
+    if "python" in state:
+        random.setstate(state["python"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
+    if "torch_cpu" in state:
+        torch.set_rng_state(state["torch_cpu"])
+    if "torch_cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointLoadResult:
+    global_step: int
+    checkpoint: dict[str, Any]
+
+
 class CheckpointManager:
     """检查点管理器。
 
     Attributes:
         output_dir: 检查点保存目录。
         keep_last_n: 保留最近 N 个检查点文件（-1 表示保留全部）。
-        best_metric_name: 用于选择最佳模型的指标名称（如 "val_loss"）。
-        best_metric_mode: "min" 或 "max"，越小越好还是越大越好。
-        best_metric_value: 当前最佳指标值。
         saved_checkpoints: 已保存的检查点文件列表。
     """
 
@@ -63,27 +95,64 @@ class CheckpointManager:
         self,
         output_dir: str = "./checkpoints",
         keep_last_n: int = 3,
-        best_metric_name: str = "val_loss",
-        best_metric_mode: str = "min",
-        best_subdir: str = "",
     ):
         """初始化检查点管理器。
 
         Args:
             output_dir: 检查点保存目录。
             keep_last_n: 保留最近几个检查点，超过则删除最旧的。
-            best_metric_name: 最佳模型评估指标名称。
-            best_metric_mode: 指标优化方向，'min' 或 'max'。
-            best_subdir: 最佳模型权重存放子目录
         """
-        self.output_dir = output_dir
+        self.output_dir = str(Path(output_dir).resolve())
         os.makedirs(self.output_dir, exist_ok=True)
-        self.best_subdir = best_subdir
         self.keep_last_n = keep_last_n
-        self.best_metric_name = best_metric_name
-        self.best_metric_mode = best_metric_mode
-        self.best_metric_value = float("inf") if best_metric_mode == "min" else float("-inf")
-        self.saved_checkpoints = []
+        self.saved_checkpoints: list[str] = []
+        self.protected_checkpoints: set[str] = set()
+        self._discover_managed_checkpoints()
+
+    def _discover_managed_checkpoints(self) -> None:
+        directory = Path(self.output_dir) / "checkpoints"
+        if not directory.is_dir():
+            return
+        paths = sorted(
+            directory.glob("checkpoint-[0-9]*.pt"),
+            key=lambda item: int(re.search(r"checkpoint-(\d+)", item.name).group(1)),
+        )
+        self.saved_checkpoints = [str(path) for path in paths]
+
+    def protect(self, filepath: str | Path) -> None:
+        """Keep a checkpoint during retention even when it is not the newest."""
+        self.protected_checkpoints.add(str(Path(filepath)))
+
+    def prune(self) -> list[Path]:
+        """Apply the rolling retention while preserving explicitly protected files."""
+        if self.keep_last_n < 0 or len(self.saved_checkpoints) <= self.keep_last_n:
+            return []
+
+        def step(path: str) -> int:
+            match = re.search(r"checkpoint-(\d+)", Path(path).name)
+            return int(match.group(1)) if match else -1
+
+        ordered = sorted(self.saved_checkpoints, key=step)
+        protected = set(self.protected_checkpoints)
+        keep = {path for path in ordered if path in protected}
+        kept_unprotected = 0
+        for path in reversed(ordered):
+            if path in protected:
+                continue
+            if kept_unprotected >= self.keep_last_n:
+                break
+            keep.add(path)
+            kept_unprotected += 1
+
+        removed = []
+        for path in ordered:
+            if path in keep:
+                continue
+            target = Path(path)
+            target.unlink(missing_ok=True)
+            removed.append(target)
+        self.saved_checkpoints = [path for path in ordered if path in keep]
+        return removed
 
     def _build_state(
         self,
@@ -92,7 +161,7 @@ class CheckpointManager:
         scheduler: Optional[LRScheduler] = None,
         scaler: Optional[Any] = None,
         global_step: int = 0,
-        metrics: Optional[Dict[str, float]] = None,
+        metrics: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """构建检查点字典。
@@ -111,8 +180,10 @@ class CheckpointManager:
         """
         raw_model = unwrap_model(model)
         state = {
+            "checkpoint_version": CHECKPOINT_VERSION,
             "global_step": global_step,
             "model_state_dict": raw_model.state_dict(),
+            "rng_state": capture_rng_state(),
         }
         model_config = getattr(raw_model, "config", None)
         if model_config is not None and hasattr(model_config, "to_dict"):
@@ -136,7 +207,7 @@ class CheckpointManager:
         scheduler: Optional[LRScheduler] = None,
         scaler: Optional[Any] = None,
         global_step: int = 0,
-        metrics: Optional[Dict[str, float]] = None,
+        metrics: Optional[Dict[str, Any]] = None,
         managed: bool = True,
         **kwargs,
     ) -> str:
@@ -157,11 +228,9 @@ class CheckpointManager:
         Returns:
             实际保存的文件路径。
         """
-        filepath = os.path.join(self.output_dir, filename)
+        filepath = str(Path(self.output_dir) / filename)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         state = self._build_state(model, optimizer, scheduler, scaler, global_step, metrics, **kwargs)
-        # 保存当前最佳指标值以便恢复
-        state["best_metric_value"] = self.best_metric_value
         temporary_path = f"{filepath}.tmp-{os.getpid()}"
         try:
             with open(temporary_path, "wb") as stream:
@@ -175,66 +244,11 @@ class CheckpointManager:
 
         # 维护 saved_checkpoints 列表
         if managed:
+            if filepath in self.saved_checkpoints:
+                self.saved_checkpoints.remove(filepath)
             self.saved_checkpoints.append(filepath)
-            # 如果超出保留数量，删除旧检查点
-            if self.keep_last_n > 0 and len(self.saved_checkpoints) > self.keep_last_n:
-                old_file = self.saved_checkpoints.pop(0)
-                if os.path.exists(old_file):
-                    os.remove(old_file)
+            self.prune()
         return filepath
-
-    def save_best(
-        self,
-        model: torch.nn.Module,
-        metrics: Dict[str, float],
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        scheduler: Optional[LRScheduler] = None,
-        scaler: Optional[Any] = None,
-        global_step: int = 0,
-        **kwargs
-    ) -> Optional[str]:
-        """根据指标保存最佳模型。
-
-        若当前指标优于历史最佳，则保存为 'best_model.pt'。
-
-        Args:
-            model: 模型。
-            metrics: 包含评估指标的字典，需包含 self.best_metric_name。
-            optimizer: 优化器。
-            scheduler: 调度器。
-            scaler: 混合精度缩放器。
-            global_step: 全局步数。
-            **kwargs: 额外状态（如 early_stopping_state）
-
-        Returns:
-            若保存成功则返回文件路径，否则返回 None。
-        """
-        if self.best_metric_name not in metrics:
-            return None
-        current_val = metrics[self.best_metric_name]
-        is_better = (
-            (self.best_metric_mode == "min" and current_val < self.best_metric_value) or
-            (self.best_metric_mode == "max" and current_val > self.best_metric_value)
-        )
-        if is_better:
-            self.best_metric_value = current_val
-            # 构建完整保存路径
-            if self.best_subdir:
-                best_filename = os.path.join(self.best_subdir, "best_model.pt")
-            else:
-                best_filename = "best_model.pt"
-            return self.save(
-                filename=best_filename,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                scaler=scaler,
-                global_step=global_step,
-                metrics=metrics,
-                managed=False,
-                **kwargs,
-            )
-        return None
 
     def load(
         self,
@@ -244,7 +258,7 @@ class CheckpointManager:
         scheduler: Optional[LRScheduler] = None,
         scaler: Optional[Any] = None,
         map_location: str = "cpu",
-    ) -> Tuple[int, Optional[float], Dict[str, Any]]:
+    ) -> CheckpointLoadResult:
         """从检查点文件恢复训练状态。
 
         Args:
@@ -256,14 +270,23 @@ class CheckpointManager:
             map_location: 设备映射。
 
         Returns:
-            (global_step, best_metric_value, checkpoint):
-            - 恢复后的全局步数
-            - 最佳指标值
-            - 原始检查点字典（用于恢复额外状态，如早停计数器）
+            Immutable load result containing the global step and the raw
+            checkpoint needed for task-specific state restoration.
         """
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"检查点文件不存在: {filepath}")
-        checkpoint = torch.load(filepath, map_location=map_location)
+        checkpoint = torch.load(
+            filepath,
+            map_location=map_location,
+            weights_only=False,
+        )
+        if not isinstance(checkpoint, dict):
+            raise ValueError("checkpoint root must be a dictionary")
+        if "artifact_type" in checkpoint:
+            raise ValueError(
+                "inference artifacts cannot be used to resume training; "
+                "select a checkpoint from checkpoints/"
+            )
         model_state_dict = strip_checkpoint_prefixes(checkpoint["model_state_dict"])
         unwrap_model(model).load_state_dict(model_state_dict)
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
@@ -272,11 +295,14 @@ class CheckpointManager:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if scaler is not None and "scaler_state_dict" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        if "best_metric_value" in checkpoint:
-            self.best_metric_value = checkpoint["best_metric_value"]
+        restore_rng_state(checkpoint.get("rng_state"))
         global_step = checkpoint.get("global_step", 0)
-        best_metric_value = checkpoint.get("best_metric_value", None)
-        return global_step, best_metric_value, checkpoint
+        if not isinstance(global_step, int) or global_step < 0:
+            raise ValueError("checkpoint global_step must be a non-negative integer")
+        return CheckpointLoadResult(
+            global_step=global_step,
+            checkpoint=checkpoint,
+        )
 
     def get_latest_checkpoint(self) -> Optional[str]:
         """获取最新的检查点文件路径。
@@ -286,9 +312,23 @@ class CheckpointManager:
         """
         if self.saved_checkpoints:
             return self.saved_checkpoints[-1]
-        # 也可扫描目录
-        files = [f for f in os.listdir(self.output_dir) if f.endswith(".pt") and f != "best_model.pt"]
+        directory = Path(self.output_dir) / "checkpoints"
+        if not directory.is_dir():
+            return None
+        files = [path for path in directory.glob("*.pt")]
         if not files:
             return None
-        files.sort(key=lambda x: os.path.getmtime(os.path.join(self.output_dir, x)))
-        return os.path.join(self.output_dir, files[-1])
+        files.sort(key=lambda path: path.stat().st_mtime)
+        return str(files[-1])
+
+
+__all__ = [
+    "CHECKPOINT_VERSION",
+    "CheckpointLoadResult",
+    "CheckpointManager",
+    "capture_rng_state",
+    "resolve_experiment_dir_from_checkpoint",
+    "restore_rng_state",
+    "strip_checkpoint_prefixes",
+    "unwrap_model",
+]

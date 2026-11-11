@@ -12,14 +12,15 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from model.attention import TaiChuCausalSelfAttention
-from model.config import ModelConfig
+from model.config import ModelConfig, load_model_config
 from model.model import CausalLMOutput, TaiChuModel
 from model.positional_encoding import RoPEPositionEncoding, apply_rotary_pos_emb
-from utils.checkpoint import (
+from training.checkpoint import (
     CheckpointManager,
     strip_checkpoint_prefixes,
 )
-from utils.config_loader import load_model_config, load_pretrain_config
+from training.config import load_pretraining_config
+from training.model_info import parameter_count
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,7 +64,7 @@ class TestTokenizerAndConfig(unittest.TestCase):
     def test_mature_tokenizer_matches_audit_config(self):
         tokenizer = Tokenizer.from_file(str(GPT2_TOKENIZER_PATH))
         config = load_model_config(str(ROOT / "configs" / "audit_gpt2_model.yaml"))
-        pretrain = load_pretrain_config(
+        pretrain = load_pretraining_config(
             str(ROOT / "configs" / "audit_gpt2_pretrain.yaml")
         )
 
@@ -163,7 +164,7 @@ class TestTokenizerAndConfig(unittest.TestCase):
                 model_config = load_model_config(
                     str(ROOT / "configs" / model_name)
                 )
-                pretrain = load_pretrain_config(
+                pretrain = load_pretraining_config(
                     str(ROOT / "configs" / train_name)
                 )
                 self.assertEqual(
@@ -237,7 +238,7 @@ class TestModelMath(unittest.TestCase):
             + config.num_layers * per_layer
             + config.hidden_size
         )
-        self.assertEqual(self.model.get_num_params(), expected)
+        self.assertEqual(parameter_count(self.model), expected)
 
     def test_future_tokens_do_not_change_prefix_logits(self):
         input_ids = torch.randint(0, 128, (1, 12))

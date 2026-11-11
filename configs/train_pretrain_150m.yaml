@@ -52,7 +52,6 @@ data:
 
 training:
   target_tokens: "5.2B"
-  batch_size: 4
   gradient_accumulation_steps: 64
   save_interval: 1000
   log_interval: 10
@@ -61,7 +60,6 @@ training:
   use_mixed_precision: true
   dtype: "bfloat16"
   seed: 42
-  local_rank: -1
   compile_model: true
   compile_mode: "auto"
   compile_dynamic: true

@@ -5,7 +5,8 @@
 
 import re
 from dataclasses import dataclass, fields
-from typing import Optional, Dict, Any, Union, get_args, get_origin
+from pathlib import Path
+from typing import Optional, Dict, Any, Union, get_args, get_origin, get_type_hints
 
 from model.moe import MoEConfig
 
@@ -14,14 +15,14 @@ _NUMERIC_INT_RE = re.compile(r'^[+-]?\d+$')
 _NUMERIC_FLOAT_RE = re.compile(r'^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$')
 
 
-def _coerce_numeric_strings(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+def coerce_numeric_strings(cls, data: Dict[str, Any]) -> Dict[str, Any]:
     """将声明为数值类型的字段中、由配置解析产生的字符串还原为数值。
 
     例如 PyYAML 会把不带小数点的科学计数法 ``1e-6`` 解析为字符串，
     此函数依据 dataclass 字段类型将其转回 ``float``/``int``，避免
     数值字段以字符串形式进入后续计算。
     """
-    field_types = {f.name: f.type for f in fields(cls)}
+    field_types = get_type_hints(cls)
     result = dict(data)
     for key, value in list(result.items()):
         if not isinstance(value, str) or key not in field_types:
@@ -342,7 +343,7 @@ class ModelConfig:
 
         # 依据字段声明类型还原数值字符串（PyYAML 会把不带小数点的
         # 科学计数法如 1e-6 解析为字符串，这里统一转回数值）
-        data = _coerce_numeric_strings(cls, data)
+        data = coerce_numeric_strings(cls, data)
 
         return cls(**data)
 
@@ -386,3 +387,15 @@ class ModelConfig:
         if moe_dict:
             result["moe"] = moe_dict
         return result
+
+
+def load_model_config(path: str | Path) -> ModelConfig:
+    """Load a model configuration from YAML."""
+    import yaml
+
+    config_path = Path(path)
+    with config_path.open("r", encoding="utf-8") as stream:
+        raw = yaml.safe_load(stream) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("model config must be a YAML mapping")
+    return ModelConfig.from_dict(raw)

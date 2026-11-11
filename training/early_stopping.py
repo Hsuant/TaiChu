@@ -1,9 +1,4 @@
-# -*- coding: utf-8 -*-
-"""早停机制模块。
-
-提供 EarlyStopping 类，用于监控验证指标并在模型不再改善时提前终止训练。
-支持配置监控指标、耐心值、最小改善阈值和优化模式（min/max）。
-"""
+"""Validation-driven early stopping state."""
 
 from typing import Dict, Any, Optional
 

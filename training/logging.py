@@ -1,7 +1,4 @@
-"""训练日志管理器。
-
-提供统一的日志记录接口，集成 TensorBoard、控制台输出与文本文件记录。
-"""
+"""Local and optional remote experiment logging."""
 
 import logging
 import os
@@ -10,6 +7,11 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import swanlab
+except ImportError:
+    swanlab = None
 
 
 class _UnicodeSafeStreamHandler(logging.StreamHandler):
@@ -228,3 +230,86 @@ class LogManager:
         for handler in self.logger.handlers:
             handler.close()
             self.logger.removeHandler(handler)
+
+
+class SwanLabLogger:
+    """Optional SwanLab metric sink for the main process."""
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        experiment_name: str | None,
+        config: dict[str, Any],
+        log_dir: str,
+        workspace: str | None = None,
+        run_id: str | None = None,
+        resume: str | None = None,
+        init_kwargs: dict[str, Any] | None = None,
+        disabled: bool = False,
+        global_rank: int = 0,
+    ) -> None:
+        self.enabled = global_rank == 0 and not disabled
+        self.run = None
+        self.run_id = None
+        self.project = project
+        self.workspace = workspace
+        self.experiment_name = experiment_name
+        self._finished = False
+        if not self.enabled:
+            return
+        if swanlab is None:
+            raise ImportError(
+                "SwanLab is enabled but the 'swanlab' package is not installed"
+            )
+
+        options = dict(init_kwargs or {})
+        effective_id = run_id or options.get("id")
+        effective_resume = resume or options.get("resume")
+        if effective_resume and not effective_id:
+            raise ValueError("SwanLab resume requires a non-empty run id")
+        resolved_name = experiment_name or f"run_{os.getpid()}"
+        self.experiment_name = resolved_name
+        options.update(
+            project=project,
+            experiment_name=resolved_name,
+            config=config,
+            logdir=log_dir,
+        )
+        if workspace:
+            options["workspace"] = workspace
+        if effective_id:
+            options["id"] = effective_id
+        if effective_resume:
+            options["resume"] = effective_resume
+
+        self.run = swanlab.init(**options)
+        self.run_id = (
+            str(getattr(self.run, "id", "") or effective_id or "")
+            or None
+        )
+
+    def log_metrics(
+        self,
+        metrics: dict[str, float],
+        step: int | None = None,
+    ) -> None:
+        if self.enabled:
+            swanlab.log(metrics, step=step)
+
+    def log_text(
+        self,
+        tag: str,
+        text: str,
+        step: int | None = None,
+    ) -> None:
+        if self.enabled:
+            swanlab.log({tag: swanlab.Text(text, caption=tag)}, step=step)
+
+    def finish(self) -> None:
+        if self.enabled and self.run is not None and not self._finished:
+            swanlab.finish()
+            self._finished = True
+
+
+__all__ = ["LogManager", "SwanLabLogger"]

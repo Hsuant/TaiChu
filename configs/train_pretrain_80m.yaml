@@ -92,11 +92,9 @@ data:
 # 训练循环配置。
 training:
   # 目标训练 Token 数；用于动态计算最大训练步数。
-  target_tokens: "8B"
-  # 每张卡前向使用的样本 Batch 大小。
-  batch_size: 1
+  target_tokens: "4B"
   # 每次优化器更新前的梯度累计步数。
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 32
   # 每隔多少优化器 Step 保存一次检查点。
   save_interval: 1000
   # 每隔多少优化器 Step 输出一次训练日志。
@@ -113,8 +111,6 @@ training:
   max_grad_norm: 1.0
   # 训练数据顺序、Dropout 和初始化的固定随机种子。
   seed: 42
-  # 当前进程的本地 Rank；-1 表示由启动器自动检测。
-  local_rank: -1
   # 是否启用 torch.compile。
   compile_model: true
   # torch.compile 模式；default 适合多卡训练。

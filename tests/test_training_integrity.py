@@ -20,25 +20,25 @@ from dataset.batching import PretrainingBatchBuilder
 from dataset.config import StorageConfig, UnifiedDataConfig
 from dataset.packing import PretrainingPacker
 from dataset.schema import PretrainingSample
-from model.config import ModelConfig
+from model.config import ModelConfig, load_model_config
 from model.model import TaiChuModel
+from training.checkpoint import (
+    CheckpointManager,
+    resolve_experiment_dir_from_checkpoint,
+)
+from training.config import load_pretraining_config
+from training.logging import LogManager, SwanLabLogger
+from training.model_setup import (
+    compile_preflight,
+    compile_training_model,
+    warmup_compiled_training,
+)
+from training.optimization import ScheduleSteps, wsd_lr_lambda
 from tokenizer.special_tokens import (
     BOS_TOKEN,
     EOS_TOKEN,
     PAD_TOKEN,
     SPECIAL_TOKENS,
-)
-from utils.checkpoint import (
-    CheckpointManager,
-    resolve_experiment_dir_from_checkpoint,
-)
-from utils.config_loader import load_model_config, load_pretrain_config
-from utils.logger import LogManager
-from utils.swanlab_logger import SwanLabLogger
-from utils.train_utils import (
-    compile_model_for_training,
-    get_wsd_lr_lambda,
-    training_compile_preflight,
 )
 
 
@@ -140,7 +140,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         tokenizer = Tokenizer.from_file(str(TOKENIZER_PATH))
         cases = [
             (
-                ROOT / "configs" / "train_pretrain_config.yaml",
+                ROOT / "configs" / "train_pretrain_80m.yaml",
                 ROOT / "configs" / "TaiChu_80M.yaml",
             ),
             (
@@ -150,7 +150,7 @@ class TestConfigurationIntegrity(unittest.TestCase):
         ]
         for pretrain_path, model_path in cases:
             with self.subTest(config=pretrain_path.name):
-                pretrain = load_pretrain_config(str(pretrain_path))
+                pretrain = load_pretraining_config(str(pretrain_path))
                 model_config = load_model_config(str(model_path))
                 self.assertEqual(
                     tokenizer.token_to_id(pretrain.data.bos_token),
@@ -296,7 +296,7 @@ class TestDataAndLossIntegrity(unittest.TestCase):
 class TestOptimizationIntegrity(unittest.TestCase):
     @staticmethod
     def _optimizer_step_trainer():
-        from trainer.train_pretrain import TaiChuTrainer
+        from trainer.train_pretrain import CausalLMTrainer
 
         torch.manual_seed(41)
         model = _tiny_model(vocab_size=32)
@@ -305,7 +305,7 @@ class TestOptimizationIntegrity(unittest.TestCase):
             optimizer,
             lambda _: 1.0,
         )
-        trainer = TaiChuTrainer.__new__(TaiChuTrainer)
+        trainer = CausalLMTrainer.__new__(CausalLMTrainer)
         trainer.model = model
         trainer.optimizer = optimizer
         trainer.scheduler = scheduler
@@ -425,23 +425,23 @@ class TestOptimizationIntegrity(unittest.TestCase):
     def test_compile_preflight_skips_missing_windows_compiler(self):
         with (
             patch(
-                "utils.train_utils.torch.cuda.is_available",
+                "training.model_setup.torch.cuda.is_available",
                 return_value=False,
             ),
-            patch("utils.train_utils.sys.platform", "win32"),
-            patch("utils.train_utils.shutil.which", return_value=None),
+            patch("training.model_setup.sys.platform", "win32"),
+            patch("training.model_setup.shutil.which", return_value=None),
         ):
-            available, reason = training_compile_preflight()
+            available, reason = compile_preflight()
         self.assertFalse(available)
         self.assertIn("MSVC cl", reason)
 
     def test_compile_helper_uses_requested_mode(self):
         model = _tiny_model()
         with patch(
-            "utils.train_utils.torch.compile",
+            "training.model_setup.torch.compile",
             return_value=model,
         ) as compile_mock:
-            result = compile_model_for_training(
+            result = compile_training_model(
                 model,
                 mode="default",
                 dynamic=False,
@@ -458,15 +458,15 @@ class TestOptimizationIntegrity(unittest.TestCase):
         model = _tiny_model()
         with (
             patch(
-                "utils.train_utils.torch.cuda.is_available",
+                "training.model_setup.torch.cuda.is_available",
                 return_value=True,
             ),
             patch(
-                "utils.train_utils.torch.compile",
+                "training.model_setup.torch.compile",
                 return_value=model,
             ) as compile_mock,
         ):
-            compile_model_for_training(
+            compile_training_model(
                 model,
                 mode="auto",
                 dynamic=True,
@@ -480,14 +480,14 @@ class TestOptimizationIntegrity(unittest.TestCase):
         )
 
     def test_compile_warmup_preserves_parameters_and_rng(self):
-        from trainer.train_pretrain import _warmup_compiled_training
+        from training.model_setup import warmup_compiled_training
 
         torch.manual_seed(29)
         model = _tiny_model(vocab_size=32)
         before = [parameter.detach().clone() for parameter in model.parameters()]
         rng_before = torch.random.get_rng_state().clone()
 
-        _warmup_compiled_training(
+        warmup_compiled_training(
             model,
             device=torch.device("cpu"),
             vocab_size=32,
@@ -535,10 +535,13 @@ class TestOptimizationIntegrity(unittest.TestCase):
         self.assertLess(losses[-1], losses[0] * 0.7)
 
     def test_wsd_schedule_has_expected_phases(self):
-        schedule = get_wsd_lr_lambda(
-            warmup_steps=4,
-            stable_steps=6,
-            max_steps=20,
+        schedule = wsd_lr_lambda(
+            ScheduleSteps(
+                warmup=4,
+                stable=6,
+                decay=10,
+                max_steps=20,
+            ),
             min_lr_ratio=0.1,
             decay_type="cosine",
         )
@@ -561,10 +564,10 @@ class TestOptimizationIntegrity(unittest.TestCase):
             path = manager.save("model.pt", model=model, global_step=7)
             self.assertFalse(list(Path(directory).glob("*.tmp-*")))
             restored = _tiny_model()
-            step, _, _ = manager.load(path, model=restored)
+            result = manager.load(path, model=restored)
             actual = restored(input_ids).logits
 
-        self.assertEqual(step, 7)
+        self.assertEqual(result.global_step, 7)
         self.assertTrue(torch.equal(expected, actual))
 
     def test_checkpoint_restores_scheduler_epoch_without_override(self):
@@ -624,7 +627,7 @@ class TestLoggingIntegrity(unittest.TestCase):
         fake_swanlab = Mock()
         fake_swanlab.init.return_value.id = "gmdnabup"
 
-        with patch("utils.swanlab_logger.swanlab", fake_swanlab):
+        with patch("training.logging.swanlab", fake_swanlab):
             logger = SwanLabLogger(
                 project="TaiChu-Small",
                 experiment_name="taichu_80m",
@@ -649,15 +652,15 @@ class TestLoggingIntegrity(unittest.TestCase):
         self.assertEqual(logger.run_id, "gmdnabup")
 
     def test_checkpoint_metadata_contains_swanlab_run_identity(self):
-        from trainer.train_pretrain import TaiChuTrainer
+        from trainer.train_pretrain import CausalLMTrainer
 
-        trainer = TaiChuTrainer.__new__(TaiChuTrainer)
+        trainer = CausalLMTrainer.__new__(CausalLMTrainer)
         trainer.swanlab_logger = Mock(
             run_id="gmdnabup",
             project="TaiChu-Small",
             workspace="ByteWyrm",
         )
-        metadata = trainer._checkpoint_swanlab_state()
+        metadata = trainer._checkpoint_metadata()
 
         self.assertEqual(
             metadata,
@@ -675,23 +678,22 @@ class TestLoggingIntegrity(unittest.TestCase):
                 global_step=3,
                 **metadata,
             )
-            _, _, restored = manager.load(path, model=_tiny_model())
+            restored = manager.load(path, model=_tiny_model()).checkpoint
 
         self.assertEqual(restored["swanlab_run_id"], "gmdnabup")
         self.assertEqual(restored["swanlab_workspace"], "ByteWyrm")
 
     def test_training_step_log_has_no_duplicate_repr_line(self):
-        from trainer.train_pretrain import TaiChuTrainer
+        from trainer.train_pretrain import CausalLMTrainer
 
-        trainer = TaiChuTrainer.__new__(TaiChuTrainer)
+        trainer = CausalLMTrainer.__new__(CausalLMTrainer)
         trainer.global_step = 100
         trainer.optimizer = type(
             "Optimizer",
             (),
             {"param_groups": [{"lr": 3.0e-6}]},
         )()
-        trainer.eval_metrics = Mock()
-        trainer.eval_metrics.get_all_metrics.return_value = {
+        diagnostics = {
             "smoothed_loss": 10.31,
             "grad_norm_sq_variance_ratio": 0.09,
         }
@@ -700,7 +702,7 @@ class TestLoggingIntegrity(unittest.TestCase):
         trainer.log_manager = Mock()
         trainer.swanlab_logger = None
 
-        trainer._log_training(10.26, 100, 0.5)
+        trainer._log_training(10.26, 100, 0.5, diagnostics)
 
         trainer.log_manager.logger.info.assert_called_once()
         log_line = trainer.log_manager.logger.info.call_args.args[0]
