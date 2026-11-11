@@ -28,9 +28,13 @@ from tokenizer.special_tokens import (
     PAD_TOKEN,
     SPECIAL_TOKENS,
 )
-from utils.checkpoint import CheckpointManager
+from utils.checkpoint import (
+    CheckpointManager,
+    resolve_experiment_dir_from_checkpoint,
+)
 from utils.config_loader import load_model_config, load_pretrain_config
 from utils.logger import LogManager
+from utils.swanlab_logger import SwanLabLogger
 from utils.train_utils import (
     compile_model_for_training,
     get_wsd_lr_lambda,
@@ -602,6 +606,80 @@ class TestOptimizationIntegrity(unittest.TestCase):
 
 
 class TestLoggingIntegrity(unittest.TestCase):
+    def test_resume_checkpoint_reuses_experiment_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            experiment_dir = Path(directory) / "experiment"
+            checkpoint_dir = experiment_dir / "checkpoints"
+            checkpoint_dir.mkdir(parents=True)
+            checkpoint_path = checkpoint_dir / "checkpoint-100.pt"
+            checkpoint_path.touch()
+
+            restored_dir = resolve_experiment_dir_from_checkpoint(
+                str(checkpoint_path)
+            )
+
+        self.assertEqual(Path(restored_dir), experiment_dir.resolve())
+
+    def test_swanlab_resume_uses_official_init_arguments(self):
+        fake_swanlab = Mock()
+        fake_swanlab.init.return_value.id = "gmdnabup"
+
+        with patch("utils.swanlab_logger.swanlab", fake_swanlab):
+            logger = SwanLabLogger(
+                project="TaiChu-Small",
+                experiment_name="taichu_80m",
+                config={"seed": 42},
+                log_dir="./swanlogs",
+                workspace="ByteWyrm",
+                run_id="gmdnabup",
+                resume="must",
+                init_kwargs={"tags": ["resume"]},
+            )
+
+        fake_swanlab.init.assert_called_once_with(
+            project="TaiChu-Small",
+            experiment_name="taichu_80m",
+            config={"seed": 42},
+            logdir="./swanlogs",
+            workspace="ByteWyrm",
+            id="gmdnabup",
+            resume="must",
+            tags=["resume"],
+        )
+        self.assertEqual(logger.run_id, "gmdnabup")
+
+    def test_checkpoint_metadata_contains_swanlab_run_identity(self):
+        from trainer.train_pretrain import TaiChuTrainer
+
+        trainer = TaiChuTrainer.__new__(TaiChuTrainer)
+        trainer.swanlab_logger = Mock(
+            run_id="gmdnabup",
+            project="TaiChu-Small",
+            workspace="ByteWyrm",
+        )
+        metadata = trainer._checkpoint_swanlab_state()
+
+        self.assertEqual(
+            metadata,
+            {
+                "swanlab_run_id": "gmdnabup",
+                "swanlab_project": "TaiChu-Small",
+                "swanlab_workspace": "ByteWyrm",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manager = CheckpointManager(output_dir=directory)
+            path = manager.save(
+                "checkpoint.pt",
+                model=_tiny_model(),
+                global_step=3,
+                **metadata,
+            )
+            _, _, restored = manager.load(path, model=_tiny_model())
+
+        self.assertEqual(restored["swanlab_run_id"], "gmdnabup")
+        self.assertEqual(restored["swanlab_workspace"], "ByteWyrm")
+
     def test_training_step_log_has_no_duplicate_repr_line(self):
         from trainer.train_pretrain import TaiChuTrainer
 

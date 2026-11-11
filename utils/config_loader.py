@@ -9,7 +9,7 @@
 
 import yaml
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # 导入统一的模型配置类与数值字符串还原工具
 from model.config import ModelConfig, _coerce_numeric_strings
@@ -101,6 +101,10 @@ class SwanLabLoggingConfig:
     swanlab_experiment_name: str = "TaiChu_Experiment_Name"
     swanlab_log_dir: str = "./swanlogs"
     swanlab_mode: str = "cloud"  # 可选 "cloud" 或 "local"
+    swanlab_workspace: Optional[str] = None
+    swanlab_id: Optional[str] = None
+    swanlab_resume: Optional[str] = None
+    swanlab_init_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class PretrainConfig:
@@ -210,6 +214,8 @@ def load_pretrain_config(yaml_path: str) -> PretrainConfig:
     )
     early_stop_cfg = EarlyStoppingConfig(**_coerce_numeric_strings(EarlyStoppingConfig, raw.get('early_stopping', {})))
     swanlab_cfg = SwanLabLoggingConfig(**_coerce_numeric_strings(SwanLabLoggingConfig, raw.get('swanlab', {})))
+    if not isinstance(swanlab_cfg.swanlab_init_kwargs, dict):
+        raise ValueError("swanlab.swanlab_init_kwargs must be a mapping")
 
     return PretrainConfig(
         tokenizer_path=tokenizer_path,

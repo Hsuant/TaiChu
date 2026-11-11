@@ -1,174 +1,194 @@
-# ============================================================
-# TaiChu 80M LLM Pretraining Configuration
-# Version: 0.2.0
-#
-# Data budget:
-#   Target tokens: 4.0B
-#   Filtered UTF-8 text: ~16GB
-#   Binary token shards: ~30GB
-#   Validation shards: ~0.6GB
-#
-# Data loading:
-#   Indexed binary shards
-#   mmap Reader + map-style DataLoader
-#   Runtime stream packing
-# ============================================================
+# TaiChu 80M 预训练训练配置。
+# 数据来自 configs/prepare_pretrain_data.yaml 生成的 Binary Dataset。
 
-
-# ------------------------------------------------------------
-# 1. Optimizer
-# ------------------------------------------------------------
-
+# 优化器配置。
 optimizer:
+  # AdamW 基础学习率。
   learning_rate: 3.0e-4
+  # 权重衰减系数。
   weight_decay: 0.1
-
+  # AdamW 一阶矩指数衰减率。
   beta1: 0.9
+  # AdamW 二阶矩指数衰减率。
   beta2: 0.95
+  # AdamW 分母数值稳定项。
   epsilon: 1.0e-8
 
-
-# ------------------------------------------------------------
-# 2. Learning Rate Scheduler
-# ------------------------------------------------------------
-
+# 学习率调度器配置。
 scheduler:
-  warmup_ratio: 0.02
+  # 总训练步数中用于线性 Warmup 的比例。
+  warmup_ratio: 0.03
+  # Warmup 后保持峰值学习率的训练步比例。
   stable_ratio: 0.70
-  min_lr_ratio: 0.1
+  # 最终学习率相对峰值学习率的下限。
+  min_lr_ratio: 0.19
+  # 稳定阶段后的学习率衰减曲线。
   decay_type: "cosine"
 
-
-# ------------------------------------------------------------
-# 3. Tokenizer
-# ------------------------------------------------------------
-
-# Tokenizer is initialized by the training entrypoint.
-# Pass the resulting tokenizer object to TaiChuDataLoaderFactory.
-
+# Tokenizer 配置。
 tokenizer:
+  # 训练入口实际加载的 Tokenizer 文件路径。
   path: "./taichu_tokenizer/tokenizer.json"
+  # Tokenizer 后端；tokenizers 表示使用原生 Tokenizers 库。
   backend: "tokenizers"
 
-
-# ------------------------------------------------------------
-# 4. Dataset Configuration
-# ------------------------------------------------------------
-
+# 训练数据与 DataLoader 配置。
 data:
+  # 统一数据配置 Schema 版本。
   schema_version: 1
+  # 训练任务类型；必须与 Binary Dataset 的样本类型匹配。
   task_type: pretraining
+  # 数据集稳定标识；用于实验追踪和恢复校验。
   dataset_id: taichu-pretraining-v1
+  # 二进制 mmap 存储配置。
   storage:
+    # 存储后端类型；当前只支持 binary_mmap。
     format: binary_mmap
+    # 训练集 Binary Dataset 目录。
     train_path: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m/train"
+    # 验证集 Binary Dataset 目录。
     validation_path: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m/validation"
+    # 每个 DataLoader worker 进程数；0 表示主进程读取。
     num_workers: 2
+    # 每个 worker 预取 Batch 数。
     prefetch_factor: 2
+  # 样本采样配置。
   sampling:
+    # 采样策略；distributed 支持单卡和多卡 Rank 分片。
     strategy: distributed
+    # 是否在每个 Epoch 重新打乱样本顺序。
     shuffle: true
+    # 采样顺序的固定随机种子。
     seed: 42
+    # 是否丢弃不足一个完整 Batch 的尾部样本。
     drop_last: true
+  # Padding Token；必须与 Tokenizer 和数据处理配置一致。
   pad_token: "<|pad|>"
+  # 文档起始 Token；必须与 Tokenizer 实际 ID 一致。
   bos_token: "<|taichu_start|>"
+  # 文档结束 Token；必须与 Tokenizer 实际 ID 一致。
   eos_token: "<|taichu_end|>"
+  # Runtime Packing 配置。
   packing:
+    # 是否启用流式 Packing。
     enabled: true
+    # Packing 策略；stream 表示跨样本流式拼接并保留 segment 边界。
     strategy: stream
+    # 物理训练序列最大长度；必须包含 BOS/EOS。
     max_seq_length: 2048
+    # Padding 后序列长度向上对齐的倍数。
     pad_to_multiple_of: 8
+    # 是否丢弃不足一个完整 Packed Sequence 的尾部内容。
     drop_last_remainder: false
+  # Batch 构造配置。
   batching:
+    # Batch 策略；fixed_length 使用固定长度 Padding。
     strategy: fixed_length
+    # 单卡 DataLoader 的原始样本 Batch 大小。
     micro_batch_size: 8
+    # Batch Tensor 序列长度向上对齐的倍数。
     pad_to_multiple_of: 8
 
-
-# ------------------------------------------------------------
-# 5. Training Configuration
-# ------------------------------------------------------------
-
+# 训练循环配置。
 training:
-  # Token budget
-  target_tokens: "4B"
-  # Batch configuration
+  # 目标训练 Token 数；用于动态计算最大训练步数。
+  target_tokens: "8B"
+  # 每张卡前向使用的样本 Batch 大小。
   batch_size: 1
+  # 每次优化器更新前的梯度累计步数。
   gradient_accumulation_steps: 4
-
-  # Checkpoint and logging
+  # 每隔多少优化器 Step 保存一次检查点。
   save_interval: 1000
+  # 每隔多少优化器 Step 输出一次训练日志。
   log_interval: 10
+  # 检查点、最终模型和实验输出目录。
   output_dir: "./experiments/small_models"
+  # 当前实验名称；用于子目录和日志标识。
   experiment_name: "taichu_80m_pretrain_v1"
-
-  # Numerical precision
+  # 是否启用混合精度训练。
   use_mixed_precision: true
+  # 混合精度计算类型；bfloat16 数值范围更稳定。
   dtype: "bfloat16"
+  # 梯度裁剪的最大范数。
   max_grad_norm: 1.0
-
-  # Reproducibility
+  # 训练数据顺序、Dropout 和初始化的固定随机种子。
   seed: 42
+  # 当前进程的本地 Rank；-1 表示由启动器自动检测。
   local_rank: -1
-
-  # Model optimization
-  # DDP-compatible compile. "default" avoids rank-local max-autotune,
-  # whose first-use latency can exceed the NCCL watchdog timeout.
+  # 是否启用 torch.compile。
   compile_model: true
+  # torch.compile 模式；default 适合多卡训练。
   compile_mode: "default"
+  # 是否允许 torch.compile 动态形状重编译。
   compile_dynamic: true
-
-  # Allow initial graph compilation and dynamic-shape recompilation to
-  # finish before DDP declares a collective timeout (PyTorch default: 10m).
+  # DDP 集合通信超时时间，单位分钟。
   distributed_timeout_minutes: 30
-
-  # DataLoader runtime configuration
-  # Passed explicitly to TaiChuDataLoaderFactory.create().
+  # 训练 DataLoader 运行时配置。
   dataloader:
+    # 是否将 Batch 固定到页锁定内存。
     pin_memory: true
+    # 是否在多 Epoch 训练中保留 worker 进程。
     persistent_workers: true
+    # 是否丢弃最后一个不完整 Batch。
     drop_last: true
 
-# ------------------------------------------------------------
-# 6. Evaluation Configuration
-# ------------------------------------------------------------
-
+# 验证与生成诊断配置。
 evaluating:
+  # 验证 DataLoader Batch 大小。
   batch_size: 4
+  # 每隔多少训练 Step 执行一次验证。
   eval_interval: 500
+  # 每隔多少验证 Batch 输出一次日志。
   log_interval: 10
+  # 是否计算空前缀下的 EOS 概率指标。
   empty_prefix_eos_ppl: false
-
+  # 验证后用于生成质量检查的 Prompt 列表。
   prompts:
+    # 中文生成 Prompt。
     - "清晨，阳光透过窗户洒进房间，小明起床后"
+    # 英文生成 Prompt。
     - "On a quiet morning, Sarah walked into the garden and"
-
+  # 每个 Prompt 最大生成 Token 数。
   num_generate_tokens: 32
-
-  # Evaluation DataLoader runtime configuration
+  # 验证 DataLoader 运行时配置。
   dataloader:
+    # 是否将验证 Batch 固定到页锁定内存。
     pin_memory: true
+    # 是否保留验证 worker 进程。
     persistent_workers: false
+    # 是否丢弃最后一个不完整验证 Batch。
     drop_last: false
 
-# ------------------------------------------------------------
-# 7. Early Stopping
-# ------------------------------------------------------------
-
+# 早停配置。
 early_stopping:
+  # 是否启用早停。
   enabled: false
+  # 早停监控指标名称。
   monitor: "val_loss"
+  # 指标连续未改善时允许的最大验证次数。
   patience: 5
+  # 判定指标改善所需的最小变化量。
   min_delta: 1.0e-4
+  # 监控指标的优化方向；min 表示越小越好。
   mode: "min"
 
-# ------------------------------------------------------------
-# 8. SwanLab
-# ------------------------------------------------------------
-
+# SwanLab 实验跟踪配置。
 swanlab:
+  # 是否启用 SwanLab 日志。
   use_swanlab: false
+  # SwanLab 项目名称。
   swanlab_project: "TaiChu-Small"
+  # SwanLab 实验名称。
   swanlab_experiment_name: "taichu_80m"
+  # SwanLab 本地日志目录。
   swanlab_log_dir: "./swanlogs"
+  # SwanLab 运行模式；local 表示仅本地记录。
   swanlab_mode: "local"
+  # SwanLab 工作区；留空时使用账号默认工作区。
+  swanlab_workspace: null
+  # 要恢复的 SwanLab 实验 ID；断点恢复时会优先读取检查点中保存的 ID。
+  swanlab_id: null
+  # SwanLab 恢复策略；恢复已有 ID 时建议使用 "must"。
+  swanlab_resume: null
+  # 其他官方 swanlab.init 参数，例如 tags、group、job_type。
+  swanlab_init_kwargs: {}

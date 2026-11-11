@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from itertools import islice
 
 from .base import materialize_indices, validate_epoch
 
@@ -26,9 +27,16 @@ class RandomSampler:
         self.drop_last = bool(drop_last)
         self.num_samples = num_samples
         self.epoch = 0
+        self._skip_samples = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = validate_epoch(epoch)
+        self._skip_samples = 0
+
+    def set_skip_samples(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("skip sample count cannot be negative")
+        self._skip_samples = int(count)
 
     def _indices(self) -> list[int]:
         indices = materialize_indices(
@@ -50,7 +58,7 @@ class RandomSampler:
         return indices
 
     def __iter__(self) -> Iterator[int]:
-        return iter(self._indices())
+        return islice(iter(self._indices()), self._skip_samples, None)
 
     def __len__(self) -> int:
         if self.num_samples is not None:

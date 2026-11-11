@@ -24,7 +24,6 @@ from dataset.metrics import DataMetrics, PackingMetrics, ThroughputMetrics
 from dataset.packing import PretrainingPacker, SampleIsolatedPacker
 from dataset.offline.adapters import (
     PreferencePreprocessor,
-    PretrainingPreprocessor,
     RewardPreprocessor,
     RoleTagRenderer,
     SFTPreprocessor,
@@ -162,8 +161,9 @@ class TestPreprocessingAdapters(unittest.TestCase):
         self.assertEqual(trajectory.group_id, "group")
 
     def test_unified_preparation_writes_binary_dataset(self):
-        adapter = PretrainingPreprocessor(
+        adapter = SFTPreprocessor(
             make_text_tokenizer(),
+            RoleTagRenderer(),
             add_eos=True,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -171,12 +171,24 @@ class TestPreprocessingAdapters(unittest.TestCase):
             writer = BinarySampleWriter(
                 output,
                 dataset_id="prepared",
-                sample_type="pretraining",
+                sample_type="sft",
             )
             stats = UnifiedPreparationPipeline(adapter, writer).run(
                 [
-                    {"sample_id": "one", "text": "alpha"},
-                    {"sample_id": "two", "text": "beta"},
+                    {
+                        "sample_id": "one",
+                        "messages": [
+                            {"role": "user", "content": "alpha"},
+                            {"role": "assistant", "content": "answer one"},
+                        ],
+                    },
+                    {
+                        "sample_id": "two",
+                        "messages": [
+                            {"role": "user", "content": "beta"},
+                            {"role": "assistant", "content": "answer two"},
+                        ],
+                    },
                 ]
             )
             writer.commit()
@@ -202,6 +214,22 @@ class TestSamplingPackingAndBatching(unittest.TestCase):
             rank_values.append(first)
         self.assertEqual(sorted(rank_values[0] + rank_values[1]), list(range(10)))
         self.assertTrue(set(rank_values[0]).isdisjoint(rank_values[1]))
+
+    def test_sampler_skip_samples_avoids_replaying_prefix(self):
+        sampler = DistributedSampler(
+            12,
+            rank=0,
+            world_size=2,
+            shuffle=True,
+            seed=7,
+        )
+        full = list(sampler)
+        sampler.set_skip_samples(3)
+
+        self.assertEqual(list(sampler), full[3:])
+
+        sampler.set_epoch(1)
+        self.assertEqual(len(list(sampler)), len(full))
 
     def test_weighted_dataset_mixer_samples_registered_sources(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -438,7 +466,13 @@ class TestUnifiedConfigurationAndRuntime(unittest.TestCase):
                 model_inputs = factory.input_adapter()(batch)
                 self.assertEqual(
                     set(model_inputs),
-                    {"input_ids", "attention_mask", "labels"},
+                    {
+                        "input_ids",
+                        "attention_mask",
+                        "segment_ids",
+                        "position_ids",
+                        "labels",
+                    },
                 )
             finally:
                 loader.close()

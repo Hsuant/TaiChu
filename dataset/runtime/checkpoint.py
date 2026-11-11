@@ -75,7 +75,11 @@ class ResumableBatchIterator:
         consumed_samples = 0 if self.state is None else self.state.consumed_samples
         if hasattr(self.loader, "set_epoch"):
             self.loader.set_epoch(epoch)
-        iterator = skip_batches(iter(self.loader), batch_index)
+        if batch_index and hasattr(self.loader, "set_resume_batch"):
+            self.loader.set_resume_batch(batch_index)
+            iterator = iter(self.loader)
+        else:
+            iterator = skip_batches(iter(self.loader), batch_index)
         for batch_index, batch in enumerate(iterator, start=batch_index):
             sample_ids = batch.get("sample_ids") if isinstance(batch, dict) else None
             sample_count = len(sample_ids) if sample_ids is not None else len(batch["input_ids"])

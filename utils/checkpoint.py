@@ -7,6 +7,7 @@
 """
 
 import os
+from pathlib import Path
 import torch
 from typing import Optional, Dict, Any, Tuple
 
@@ -36,6 +37,14 @@ def strip_checkpoint_prefixes(state_dict: Dict[str, Any]) -> Dict[str, Any]:
                     break
         normalized[key] = value
     return normalized
+
+
+def resolve_experiment_dir_from_checkpoint(filepath: str) -> str:
+    """返回检查点所属实验目录，供断点恢复沿用原输出与日志目录。"""
+    checkpoint_path = Path(filepath).expanduser().resolve()
+    if checkpoint_path.parent.name in {"checkpoints", "best_models", "final_models"}:
+        return str(checkpoint_path.parent.parent)
+    return str(checkpoint_path.parent)
 
 
 class CheckpointManager:

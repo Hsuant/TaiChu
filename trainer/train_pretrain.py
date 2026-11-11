@@ -38,7 +38,7 @@ from torch.utils.data import DataLoader
 
 from model.model import TaiChuModel
 from tokenizers import Tokenizer
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from utils.config_loader import load_model_config, load_pretrain_config, parse_tokens_string
 from utils.train_utils import (
@@ -51,7 +51,11 @@ from utils.train_utils import (
 )
 from utils.logger import LogManager
 from utils.swanlab_logger import SwanLabLogger
-from utils.checkpoint import CheckpointManager, unwrap_model
+from utils.checkpoint import (
+    CheckpointManager,
+    resolve_experiment_dir_from_checkpoint,
+    unwrap_model,
+)
 from utils.model_utils import ModelInspector
 from dataset.runtime import UnifiedDataLoaderFactory as TaiChuDataLoaderFactory
 from dataset.runtime import DataState, skip_batches
@@ -271,8 +275,18 @@ class TaiChuTrainer:
                 )
             if hasattr(self.train_loader, "set_epoch"):
                 self.train_loader.set_epoch(data_epoch)
+            fast_resume = (
+                batch_index > 0
+                and hasattr(self.train_loader, "set_resume_batch")
+            )
+            if fast_resume:
+                self.log_manager.info(
+                    "数据恢复位置: "
+                    f"epoch={data_epoch}, batch_index={batch_index}"
+                )
+                self.train_loader.set_resume_batch(batch_index)
             train_iter = iter(self.train_loader)
-            if batch_index:
+            if batch_index and not fast_resume:
                 train_iter = skip_batches(train_iter, batch_index)
             tokens_since_log = 0
 
@@ -353,6 +367,18 @@ class TaiChuTrainer:
                                 self.device,
                                 non_blocking=self.device.type == "cuda",
                             )
+                    segment_ids = batch.get("segment_ids")
+                    if segment_ids is not None:
+                        segment_ids = segment_ids.to(
+                            self.device,
+                            non_blocking=self.device.type == "cuda",
+                        )
+                    position_ids = batch.get("position_ids")
+                    if position_ids is not None:
+                        position_ids = position_ids.to(
+                            self.device,
+                            non_blocking=self.device.type == "cuda",
+                        )
 
                     if self.compiled_model:
                         torch.compiler.cudagraph_mark_step_begin()
@@ -376,6 +402,8 @@ class TaiChuTrainer:
                             out = self.model(
                                 input_ids,
                                 attention_mask=attention_mask,
+                                segment_ids=segment_ids,
+                                position_ids=position_ids,
                                 labels=labels,
                                 return_logits=False,
                                 validate_inputs=False,
@@ -463,9 +491,10 @@ class TaiChuTrainer:
                 self.global_step += 1
                 self.data_state = group_data_state
 
-                avg_loss = float(
-                    (accumulated_loss_sum / global_loss_tokens).item()
+                global_loss_sum = self._global_sum_float(
+                    float(accumulated_loss_sum.item())
                 )
+                avg_loss = global_loss_sum / global_loss_tokens
                 self.eval_metrics.update_loss(avg_loss)
                 if self.eval_metrics.mfu is not None:
                     step_flops = (
@@ -492,10 +521,25 @@ class TaiChuTrainer:
 
                 val_loss = None
 
+                checkpoint_saved_at_step = False
+                if (
+                    self.global_rank == 0
+                    and self.save_interval > 0
+                    and self.global_step % self.save_interval == 0
+                ):
+                    self._save_training_checkpoint(
+                        metrics={"val_loss": self.best_val_loss},
+                    )
+                    checkpoint_saved_at_step = True
+
                 if (
                     self.eval_interval > 0
                     and self.global_step % self.eval_interval == 0
                 ):
+                    if not checkpoint_saved_at_step:
+                        self._save_training_checkpoint(
+                            metrics={"val_loss": self.best_val_loss},
+                        )
                     self.log_manager.info("验证开始")
                     val_loss = self._evaluate(
                         generate_prompts=self.generation_prompts,
@@ -513,6 +557,7 @@ class TaiChuTrainer:
                             scaler=self.scaler,
                             global_step=self.global_step,
                             data_state=self.data_state.to_dict(),
+                            **self._checkpoint_swanlab_state(),
                         )
                     self.log_manager.info(
                         f"当前最佳验证损失: {self.best_val_loss:.4f}"
@@ -538,34 +583,9 @@ class TaiChuTrainer:
                                     metrics={"val_loss": val_loss},
                                     early_stopping_state=self.early_stopping.state_dict(),
                                     data_state=self.data_state.to_dict(),
+                                    **self._checkpoint_swanlab_state(),
                                 )
                             break
-
-                if (
-                    self.global_rank == 0
-                    and self.save_interval > 0
-                    and self.global_step % self.save_interval == 0
-                ):
-                    extra = {}
-                    if self.early_stopping is not None:
-                        extra["early_stopping_state"] = self.early_stopping.state_dict()
-                    extra["data_state"] = self.data_state.to_dict()
-                    self.checkpoint_manager.save(
-                        f"checkpoints/checkpoint-{self.global_step}.pt",
-                        model=self.model,
-                        optimizer=self.optimizer,
-                        scheduler=self.scheduler,
-                        scaler=self.scaler,
-                        global_step=self.global_step,
-                        metrics={
-                            "val_loss": (
-                                val_loss
-                                if val_loss is not None
-                                else self.best_val_loss
-                            )
-                        },
-                        **extra,
-                    )
 
             # 训练结束，保存最终模型
             if self.global_rank == 0:
@@ -579,6 +599,7 @@ class TaiChuTrainer:
                     data_state=(
                         None if self.data_state is None else self.data_state.to_dict()
                     ),
+                    **self._checkpoint_swanlab_state(),
                 )
             self.log_manager.info("训练完成!")
             if self.swanlab_logger:
@@ -608,6 +629,7 @@ class TaiChuTrainer:
         extra["data_state"] = (
             None if self.data_state is None else self.data_state.to_dict()
         )
+        extra.update(self._checkpoint_swanlab_state())
         self.checkpoint_manager.save(
             f"checkpoints/checkpoint-emergency-step{self.global_step}.pt",
             model=self.model,
@@ -620,6 +642,39 @@ class TaiChuTrainer:
         )
         self.log_manager.info(f"紧急检查点已保存至 step {self.global_step}")
 
+    def _save_training_checkpoint(self, metrics: Optional[Dict[str, float]]) -> None:
+        """Save resumable state before a validation phase can be interrupted."""
+        if self.global_rank != 0:
+            return
+        extra = {"data_state": self.data_state.to_dict()}
+        if self.early_stopping is not None:
+            extra["early_stopping_state"] = self.early_stopping.state_dict()
+        extra.update(self._checkpoint_swanlab_state())
+        self.checkpoint_manager.save(
+            f"checkpoints/checkpoint-{self.global_step}.pt",
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            global_step=self.global_step,
+            metrics=metrics,
+            **extra,
+        )
+        self.log_manager.info(
+            f"验证前检查点已保存至 step {self.global_step}"
+        )
+
+    def _checkpoint_swanlab_state(self) -> Dict[str, str]:
+        """Return SwanLab identity metadata stored with each checkpoint."""
+        if self.swanlab_logger is None or not self.swanlab_logger.run_id:
+            return {}
+        state = {"swanlab_run_id": self.swanlab_logger.run_id}
+        if self.swanlab_logger.project:
+            state["swanlab_project"] = self.swanlab_logger.project
+        if self.swanlab_logger.workspace:
+            state["swanlab_workspace"] = self.swanlab_logger.workspace
+        return state
+
     def _global_sum(self, value: int) -> int:
         """Sum a scalar across ranks without changing the compile hot path."""
         if not torch.distributed.is_initialized():
@@ -627,6 +682,14 @@ class TaiChuTrainer:
         total = torch.tensor(float(value), dtype=torch.float64, device=self.device)
         torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
         return int(total.item())
+
+    def _global_sum_float(self, value: float) -> float:
+        """Sum a floating-point scalar across ranks."""
+        if not torch.distributed.is_initialized():
+            return float(value)
+        total = torch.tensor(float(value), dtype=torch.float64, device=self.device)
+        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        return float(total.item())
 
     def _all_ranks_finite(self, finite: bool) -> bool:
         """Return whether every rank agreed that the training state is finite."""
@@ -853,11 +916,25 @@ class TaiChuTrainer:
                             self.device,
                             non_blocking=self.device.type == "cuda",
                         )
+                segment_ids = batch.get("segment_ids")
+                if segment_ids is not None:
+                    segment_ids = segment_ids.to(
+                        self.device,
+                        non_blocking=self.device.type == "cuda",
+                    )
+                position_ids = batch.get("position_ids")
+                if position_ids is not None:
+                    position_ids = position_ids.to(
+                        self.device,
+                        non_blocking=self.device.type == "cuda",
+                    )
 
                 with autocast(device_type=self.device.type, enabled=self.use_amp, dtype=self.dtype):
                     out = self.model(
                         input_ids,
                         attention_mask=attention_mask,
+                        segment_ids=segment_ids,
+                        position_ids=position_ids,
                         labels=labels,
                         return_logits=False,
                         validate_inputs=False,
@@ -1247,6 +1324,21 @@ def main() -> None:
     parser.add_argument("--early_stop_patience", type=int, default=None, help="早停耐心值，连续无改善的验证次数上限（如 5）")
     parser.add_argument("--early_stop_min_delta", type=float, default=None, help="判定改善的最小绝对变化量（如 1e-4）")
 
+    # SwanLab 参数覆盖
+    parser.add_argument(
+        "--use_swanlab",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖是否启用 SwanLab",
+    )
+    parser.add_argument("--swanlab_project", type=str, default=None, help="覆盖 SwanLab 项目名")
+    parser.add_argument("--swanlab_workspace", type=str, default=None, help="覆盖 SwanLab 工作区")
+    parser.add_argument("--swanlab_id", type=str, default=None, help="指定 SwanLab 实验 ID")
+    parser.add_argument("--swanlab_resume", type=str, default=None, help="SwanLab 恢复策略，如 must")
+    parser.add_argument("--swanlab_experiment_name", type=str, default=None, help="覆盖 SwanLab 实验名")
+    parser.add_argument("--swanlab_log_dir", type=str, default=None, help="覆盖 SwanLab 日志目录")
+    parser.add_argument("--swanlab_mode", type=str, default=None, help="覆盖 SwanLab 运行模式")
+
     args = parser.parse_args()
 
     # 1. 加载配置
@@ -1331,6 +1423,24 @@ def main() -> None:
     if args.early_stop_min_delta is not None:
         pretrain_cfg.early_stopping.min_delta = args.early_stop_min_delta
 
+    # 覆盖 SwanLab 配置
+    if args.use_swanlab is not None:
+        pretrain_cfg.swanlab.use_swanlab = args.use_swanlab
+    if args.swanlab_project is not None:
+        pretrain_cfg.swanlab.swanlab_project = args.swanlab_project
+    if args.swanlab_workspace is not None:
+        pretrain_cfg.swanlab.swanlab_workspace = args.swanlab_workspace
+    if args.swanlab_id is not None:
+        pretrain_cfg.swanlab.swanlab_id = args.swanlab_id
+    if args.swanlab_resume is not None:
+        pretrain_cfg.swanlab.swanlab_resume = args.swanlab_resume
+    if args.swanlab_experiment_name is not None:
+        pretrain_cfg.swanlab.swanlab_experiment_name = args.swanlab_experiment_name
+    if args.swanlab_log_dir is not None:
+        pretrain_cfg.swanlab.swanlab_log_dir = args.swanlab_log_dir
+    if args.swanlab_mode is not None:
+        pretrain_cfg.swanlab.swanlab_mode = args.swanlab_mode
+
     # 3. 分布式初始化
     local_rank = pretrain_cfg.training.local_rank
     if local_rank == -1:
@@ -1360,12 +1470,18 @@ def main() -> None:
     base_seed = pretrain_cfg.training.seed
     set_seed(base_seed + global_rank)
 
-    # 5. 生成实验目录
-    # 生成唯一的实验目录
+    # 5. 生成实验目录；恢复训练时沿用检查点所在实验目录
     base_output_dir = pretrain_cfg.training.output_dir  # 默认 "./experiments"
     experiment_name = pretrain_cfg.training.experiment_name  # 从 YAML 读取，可能为空
     model_name = model_cfg.model_name
-    experiment_dir = get_experiment_dir(base_output_dir, experiment_name, model_name)
+    resume_path = None
+    if args.resume:
+        resume_path = os.path.abspath(args.resume)
+        if not os.path.isfile(resume_path):
+            raise FileNotFoundError(f"检查点文件不存在: {resume_path}")
+        experiment_dir = resolve_experiment_dir_from_checkpoint(resume_path)
+    else:
+        experiment_dir = get_experiment_dir(base_output_dir, experiment_name, model_name)
     if torch.distributed.is_initialized():
         experiment_dirs = [experiment_dir if global_rank == 0 else None]
         torch.distributed.broadcast_object_list(experiment_dirs, src=0)
@@ -1541,6 +1657,15 @@ def main() -> None:
                 for key, value in pretrain_cfg.data.to_dict().items()
             )
         )
+        if (
+            pretrain_cfg.training.batch_size
+            != pretrain_cfg.data.batching.micro_batch_size
+        ):
+            log_manager.warning(
+                "training.batch_size 与 data.batching.micro_batch_size 不一致；"
+                "训练 loader 使用 training.batch_size，"
+                f"当前为 {pretrain_cfg.training.batch_size}"
+            )
 
     # 11. 优化器
     raw_model_for_optim = unwrap_model(model)
@@ -1551,8 +1676,10 @@ def main() -> None:
 
     log_manager.info(f"目标总 token 数: {target_tokens:,}")
     log_manager.info(
-        f"全局 batch size: {global_batch_size} (每卡 {per_gpu_batch} × 累积 {grad_accum} × 节点数 {world_size})")
-    log_manager.info(f"每步消耗 token 数: {tokens_per_step:,}")
+        f"全局样本 batch size: {global_batch_size} "
+        f"(每卡 {per_gpu_batch} × 累积 {grad_accum} × rank 数 {world_size})"
+    )
+    log_manager.info(f"每步名义 token 数: {tokens_per_step:,}")
     log_manager.info(f"动态计算 max_steps = {max_steps}, warmup_steps = {warmup_steps}")
 
     # 12. 学习率调度器（warmup + cosine）
@@ -1609,7 +1736,28 @@ def main() -> None:
         best_subdir="best_models",
     )
 
-    # 15. SwanLab 日志记录器（仅主进程且配置启用）
+    # 15. 恢复训练（如果指定）
+    resume_step = 0
+    best_val_loss_restored = None
+    checkpoint = None
+    data_state = None
+    if resume_path:
+        log_manager.info(f"从检查点恢复: {resume_path}")
+        resume_step, best_val_loss_restored, checkpoint = checkpoint_manager.load(
+            resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            map_location=str(device),
+        )
+        if resume_step > 0 and "scheduler_state_dict" not in checkpoint:
+            scheduler.last_epoch = resume_step
+        if checkpoint.get("data_state") is not None:
+            data_state = DataState.from_dict(checkpoint["data_state"])
+        log_manager.info(f"恢复至全局步数: {resume_step}")
+
+    # 16. SwanLab 日志记录器（仅主进程且配置启用）
     swanlab_logger = None
     use_swanlab = pretrain_cfg.swanlab.use_swanlab
     if use_swanlab and is_main:
@@ -1637,37 +1785,53 @@ def main() -> None:
         if pretrain_cfg.swanlab.swanlab_mode:
             os.environ["SWANLAB_MODE"] = pretrain_cfg.swanlab.swanlab_mode
 
+        resume_swanlab_id = (
+            checkpoint.get("swanlab_run_id")
+            if checkpoint is not None
+            else None
+        )
+        swanlab_init_kwargs = pretrain_cfg.swanlab.swanlab_init_kwargs
+        swanlab_id = (
+            pretrain_cfg.swanlab.swanlab_id
+            or resume_swanlab_id
+            or swanlab_init_kwargs.get("id")
+        )
+        swanlab_workspace = (
+            pretrain_cfg.swanlab.swanlab_workspace
+            or (
+                checkpoint.get("swanlab_workspace")
+                if checkpoint is not None
+                else None
+            )
+            or swanlab_init_kwargs.get("workspace")
+        )
+        swanlab_resume = (
+            pretrain_cfg.swanlab.swanlab_resume
+            or swanlab_init_kwargs.get("resume")
+        )
+        if resume_path and swanlab_id and not swanlab_resume:
+            swanlab_resume = "must"
+
         swanlab_logger = SwanLabLogger(
             project=pretrain_cfg.swanlab.swanlab_project,
             experiment_name=pretrain_cfg.swanlab.swanlab_experiment_name,
             config=swanlab_config,
             log_dir=pretrain_cfg.swanlab.swanlab_log_dir,
+            workspace=swanlab_workspace,
+            run_id=swanlab_id,
+            resume=swanlab_resume,
+            init_kwargs=swanlab_init_kwargs,
             disabled=False,
             global_rank=global_rank,
         )
         log_manager.info(
-            f"SwanLab 已启用，项目: {pretrain_cfg.swanlab.swanlab_project}，实验: {pretrain_cfg.swanlab.swanlab_experiment_name or 'auto'}")
-
-    # 16. 恢复训练（如果指定）
-    resume_step = 0
-    best_val_loss_restored = None
-    checkpoint = None
-    data_state = None
-    if args.resume:
-        log_manager.info(f"从检查点恢复: {args.resume}")
-        resume_step, best_val_loss_restored, checkpoint = checkpoint_manager.load(
-            args.resume,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            map_location=str(device),
+            "SwanLab 已启用，"
+            f"项目: {pretrain_cfg.swanlab.swanlab_project}, "
+            f"工作区: {swanlab_workspace or '<default>'}, "
+            f"实验: {pretrain_cfg.swanlab.swanlab_experiment_name or 'auto'}, "
+            f"ID: {swanlab_logger.run_id or '<new>'}, "
+            f"resume: {swanlab_resume or '<disabled>'}"
         )
-        if resume_step > 0 and "scheduler_state_dict" not in checkpoint:
-            scheduler.last_epoch = resume_step
-        if checkpoint.get("data_state") is not None:
-            data_state = DataState.from_dict(checkpoint["data_state"])
-        log_manager.info(f"恢复至全局步数: {resume_step}")
 
     # 峰值算力：优先 --peak_flops，否则按 GPU 型号自动识别
     peak_flops = args.peak_flops if args.peak_flops is not None else ModelInspector.get_peak_flops()

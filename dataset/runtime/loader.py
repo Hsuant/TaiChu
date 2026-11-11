@@ -37,6 +37,17 @@ class UnifiedDataLoader(DataLoader):
         if sampler is not None and hasattr(sampler, "set_epoch"):
             sampler.set_epoch(epoch)
 
+    def set_resume_batch(self, batch_index: int) -> None:
+        """Skip completed samples without loading and discarding batches."""
+        if batch_index < 0:
+            raise ValueError("resume batch index cannot be negative")
+        if self.batch_size is None:
+            raise ValueError("resume batch index requires a batch size")
+        sampler = getattr(self, "sampler", None)
+        if sampler is None or not hasattr(sampler, "set_skip_samples"):
+            raise ValueError("sampler does not support resume offsets")
+        sampler.set_skip_samples(int(batch_index) * int(self.batch_size))
+
     def close(self) -> None:
         reader = getattr(getattr(self, "dataset", None), "reader", None)
         if reader is not None and hasattr(reader, "close"):

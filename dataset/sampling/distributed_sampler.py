@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
+from itertools import islice
 
 from .base import materialize_indices, pad_indices, validate_epoch
 
@@ -35,9 +36,16 @@ class DistributedSampler:
         self.pad_to_world_size = bool(pad_to_world_size)
         self.pair_aware = bool(pair_aware)
         self.epoch = 0
+        self._skip_samples = 0
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = validate_epoch(epoch)
+        self._skip_samples = 0
+
+    def set_skip_samples(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("skip sample count cannot be negative")
+        self._skip_samples = int(count)
 
     def _global_indices(self) -> list[int]:
         indices = materialize_indices(
@@ -60,7 +68,7 @@ class DistributedSampler:
         return pad_indices(local, expected)
 
     def __iter__(self) -> Iterator[int]:
-        return iter(self._rank_indices())
+        return islice(iter(self._rank_indices()), self._skip_samples, None)
 
     def __len__(self) -> int:
         if self.drop_last:
