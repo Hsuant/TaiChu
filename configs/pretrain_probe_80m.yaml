@@ -1,0 +1,17 @@
+# TaiChu 80M raw-text continuation probe configuration.
+
+checkpoint: "../experiments/80m/taichu_80m_pretrain_v1/best_models/best_model.pt"
+tokenizer: "../taichu_tokenizer"
+
+device: "auto"
+dtype: "auto"
+context_tokens: null
+
+# Raw next-token continuation uses the model's ordinary pretraining distribution.
+sampling:
+  max_new_tokens: 128
+  temperature: 0.6
+  top_k: 10
+  top_p: 0.9
+  repetition_penalty: 1.00
+  seed: 42
