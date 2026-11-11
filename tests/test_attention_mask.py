@@ -136,6 +136,56 @@ class TestAttentionMask(unittest.TestCase):
         )
         self.assertTrue(torch.equal(visible, expected))
 
+    def test_segment_ids_create_block_diagonal_causal_attention(self):
+        plan = build_attention_mask(
+            q_len=4,
+            total_len=4,
+            batch_size=1,
+            attention_mask=None,
+            segment_ids=torch.tensor([[0, 0, 1, 1]]),
+            device=CPU,
+        )
+        expected = torch.tensor(
+            [
+                [True, False, False, False],
+                [True, True, False, False],
+                [False, False, True, False],
+                [False, False, True, True],
+            ]
+        )
+        self.assertTrue(torch.equal(plan_visibility(plan)[0], expected))
+        self.assertFalse(plan.is_causal)
+
+    def test_packed_positions_match_independent_sequences(self):
+        torch.manual_seed(31)
+        model = TaiChuModel(
+            ModelConfig(
+                vocab_size=64,
+                hidden_size=32,
+                num_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                intermediate_size=64,
+                max_position_embeddings=32,
+                use_flash_attention=False,
+            )
+        ).eval()
+        packed_ids = torch.tensor([[5, 6, 7, 8]])
+        separate_ids = torch.tensor([[5, 6], [7, 8]])
+        with torch.no_grad():
+            packed = model(
+                packed_ids,
+                segment_ids=torch.tensor([[0, 0, 1, 1]]),
+                position_ids=torch.tensor([[0, 1, 0, 1]]),
+            ).logits
+            separate = model(separate_ids).logits
+        self.assertTrue(
+            torch.allclose(packed[:, :2], separate[:1], atol=1e-6)
+        )
+        self.assertTrue(
+            torch.allclose(packed[:, 2:], separate[1:], atol=1e-6)
+        )
+
     def test_all_padding_rows_fallback_to_global_self_key(self):
         plan = build_attention_mask(
             q_len=4,

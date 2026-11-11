@@ -19,22 +19,35 @@ from .padding import padded_float_tensor, padded_tensor
 
 def _sequence_values(sample: Any) -> tuple[list[int], list[int], list[int], list[int], list[int]]:
     if isinstance(sample, PackedSequence):
+        segment_ids = [
+            (segment_id + 1) * 1_000_003 + document_id
+            for segment_id, document_id in zip(
+                sample.segment_ids,
+                sample.document_ids,
+                strict=True,
+            )
+        ]
         return (
             sample.input_ids,
             sample.labels,
             sample.attention_mask,
             sample.loss_mask,
-            sample.segment_ids,
+            segment_ids,
         )
     if isinstance(sample, PretrainingSample):
         labels = sample.labels or sample.input_ids
         mask = sample.attention_mask or [1] * len(sample.input_ids)
+        segment_ids = (
+            sample.document_ids
+            if sample.document_ids
+            else [0] * len(sample.input_ids)
+        )
         return (
             sample.input_ids,
             labels,
             mask,
             [int(label != -100) for label in labels],
-            [0] * len(sample.input_ids),
+            segment_ids,
         )
     if isinstance(sample, SFTSequenceSample):
         mask = sample.attention_mask or [1] * len(sample.input_ids)
@@ -97,6 +110,7 @@ class PretrainingBatchBuilder:
             pad_id=-1,
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
+        segment_ids = aligned_segment_ids(attention_mask, segment_ids)
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -105,7 +119,8 @@ class PretrainingBatchBuilder:
                 _is_right_padded(row[2]) for row in rows
             ),
             "loss_mask": loss_mask,
-            "segment_ids": aligned_segment_ids(attention_mask, segment_ids),
+            "segment_ids": segment_ids,
+            "position_ids": segment_position_ids(segment_ids),
             "sample_ids": sample_ids,
         }
 

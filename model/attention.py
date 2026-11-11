@@ -152,6 +152,7 @@ def build_attention_mask(
     batch_size: int,
     attention_mask: Optional[torch.Tensor],
     device: torch.device,
+    segment_ids: Optional[torch.Tensor] = None,
 ) -> AttentionMask:
     """统一构造全序列、增量解码和 padding 的 SDPA 掩码计划。
 
@@ -176,6 +177,39 @@ def build_attention_mask(
         total_len=total_len,
         device=device,
     )
+    if segment_ids is not None:
+        if segment_ids.dim() != 2:
+            raise ValueError(
+                "segment_ids 仅支持二维张量，形状应为 (batch, total_len)"
+            )
+        if segment_ids.shape != (batch_size, total_len):
+            raise ValueError(
+                "segment_ids 形状必须为 "
+                f"({batch_size}, {total_len})，当前为 {tuple(segment_ids.shape)}"
+            )
+        if segment_ids.is_floating_point() or segment_ids.is_complex():
+            raise ValueError("segment_ids 必须使用整数张量")
+        if q_len != total_len:
+            raise ValueError(
+                "segment-aware attention 目前只支持完整序列前向"
+            )
+        segment_ids = segment_ids.to(device=device)
+        visibility = _causal_visibility(q_len, total_len, device).unsqueeze(0)
+        visibility = visibility & segment_ids[:, :, None].eq(
+            segment_ids[:, None, :]
+        )
+        visibility = visibility & (segment_ids[:, None, :] >= 0)
+        if key_is_valid is not None:
+            visibility = visibility & key_is_valid[:, None, :]
+        visibility = _ensure_no_empty_rows(visibility)
+        return AttentionMask(
+            attn_mask=visibility[:, None, :, :],
+            is_causal=False,
+            batch_size=batch_size,
+            q_len=q_len,
+            total_len=total_len,
+            device=device,
+        )
 
     if key_is_valid is None:
         if q_len == total_len:

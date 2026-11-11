@@ -127,6 +127,8 @@ class TaiChuModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         past_key_values: Optional[KVCache] = None,
         use_cache: bool = False,
@@ -150,6 +152,10 @@ class TaiChuModel(nn.Module):
                        增量推理时形状 (batch, cur_len)（通常 cur_len=1）。
             attention_mask: 可选的二维 Padding Mask，形状
                 (batch_size, total_len)。非零/True 表示有效 Token。
+            segment_ids: 可选的二维 Attention Group ID，形状
+                (batch_size, seq_len)。不同 Group 之间不可互相 Attention。
+            position_ids: 可选的位置编号，形状 (batch_size, seq_len)。
+                Packing 后可按 Attention Group 重置位置。
             labels: 语言模型标签，形状 (batch, seq_len)，仅训练/完整序列时有效。
             past_key_values: 各层上一时刻的 KV 缓存，列表长度 = num_layers，
                              每个元素为 (k, v) 元组或 None。
@@ -199,6 +205,23 @@ class TaiChuModel(nn.Module):
                 )
             if attention_mask.size(0) != batch_size:
                 raise ValueError("attention_mask 的 batch 维度与 input_ids 不一致")
+        for name, value in (
+            ("segment_ids", segment_ids),
+            ("position_ids", position_ids),
+        ):
+            if value is None:
+                continue
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{name} 必须为 torch.Tensor 或 None")
+            if value.shape != input_ids.shape:
+                raise ValueError(
+                    f"{name} 形状 {tuple(value.shape)} 必须与 input_ids "
+                    f"形状 {tuple(input_ids.shape)} 一致"
+                )
+            if value.dtype != torch.long:
+                raise ValueError(f"{name} 必须使用 torch.long")
+            if value.device != input_ids.device:
+                raise ValueError(f"{name} 与 input_ids 必须位于同一设备")
 
         # ========== 1. 计算位置信息与总序列长度 ==========
         caches = list(past_key_values) if past_key_values is not None else []
@@ -269,6 +292,10 @@ class TaiChuModel(nn.Module):
                     raise ValueError("各层 KV cache 的 dtype 必须一致")
             if labels is not None:
                 raise ValueError("增量推理时 labels 必须为 None")
+            if segment_ids is not None or position_ids is not None:
+                raise ValueError(
+                    "增量推理暂不支持 segment_ids 或 position_ids"
+                )
         else:
             # 完整序列前向（训练或首次推理）
             past_len = 0
@@ -302,10 +329,21 @@ class TaiChuModel(nn.Module):
                     )
 
         # ========== 2. 获取 RoPE 的 cos / sin，并截取当前步所需部分 ==========
-        cos_full, sin_full = self.rope(total_len)
-        # 对于完整序列，取全部位置；对于增量，取最后 cur_len 个位置对应的旋转参数
-        cos = cos_full[:, past_len:total_len, :, :]   # (1, cur_len, 1, head_dim)
-        sin = sin_full[:, past_len:total_len, :, :]
+        if position_ids is None:
+            cos_full, sin_full = self.rope(total_len)
+            # 对于完整序列，取全部位置；对于增量，取最后 cur_len 个位置对应的旋转参数
+            cos = cos_full[:, past_len:total_len, :, :]
+            sin = sin_full[:, past_len:total_len, :, :]
+        else:
+            max_position = int(position_ids.max().item())
+            if max_position >= self.config.max_position_embeddings:
+                raise ValueError(
+                    f"position_ids 超出模型最大位置 {self.config.max_position_embeddings}"
+                )
+            if int(position_ids.min().item()) < 0:
+                raise ValueError("position_ids 不能包含负数")
+            cos = self.rope.cos_cached[0][position_ids]
+            sin = self.rope.sin_cached[0][position_ids]
 
         # ========== 3. 词嵌入 ==========
         hidden_states = self.token_embedding(input_ids)
@@ -315,6 +353,7 @@ class TaiChuModel(nn.Module):
             batch_size=batch_size,
             attention_mask=attention_mask,
             device=hidden_states.device,
+            segment_ids=segment_ids,
         )
 
         # ========== 4. 逐层传递 Transformer 层 ==========

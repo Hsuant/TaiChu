@@ -8,7 +8,16 @@ from .base import select_keys
 
 class PretrainingInputAdapter:
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
-        return select_keys(batch, ("input_ids", "attention_mask", "labels"))
+        return select_keys(
+            batch,
+            (
+                "input_ids",
+                "attention_mask",
+                "segment_ids",
+                "position_ids",
+                "labels",
+            ),
+        )
 
 
 __all__ = ["PretrainingInputAdapter"]
