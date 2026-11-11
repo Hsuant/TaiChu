@@ -132,6 +132,7 @@ dataset/
 ├── offline/
 │   ├── adapters/    # task semantics and masks
 │   ├── prepare.py   # offline orchestration + atomic output
+│   ├── pretraining/ # config, dedup, segmentation, output, reporting, orchestration
 │   ├── readers.py   # raw JSONL / GZ / Parquet input
 │   └── cleaning.py  # shared cleaning and deduplication
 ├── sampling/        # random, distributed, weighted, mixer, shuffle buffer
@@ -201,12 +202,14 @@ PretrainingSample
   -> PretrainingPacker
   -> PackedSequence
   -> PretrainingBatchBuilder
-  -> {input_ids, attention_mask, labels}
-  -> Causal LM
+  -> {input_ids, attention_mask, labels, segment_ids, position_ids}
+  -> Segment-aware Causal LM
 ```
 
-`document_ids` 与 `segment_ids` 随 Packed Sequence 保留，为未来的文档隔离 Attention
-提供边界信息。当前模型仍使用普通 Causal Mask。
+`document_ids` 与 `segment_ids` 随 Packed Sequence 保留。Batch Builder 将文档边界
+转换为 Attention Group ID，并按 Group 重置 `position_ids`。模型在 SDPA 前构造
+`causal AND same_group AND valid_key` 的块对角布尔 Mask，因此不同文档及同一长文档
+的不同滑动窗口不能仅因物理拼接而互相 Attention。
 
 ### 7.2 SFT
 
@@ -318,11 +321,13 @@ for batch in loader:
 离线准备 API：
 
 ```python
-from dataset.offline.config import load_preparation_config
-from dataset.offline.prepare import UnifiedDataPreparation
+from dataset.offline.pretraining import (
+    PretrainingDataPreparation,
+    load_pretraining_config,
+)
 
-config = load_preparation_config("configs/prepare_pretrain_data.yaml")
-manifest = UnifiedDataPreparation(config).run()
+config = load_pretraining_config("configs/prepare_pretrain_data.yaml")
+manifest = PretrainingDataPreparation(config).run()
 ```
 
 ## 11. Checkpoint / Resume
@@ -393,12 +398,12 @@ Storage、Manifest、Sampler、Distributed Sampler、Mixer 和 Checkpoint 不应
 - 多轮 Conversation 的 Assistant-only Mask。
 - Preference Pair 与 Pair-aware Batch。
 - Reward / Trajectory Batch 契约。
-- Pretraining Stream Packing 和 SFT Sample-isolated Packing。
+- Pretraining Stream Packing、块对角 Attention 和 SFT Sample-isolated Packing。
 - 单卡 Sampler、多 Rank 分片、Epoch 可复现性。
 - 统一离线 JSONL 到 Binary 数据集。
 - 配置严格校验和单一 Runtime 路径。
 
-当前完整 unittest 回归为 `154 tests, 1 skipped`。
+当前完整 unittest 回归为 `204 tests, 2 skipped`。
 
 CPU 端到端验证还覆盖了：
 
@@ -434,9 +439,9 @@ python benchmarks/preflight_next_token.py `
 - Padding 不变性、未来 Token 因果性、梯度与优化器单步更新。
 - SFT Assistant-only Mask 和 Stream Packing 文档边界。
 
-当前 `segment_ids` / `document_ids` 已被数据层保留，但模型 Attention 尚未使用
-它们构造块对角隔离 Mask。SFT 多 Conversation Packing 上线前，必须关闭 Packing
-或实现 Segment-aware Attention。
+当前 `segment_ids` / `document_ids` 已进入模型 Attention。不同 Group 使用独立因果
+块，Packing 后不会发生跨文档 Attention；增量解码路径仍使用普通 KV Cache 因果
+语义，不接收 `segment_ids` 或自定义 `position_ids`。
 
 仍未验证：
 

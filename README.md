@@ -179,15 +179,6 @@ python -m trainer.validate_tokenizer `
 
 ### 3. 检查数据格式
 
-仓库自带小规模样例，可先验证离线数据管线：
-
-```powershell
-python -m dataset.offline.prepare `
-  --config configs/prepare_pretrain_sample.yaml
-```
-
-样例将被写入 `data/unified/sample/`。它只用于格式与链路验证，不代表训练规模。
-
 生产预训练建议使用：
 
 ```text
@@ -202,7 +193,8 @@ python -m dataset.offline.prepare `
   --config configs/prepare_pretrain_data.yaml
 ```
 
-默认会生成 `data/unified/taichu_80m/{train,validation}/`，与 80M 训练配置一致。
+默认会生成 `data/unified/taichu_80m/{train,validation,diagnostic}/`，
+与 80M 训练配置一致。
 切换到 150M 或 190M 时，需要同步修改准备配置的 `dataset_id`、`output_dir`，
 以及训练配置中的 `storage.train_path` 与 `storage.validation_path`。
 
@@ -246,6 +238,31 @@ python -m trainer.train_pretrain `
   --model_config configs/TaiChu_80M.yaml `
   --pretrain_config configs/train_pretrain_80m.yaml `
   --resume experiments/small_models/taichu_80m_pretrain_v1/checkpoints/checkpoint-1000.pt
+```
+
+恢复时会沿用检查点所在的实验目录。若检查点中保存了 SwanLab run id，
+训练器会自动使用官方 `swanlab.init(..., id=..., resume="must")` 继续原实验；
+也可以通过配置或命令行显式覆盖：
+
+```yaml
+swanlab:
+  use_swanlab: true
+  swanlab_project: "TaiChu-Small"
+  swanlab_workspace: "ByteWyrm"
+  swanlab_id: "gmdnabup"
+  swanlab_resume: "must"
+  swanlab_init_kwargs:
+    tags: ["resume"]
+```
+
+```powershell
+python -m trainer.train_pretrain `
+  --model_config configs/TaiChu_80M.yaml `
+  --pretrain_config configs/train_pretrain_80m.yaml `
+  --resume experiments/small_models/taichu_80m_pretrain_v1/checkpoints/checkpoint-1000.pt `
+  --swanlab_workspace ByteWyrm `
+  --swanlab_id gmdnabup `
+  --swanlab_resume must
 ```
 
 常用命令行覆盖项：
@@ -517,7 +534,7 @@ TaiChu 的开发过程本身就是项目的一部分。以下时间线来自 Git
 | CUDA、AMP、FlashAttention 未完成实机审计 | 不能宣称 GPU 训练路径已稳定 | 在 Ampere/Hopper GPU 上复跑测试与短训练 |
 | 多卡 NCCL 未完成实机验证 | 不能宣称 DDP 稳定性 | 使用 2/4 卡 `torchrun` 做通信与恢复测试 |
 | 无 Activation Checkpointing | 低显存训练 150M/190M 受限制 | 在 Transformer Block 增加可配置重计算 |
-| Packing 未实现文档隔离 Attention | 已屏蔽跨文档目标，但上下文仍需块对角 Mask 隔离 | 使用 `document_ids` / `segment_ids` 构造块对角 Mask |
+| Packing 文档隔离 Attention | `segment_ids` 已构造块对角因果 Mask，跨文档 Key 不可见 | 使用模型侧 Attention 等价测试防止回归 |
 | 无下游 Benchmark | 无法评价知识、推理、代码与安全能力 | 接入 MMLU、C-Eval、HumanEval、GSM8K 等 |
 | 分布式精确分位数集中到 rank 0 | rank 0 CPU 内存随验证 token 数增长 | 超大验证集使用独立离线分位数评估 |
 | MFU 使用近似 FLOPs 公式 | 只能作为硬件效率参考 | 接入更精确的算子级 FLOP 统计 |
