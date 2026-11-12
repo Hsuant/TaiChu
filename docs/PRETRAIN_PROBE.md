@@ -26,16 +26,14 @@ eval/pretrain_probe/
 ## 启动
 
 ```powershell
-& 'D:\Environments\Anaconda\envs\AI\python.exe' `
-  -m eval.pretrain_probe `
+python -m eval.pretrain_probe `
   --config configs/pretrain_probe_80m.yaml
 ```
 
 单条续写：
 
 ```powershell
-& 'D:\Environments\Anaconda\envs\AI\python.exe' `
-  -m eval.pretrain_probe `
+python -m eval.pretrain_probe `
   --config configs/pretrain_probe_80m.yaml `
   --prompt "清晨，阳光透过窗户洒进房间，" `
   --max-new-tokens 64
@@ -44,8 +42,7 @@ eval/pretrain_probe/
 多条提示可使用重复的 `--prompt`，或读取文本/JSONL 文件：
 
 ```powershell
-& 'D:\Environments\Anaconda\envs\AI\python.exe' `
-  -m eval.pretrain_probe `
+python -m eval.pretrain_probe `
   --config configs/pretrain_probe_80m.yaml `
   --prompts-file prompts.txt `
   --json

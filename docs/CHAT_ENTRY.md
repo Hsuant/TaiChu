@@ -21,17 +21,16 @@
 
 ## 启动
 
-本机指定环境：
+通用启动方式：
 
 ```powershell
-& 'D:\Environments\Anaconda\envs\AI\python.exe' -m chat `
-  --config configs/chat_80m.yaml
+python -m chat --config configs/chat_80m.yaml
 ```
 
 单次请求：
 
 ```powershell
-& 'D:\Environments\Anaconda\envs\AI\python.exe' -m chat `
+python -m chat `
   --config configs/chat_80m.yaml `
   --prompt "用三句话解释什么是语言模型。" `
   --max-new-tokens 96
@@ -68,9 +67,10 @@ experiments/80m/taichu_80m_pretrain_v1/best_models/best_model.pt
 ## 验证
 
 ```powershell
-& 'D:\Environments\Anaconda\envs\AI\python.exe' -m pytest -q `
-  tests/test_chat_entry.py
+python -m pytest -q tests/test_chat_entry.py
 ```
+
+如果测试目录未纳入当前公开仓库，可先按“加载真实 Best Artifact”做手动 Smoke Test。
 
 ## 能力边界
 

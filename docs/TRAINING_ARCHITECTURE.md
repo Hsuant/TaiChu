@@ -194,11 +194,14 @@ objective、batch contract 和执行流程承载。
 
 ## 6. 验证
 
-当前完整测试：
+当前维护工作区完整测试：
 
 ```text
-243 passed, 2 skipped, 150 subtests passed
+249 passed, 2 skipped, 150 subtests passed
 ```
 
 CPU 模拟训练完成 79 步，训练、验证、Checkpoint 和独立评估均成功。
 CUDA AMP、FlashAttention、NCCL 和多节点环境仍需目标硬件验证。
+
+注意：当前公开 Git 历史已删除 `tests/`，而本地工作区将 `tests/` 加入忽略规则。
+测试数字来自维护工作区；在公开仓库恢复测试目录前，该基线不能由新克隆直接复现。
