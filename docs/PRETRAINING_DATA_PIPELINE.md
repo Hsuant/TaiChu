@@ -1,5 +1,8 @@
 # Pretraining Data Pipeline
 
+> 当前配置：80M 原始抽样目标 18 GB，训练目标 4.0B Token。
+> 本文的性能数字是维护者本机历史测量，只用于解释瓶颈与容量规划，不是当前机器基准。
+
 ## Pipeline
 
 ```text
@@ -74,9 +77,9 @@ page-size and query changes.
 
 On a 2,000-document sample, omitting per-document shingle/signature payloads
 reduced staging from 37.6 MB to 10.8 MB for 8.28 MB of cleaned UTF-8 text. For
-the current 18.01 GB raw mix, expect roughly 24 GB of staging plus roughly 79 GB
-of final binary output at peak. Keep at least 120 GB free on the output volume;
-the current 103 GB free space is too tight for a safe full run.
+that historical 18.01 GB raw mix, the projection was roughly 24 GB of staging
+plus roughly 79 GB of final binary output at peak. Re-measure free space and
+output size for the current corpus before a full run.
 
 `pending_batches` is the bounded in-flight queue, normally
 `2 * processing_workers`. A full queue therefore means work is saturating the
@@ -221,6 +224,6 @@ Automated tests cover:
 - JSONL to Binary integration with the bundled tokenizer,
 - block-diagonal Attention and Group-local position IDs.
 
-Full-corpus deduplication, the configured 4M/20M validation targets and GPU
+Full-corpus deduplication, the configured production sampling volume and GPU
 throughput have not been run in this workspace. Those require the production raw
 cache and are reported as operational next steps, not test results.

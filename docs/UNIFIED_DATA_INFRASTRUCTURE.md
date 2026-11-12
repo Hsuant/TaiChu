@@ -403,7 +403,7 @@ Storage、Manifest、Sampler、Distributed Sampler、Mixer 和 Checkpoint 不应
 - 统一离线 JSONL 到 Binary 数据集。
 - 配置严格校验和单一 Runtime 路径。
 
-当前完整回归为 `243 passed, 2 skipped, 150 subtests passed`。
+当前维护工作区完整回归为 `249 passed, 2 skipped, 150 subtests passed`。
 
 CPU 端到端验证还覆盖了：
 
@@ -411,15 +411,15 @@ CPU 端到端验证还覆盖了：
 - 预训练 `79` 步、验证、生成诊断和 Checkpoint。
 - 从 `checkpoint-60` 恢复并在校验 Dataset ID/Version 后继续到第 `79` 步。
 
-完整测试与 CPU 端到端预检：
+若当前工作区包含测试目录，可运行：
 
 ```powershell
 python -m pytest -q
-python tests/test_train/run.py
 ```
 
-`tests/test_train/run.py` 会完成文档级数据准备、79 步训练、验证、生成诊断、
-Checkpoint 和最终模型保存。吞吐数字不作为 GPU 或多 Worker 生产结论。
+维护工作区还完成了文档级数据准备、79 步 CPU 模拟训练、验证、生成诊断、
+Checkpoint、恢复和最终模型保存。该测试入口当前未纳入公开 Git 跟踪，吞吐数字
+不作为 GPU 或多 Worker 生产结论。
 
 测试覆盖：
 

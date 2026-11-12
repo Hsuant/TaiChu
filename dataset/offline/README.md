@@ -1,70 +1,80 @@
 # Offline Preparation
 
-Raw records are converted to unified binary datasets here.
+`dataset.offline` 把原始记录转换为统一 Binary Dataset，并生成可用于恢复和审计的
+Manifest。
+
+## 文档级预训练
 
 ```text
 JSONL / JSONL.GZ / Parquet
-  -> RecordSourceReader
-  -> task adapter
-  -> optional cleaning/dedup
-  -> Typed Sample
-  -> Binary Shard + Manifest
+  → RecordSourceReader
+  → NFC 清洗
+  → 精确去重
+  → 13-gram MinHash / LSH
+  → 精确 Jaccard 复核
+  → Cluster 级 Split
+  → 全文档 Tokenization
+  → 2,046 Token 滑窗 + 128 Overlap
+  → tcbin / tcidx / Manifest
 ```
-
-## Commands
-
-Document-aware pretraining preparation (the canonical pretraining entry):
 
 ```powershell
 python -m dataset.offline.prepare `
   --config configs/prepare_pretrain_data.yaml
 ```
 
-This path performs document-level exact and 13-gram MinHash/LSH near deduplication,
-cluster-level train/validation/diagnostic isolation, full-document tokenization,
-and 2046/128 sliding windows. Each window is stored as an independent sample with
-true-document BOS/EOS semantics and `labels=-100` on overlap context.
+这是当前预训练与 CPT 的规范入口。处理内容包括：
 
-Generic preparation for non-pretraining tasks:
+- 文档级 BOS/EOS。
+- 窗口重叠区 `labels=-100`。
+- Train / Validation / Diagnostic 的重复 Cluster 隔离。
+- 来源、语言、Token、窗口和泄漏统计。
+- 原子输出与可恢复 Staging。
+
+## 来源抽样
+
+文档级准备前，可先按 GB 权重抽取原始来源：
+
+```powershell
+python -m dataset.offline.sample_sources `
+  --config configs/sample_pretrain_80m.yaml
+```
+
+先做路径与预算检查：
+
+```powershell
+python -m dataset.offline.sample_sources `
+  --config configs/sample_pretrain_80m.yaml `
+  --dry-run
+```
+
+抽样是确定性的，并输出：
+
+```text
+sampling_manifest.json
+train/<source>.jsonl
+validation/<source>.jsonl
+```
+
+最终 Split 不以抽样阶段结果为准；文档级准备会重新执行去重和 Cluster 隔离。
+
+## 通用任务准备
 
 ```powershell
 python -m dataset.offline.prepare `
   --config configs/prepare_sft_data.yaml
 ```
 
-For production pretraining, sample the configured source mixture first:
+支持：
 
-```powershell
-python -m dataset.offline.sample_sources `
-  --config configs/sample_pretrain_mix.yaml
-```
+- SFT / Instruction Tuning
+- Preference / DPO / IPO / KTO 数据契约
+- Reward 数据契约
+- Trajectory / PPO / GRPO 数据契约
 
-Use the size-specific configs for the 80M, 150M and 190M presets. Sampling is
-deterministic for a fixed seed and writes a per-source manifest with selected
-bytes, train records and validation records. Point each pretraining source's
-`paths` entries at the generated per-source JSONL files.
-Records outside `min_chars`/`max_chars` are removed before sampling. Both the
-length-statistics pass and the sampling pass show byte-based progress bars.
-Thresholds can be overridden from the command line:
+除 Pretraining 外，这些任务目前只有数据准备与 Batch 契约，不代表对应训练算法已实现。
 
-```powershell
-python -m dataset.offline.sample_sources `
-  --config configs/sample_pretrain_190m.yaml `
-  --min-chars 32 `
-  --max-chars 100000
-```
-
-Use `--no-progress` for non-interactive logs. The manifest reports
-`short_records`, `long_records`, `eligible_records` and `eligible_gb`.
-
-Sampling first builds a compact temporary index of eligible record offsets. The
-sampling pass seeks only selected records, so source JSON is parsed once and
-eligible data is not read a second time. If Windows denies the final directory
-rename, the script retries and falls back to moving files within the same volume.
-A completed staging directory is retained on commit failure; rerunning the same
-command finalizes it without sampling again.
-
-Output:
+## 输出
 
 ```text
 data/unified/taichu_80m/
@@ -73,33 +83,42 @@ data/unified/taichu_80m/
 │   ├── manifest.json
 │   ├── data-00000.tcbin
 │   └── data-00000.tcidx
-└── validation/
-    ├── manifest.json
-    ├── data-00000.tcbin
-    └── data-00000.tcidx
+├── validation/
+│   ├── manifest.json
+│   ├── data-00000.tcbin
+│   └── data-00000.tcidx
+└── diagnostic/
 ```
 
-Pretraining implementation:
+## 实现结构
 
 ```text
-dataset/offline/pretraining/
-├── config.py          # strict config and validation
-├── hashing.py         # exact digest, MinHash and LSH buckets
-├── fingerprinting.py  # parallel document fingerprint computation
-├── segmentation.py    # sliding windows, BOS/EOS and labels
-├── store.py           # SQLite staging and resumable state
-├── deduplication.py   # exact/near duplicate clusters
-├── output.py          # split writing and leakage verification
-├── reporting.py       # statistics and manifest
-└── pipeline.py        # atomic orchestration
+dataset/offline/
+├── readers.py              # JSONL / GZ / Parquet
+├── cleaning.py             # 通用清洗
+├── sample_sources.py       # GB 加权确定性抽样
+├── prepare.py              # 统一准备路由
+├── pretraining/
+│   ├── config.py
+│   ├── hashing.py
+│   ├── fingerprinting.py
+│   ├── deduplication.py
+│   ├── segmentation.py
+│   ├── output.py
+│   ├── reporting.py
+│   └── pipeline.py
+└── adapters/               # SFT / Preference / Reward / Trajectory
 ```
 
-Non-pretraining adapters:
+## 注意事项
 
-- `SFTPreprocessor`
-- `PreferencePreprocessor`
-- `RewardPreprocessor`
-- `TrajectoryPreprocessor`
+- 配置中的路径来自作者本机，执行前必须替换。
+- `--restart` 只处理不完整 Staging，不覆盖已完成的正式输出。
+- 现有数据配置与训练配置的 Dataset ID 不一致，复现前应统一。
+- 生产语料和输出目录不应提交。
 
-All adapters share `TextTokenizer`, validation, metadata and Binary Storage.
-The legacy pretraining truncation adapter and process worker have been removed.
+详细说明：
+
+- [Pre-training Data Pipeline](../../docs/PRETRAINING_DATA_PIPELINE.md)
+- [Unified Data Infrastructure](../../docs/UNIFIED_DATA_INFRASTRUCTURE.md)
+- [Configuration](../../docs/CONFIGURATION.md)
