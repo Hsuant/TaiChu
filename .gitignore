@@ -36,7 +36,7 @@ desktop.ini
 node_modules/
 
 # Training and evaluation artifacts
-experiments/
+/experiments/
 swanlogs/
 wandb/
 mlruns/
@@ -73,7 +73,7 @@ nohup.out
 *.npy
 *.npz
 /reports/
-/tests
+/tests/
 
 # Modele
 /taichu
