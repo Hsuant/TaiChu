@@ -226,6 +226,10 @@ messages
 Prompt Mask、Assistant-only Loss、EOS Mask、Conversation Boundary 和 Segment ID 在
 离线阶段或 Packing 阶段生成。`labels` 在数据层不做因果移位。
 
+批量 SFT Builder 在筛选阶段一次生成完整 Token IDs 与 Assistant Mask，并写入紧凑
+token cache；Binary 发布阶段直接读取 cache 写 `SFTSequenceSample`，不会重新逐 turn
+tokenization，也不会在训练二进制 metadata 中重复保存完整 messages。
+
 ### 7.3 Preference
 
 ```text
@@ -285,6 +289,11 @@ Rank 0..N-1
 - `configs/data_reward_unified.yaml`
 - `configs/data_trajectory_unified.yaml`
 
+离线准备配置：
+
+- `configs/prepare_pretrain_data.yaml`
+- `configs/prepare_sft_data.yaml`
+
 配置类在 `dataset/config.py`，加载时会：
 
 - 检查未知字段。
@@ -310,13 +319,31 @@ factory = UnifiedDataLoaderFactory(
     data_config,
     pad_token_id=tokenizer.token_to_id(data_config.pad_token),
 )
-loader = factory.create(split="train")
+loader = factory.create(split="train", batch_size=8)
 loader.set_epoch(0)
 
 for batch in loader:
     model_inputs = factory.input_adapter()(batch)
     train_step(model_inputs)
 ```
+
+SFT 使用同一 Runtime，只需要专用入口：
+
+```python
+from dataset.runtime import build_sft_data_loader
+
+loader = build_sft_data_loader(
+    data_config,
+    pad_token_id=tokenizer.token_to_id(data_config.pad_token),
+    batch_size=8,
+    split="train",
+    drop_last=True,
+)
+```
+
+该入口复用 `UnifiedDataLoaderFactory`，保留 assistant-only `loss_mask`、
+`segment_ids`、sample-isolated packing 和固定长度或 padding-free batch
+contract。
 
 离线准备 API：
 
@@ -403,7 +430,7 @@ Storage、Manifest、Sampler、Distributed Sampler、Mixer 和 Checkpoint 不应
 - 统一离线 JSONL 到 Binary 数据集。
 - 配置严格校验和单一 Runtime 路径。
 
-当前维护工作区完整回归为 `249 passed, 2 skipped, 150 subtests passed`。
+当前维护工作区完整回归为 `268 passed, 3 skipped, 152 subtests passed`。
 
 CPU 端到端验证还覆盖了：
 

@@ -1,29 +1,42 @@
+# TaiChu 通用 SFT Runtime 数据配置。
+# 该文件只负责训练时读取 unified Binary Dataset；source 构建和 tokenization
+# 由 configs/prepare_sft_data.yaml 控制。
 data:
+  # 统一数据配置 Schema 版本。
   schema_version: 1
+  # 任务类型；SFT Loader 只接受 sft / instruction_tuning。
   task_type: sft
-  dataset_id: taichu-sft-v1
+  # 必须与 prepare_sft_data.yaml 中的 dataset_id 保持一致。
+  dataset_id: taichu-sft-80m-v1
 
   storage:
+    # 当前支持的训练存储格式。
     format: binary_mmap
-    train_path: ./data/unified/sft/train
-    validation_path: ./data/unified/sft/validation
+    # 由通用 SFT 构建流程生成的 source=unified 输出。
+    train_path: "../data/SFT/unified/80m_v1/train"
+    validation_path: "../data/SFT/unified/80m_v1/validation"
+    # DataLoader worker 和预取配置。
     num_workers: 4
     prefetch_factor: 2
 
   sampling:
+    # distributed 同时支持单卡和多卡 Rank 分片。
     strategy: distributed
     shuffle: true
     seed: 42
+    # SFT 训练丢弃最后一个不足一个 micro batch 的尾部。
     drop_last: true
 
   packing:
+    # SFT 使用整 conversation 级 packing，禁止跨 conversation 拼接 Attention。
     enabled: true
     strategy: sample_isolated
-    max_seq_length: 4096
+    # 必须与模型最大上下文及 prepare_sft_data.yaml 保持一致。
+    max_seq_length: 2048
     pad_to_multiple_of: 8
 
   batching:
-    strategy: padding_free
-    micro_batch_size: 2
+    # fixed_length 输出二维 Batch；切换 padding_free 时输出扁平 cu_seqlens 契约。
+    strategy: fixed_length
     pad_to_multiple_of: 8
-    padding_free: true
+    padding_free: false

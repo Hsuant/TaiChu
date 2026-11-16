@@ -13,8 +13,10 @@ from .base import (
     TextTokenizer,
     apply_max_length,
     dataset_identifier,
+    normalize_reasoning_tags,
     sample_identifier,
     source_identifier,
+    validate_reasoning_protocol,
 )
 
 
@@ -29,12 +31,11 @@ class SFTPreprocessor(BasePreprocessingAdapter):
         max_length: int | None = None,
         truncation: str = "left",
         assistant_only_loss: bool = True,
-        add_eos: bool = True,
         train_on_eos: bool = True,
     ) -> None:
         if truncation not in {"left", "right"}:
             raise ValueError("truncation must be 'left' or 'right'")
-        if add_eos and tokenizer.eos_token_id is None:
+        if train_on_eos and tokenizer.eos_token_id is None:
             raise ValueError("EOS token could not be resolved")
         if not assistant_only_loss and train_on_eos:
             raise ValueError("train_on_eos requires assistant_only_loss")
@@ -43,7 +44,6 @@ class SFTPreprocessor(BasePreprocessingAdapter):
         self.max_length = max_length
         self.truncation = truncation
         self.assistant_only_loss = assistant_only_loss
-        self.add_eos = add_eos
         self.train_on_eos = train_on_eos
 
     def validate(self, record: Mapping[str, Any]) -> None:
@@ -54,10 +54,24 @@ class SFTPreprocessor(BasePreprocessingAdapter):
         for message in messages:
             if not isinstance(message, Mapping):
                 raise TaiChuDataFormatError("each message must be a mapping")
-            self.renderer.render(message)
+            self.renderer.render(self._normalized_message(message))
 
     def format(self, record: Mapping[str, Any]) -> list[RenderedTurn]:
-        return [self.renderer.render(message) for message in record["messages"]]
+        return [
+            self.renderer.render(self._normalized_message(message))
+            for message in record["messages"]
+        ]
+
+    @staticmethod
+    def _normalized_message(
+        message: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        normalized = dict(message)
+        if normalized.get("role") == "assistant":
+            normalized["content"] = normalize_reasoning_tags(
+                str(normalized.get("content", ""))
+            )
+        return normalized
 
     def tokenize(
         self,
@@ -68,6 +82,8 @@ class SFTPreprocessor(BasePreprocessingAdapter):
         loss_mask: list[int] = []
         for turn in formatted:
             prefix_ids = self.tokenizer.encode(turn.prefix)
+            if turn.role == "assistant":
+                validate_reasoning_protocol(turn.content)
             content_ids = self.tokenizer.encode(turn.content)
             suffix_ids = self.tokenizer.encode(turn.suffix)
             input_ids.extend(prefix_ids)
@@ -76,12 +92,18 @@ class SFTPreprocessor(BasePreprocessingAdapter):
             train_turn = (not self.assistant_only_loss) or turn.role == "assistant"
             loss_mask.extend([0] * len(prefix_ids))
             loss_mask.extend([1 if train_turn else 0] * len(content_ids))
-            loss_mask.extend([0] * len(suffix_ids))
-            if self.add_eos and self.tokenizer.eos_token_id is not None:
-                input_ids.append(self.tokenizer.eos_token_id)
-                loss_mask.append(
-                    1 if train_turn and self.train_on_eos else 0
-                )
+            loss_mask.extend(
+                [
+                    1
+                    if (
+                        train_turn
+                        and self.train_on_eos
+                        and token_id == self.tokenizer.eos_token_id
+                    )
+                    else 0
+                    for token_id in suffix_ids
+                ]
+            )
 
         labels = [
             token if mask else -100
@@ -101,7 +123,11 @@ class SFTPreprocessor(BasePreprocessingAdapter):
         messages = [
             ConversationMessage(
                 role=str(message["role"]),
-                content=str(message["content"]),
+                content=(
+                    normalize_reasoning_tags(str(message["content"]))
+                    if message["role"] == "assistant"
+                    else str(message["content"])
+                ),
                 name=message.get("name"),
                 metadata=dict(message.get("metadata", {})),
             )

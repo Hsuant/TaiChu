@@ -34,7 +34,7 @@ from dataset import (
 | Schema | 当前用途 |
 |---|---|
 | `PretrainingSample` | 预训练 / CPT，已接入训练 |
-| `SFTSequenceSample` | SFT 数据与 Batch 契约，训练器未接入 |
+| `SFTSequenceSample` | SFT 数据、Assistant-only Label 与训练 Batch 契约，已接入 `trainer.train_sft` |
 | `PreferenceSample` | DPO/IPO/KTO 数据契约，算法未实现 |
 | `RewardSample` | Reward Model 数据契约，Reward Head 未实现 |
 | `TrajectorySample` | PPO/GRPO/RLHF 在线与离线轨迹契约，算法未实现 |

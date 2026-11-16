@@ -98,7 +98,7 @@ class RecordSourceReader:
         except ImportError as exc:
             raise ImportError("pyarrow is required to read Parquet sources") from exc
         with parquet.ParquetFile(path) as handle:
-            for batch in handle.iter_batches(use_threads=False):
+            for batch in handle.iter_batches(use_threads=True):
                 records = batch.to_pylist()
                 if not records:
                     continue

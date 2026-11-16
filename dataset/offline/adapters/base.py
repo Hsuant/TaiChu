@@ -9,6 +9,35 @@ from ...exceptions import TaiChuDataFormatError
 from ...schema import token_ids
 
 
+CANONICAL_THINK_OPEN = "<|think|>"
+CANONICAL_THINK_CLOSE = "<|/think|>"
+LEGACY_THINK_OPEN = "<think>"
+LEGACY_THINK_CLOSE = "</think>"
+
+
+def normalize_reasoning_tags(content: str) -> str:
+    """Convert legacy data markers to canonical tokens during offline ingestion."""
+    return content.replace(LEGACY_THINK_OPEN, CANONICAL_THINK_OPEN).replace(
+        LEGACY_THINK_CLOSE,
+        CANONICAL_THINK_CLOSE,
+    )
+
+
+def validate_reasoning_protocol(content: str) -> None:
+    """Reject legacy markers and require balanced canonical reasoning tags."""
+    if LEGACY_THINK_OPEN in content or LEGACY_THINK_CLOSE in content:
+        raise TaiChuDataFormatError(
+            "legacy reasoning tags are unsupported; use "
+            "<|think|> and <|/think|>"
+        )
+    if content.count(CANONICAL_THINK_OPEN) != content.count(
+        CANONICAL_THINK_CLOSE
+    ):
+        raise TaiChuDataFormatError(
+            "canonical reasoning tags must be opened and closed in pairs"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedTurn:
     role: str
@@ -42,6 +71,8 @@ class RoleTagRenderer:
             raise TaiChuDataFormatError(f"unsupported message role {role!r}")
         if not isinstance(content, str):
             raise TaiChuDataFormatError("message content must be a string")
+        if role == "assistant":
+            validate_reasoning_protocol(content)
         prefix = f"{self.start_token}{role}\n"
         suffix = f"{self.end_token}\n"
         return RenderedTurn(role=role, prefix=prefix, content=content, suffix=suffix)
@@ -277,11 +308,17 @@ def apply_max_length(
 
 __all__ = [
     "BasePreprocessingAdapter",
+    "CANONICAL_THINK_CLOSE",
+    "CANONICAL_THINK_OPEN",
     "ConversationRenderer",
+    "LEGACY_THINK_CLOSE",
+    "LEGACY_THINK_OPEN",
     "RenderedTurn",
     "RoleTagRenderer",
     "TextTokenizer",
     "apply_max_length",
+    "validate_reasoning_protocol",
+    "normalize_reasoning_tags",
     "dataset_identifier",
     "sample_identifier",
     "source_identifier",

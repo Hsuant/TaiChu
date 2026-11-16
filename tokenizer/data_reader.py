@@ -80,9 +80,11 @@ class JsonRecordReader:
                 ijson = None
             if ijson is not None:
                 with self.path.open("rb") as handle:
-                    for record in ijson.items(handle, self.json_prefix):
-                        self.stats.records_read += 1
-                        yield record
+                    for value in ijson.items(handle, self.json_prefix):
+                        records = value if isinstance(value, list) else [value]
+                        for record in records:
+                            self.stats.records_read += 1
+                            yield record
                 return
 
         if not self.allow_full_json_load:

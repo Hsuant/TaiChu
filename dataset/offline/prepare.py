@@ -52,7 +52,6 @@ def _sft_adapter(
         max_length=config.max_seq_length,
         truncation=config.truncation,
         assistant_only_loss=config.assistant_only_loss,
-        add_eos=config.add_eos,
         train_on_eos=config.train_on_eos,
     )
 

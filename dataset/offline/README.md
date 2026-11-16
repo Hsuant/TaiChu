@@ -62,17 +62,39 @@ validation/<source>.jsonl
 
 ```powershell
 python -m dataset.offline.prepare `
-  --config configs/prepare_sft_data.yaml
+  --config configs/prepare_preference_data.yaml
 ```
 
 支持：
 
-- SFT / Instruction Tuning
 - Preference / DPO / IPO / KTO 数据契约
 - Reward 数据契约
 - Trajectory / PPO / GRPO 数据契约
 
 除 Pretraining 外，这些任务目前只有数据准备与 Batch 契约，不代表对应训练算法已实现。
+
+## 精选 SFT 数据构建
+
+`dataset.offline.sft` 接收通用 `messages` 记录，执行完整上下文长度检查、
+跨来源去重、可选类别配额、source/validation 划分和 Binary Dataset 构建：
+
+```powershell
+python -m dataset.offline.sft `
+  --config configs/prepare_sft_data.yaml
+```
+
+默认输出：
+
+```text
+data/sft/
+├── build_manifest.json
+├── source/train/sft.jsonl
+├── source/validation/sft.jsonl
+└── unified/
+    ├── dataset_manifest.json
+    ├── train/
+    └── validation/
+```
 
 ## 输出
 
@@ -97,6 +119,7 @@ dataset/offline/
 ├── readers.py              # JSONL / GZ / Parquet
 ├── cleaning.py             # 通用清洗
 ├── sample_sources.py       # GB 加权确定性抽样
+├── sft/                    # 通用 SFT source + unified 构建器
 ├── prepare.py              # 统一准备路由
 ├── pretraining/
 │   ├── config.py

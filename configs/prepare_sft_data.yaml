@@ -1,24 +1,237 @@
-task_type: "sft"
-dataset_id: "taichu-sft-v1"
-version: "1"
+# TaiChu SFT 离线数据构建配置。
+#
+# 构建命令：
+#   python -m dataset.offline.sft --config configs/prepare_sft_data.yaml
+#
+# 该文件控制 raw conversation 的读取、清洗、去重、配额选择、tokenize、
+# train/validation 划分以及 Unified Binary Dataset 输出。
 
+# 与训练和 Chat 入口共享的 tokenizer 定义。这里必须是 tokenizer.json，
+# 不是 tokenizer 目录。
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
-output_dir: "./data/unified/sft"
 
-max_seq_length: 4096
+# 所有 profile 的公共输出父目录。实际输出为 output_dir / output_subdir。
+output_dir: "E:/Academic/Datasets/TaiChu/SFT/unified"
+
+# 默认使用的 profile。命令行 --profile 可以覆盖该值。
+profile: "80m_multiturn"
+
+# profile 决定输出身份和 category 配额。原 80m profile 保留，用于复现旧数据集；
+# 新训练默认使用 80m_multiturn。
+profiles:
+  80m:
+    # 最终目录：output_dir / output_subdir。
+    output_subdir: "80m_v1"
+
+    # dataset_id 是 Binary Dataset 身份。训练配置和断点恢复都必须保持一致。
+    dataset_id: "taichu-sft-80m-v1"
+    version: "1"
+
+    # quotas 是过滤、去重后每个 category 最多保留的样本数，不是 token 数。
+    # 某 category 候选不足时允许低于配额，并会记录在 underfilled_categories。
+    # 五个 family 合计：
+    #   中文通用/考试 51,600
+    #   英文通用/科学 51,600
+    #   数学 12,900
+    #   代码 12,900
+    quotas: &sft_80m_quotas
+      # 中文通用能力、中文 STEM 和中文考试。
+      zh_general: 50000
+      zh_stem: 300
+      zh_exam: 1300
+
+      # 英文通用能力和英文科学问答。
+      en_general: 47600
+      en_science: 4000
+
+      # 中英文数学。
+      zh_math: 6450
+      en_math: 6450
+
+      # 以英文为主的代码数据。
+      en_code: 12900
+
+  80m_multiturn:
+    output_subdir: "80m_multiturn_v1"
+    dataset_id: "taichu-sft-80m-multiturn-v1"
+    version: "1"
+
+    # 保留原 profile 的类别结构，只增加中英文通用对话配额。
+    # YAML merge key (<<) 复用上面锚定的原配额，总额从 129,000 增至 169,000。
+    # 新增 40,000 条名额用于高质量多轮样本，不挤占数学、代码和科学配额。
+    quotas:
+      <<: *sft_80m_quotas
+      zh_general: 70000
+      en_general: 67600
+
+# raw_sources 按顺序读取，但最终样本由 seed 决定的稳定 selection_key 和
+# category 配额选择，因此输入文件顺序不会直接决定训练集。
+#
+# 每个来源字段：
+#   name:    本次构建内唯一的来源名
+#   adapter: sources.py 中注册的格式适配器
+#   group:   来源分组，用于 source_quotas 和 Manifest 统计
+#   path:    文件或目录；当前配置使用绝对路径
+#   options: adapter 专用参数，由具体 adapter 解释
+raw_sources:
+  # 中文 Alpaca-GPT4 指令数据，单轮 instruction/input/output JSON。
+  - name: "alpaca_zh"
+    adapter: "alpaca_zh"
+    group: "alpaca_zh"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/alpaca-zh/alpaca_gpt4_data_zh.json"
+
+  # 中文 DeepSeek-R1 蒸馏 SFT 数据，单轮 JSONL。
+  # min_score 过滤来源自带的质量分数，低于该值的记录不会进入后续处理。
+  - name: "chinese_deepseek"
+    adapter: "chinese_deepseek"
+    group: "chinese_deepseek"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/Chinese-DeepSeek-R1-Distill-data-110k-SFT"
+    options:
+      min_score: 8
+
+  # OpenHermes-2.5，JSON 数组 + conversations/from/value 结构。
+  # 其中包含单轮和多轮样本，后续统一走质量、长度和去重过滤。
+  - name: "openhermes"
+    adapter: "openhermes"
+    group: "openhermes"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/OpenHermes-2.5/openhermes2_5.json"
+
+  # OpenThoughts 数学/科学/代码 Parquet，读取后统一转换为 messages。
+  - name: "open_thoughts"
+    adapter: "open_thoughts"
+    group: "open_thoughts"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/OpenThoughts-114k/metadata"
+
+  # OpenR1-Math Parquet，仅保留 correctness_count > 0 的数学样本。
+  - name: "open_r1"
+    adapter: "open_r1"
+    group: "open_r1"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/OpenR1-Math-220k/data"
+
+  # Bespoke-Stratos Parquet，主要用于英文数学和推理数据。
+  - name: "bespoke_stratos"
+    adapter: "bespoke_stratos"
+    group: "bespoke"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/Bespoke-Stratos-17k/data/train-00000-of-00001.parquet"
+
+  # ---------------------------------------------------------------------------
+  # 高质量多轮补充来源
+  #
+  # 许可证、数据规模、下载方式和未启用来源说明：
+  #   docs/MULTITURN_SFT_DATA.md
+  #
+  # canonical_messages 支持 Parquet、JSONL、JSON，并自动识别 messages、
+  # conversations 或 conversation。min_user_turns: 2 表示只接收至少两轮
+  # user/assistant 对话，避免单轮样本混入多轮补充集。
+  # ---------------------------------------------------------------------------
+
+  # 中文 SmolTalk：Parquet，字段为 conversations。
+  # 注意：仓库标记 Apache-2.0，但 OpenCSG README 对商业使用另有许可要求。
+  - name: "smoltalk_chinese"
+    adapter: "canonical_messages"
+    group: "smoltalk_chinese"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/SmolTalk-Chinese"
+    options:
+      # 该来源统一进入中文通用配额；category 决定最终配额归属。
+      category: "zh_general"
+      min_user_turns: 2
+
+  # ShareGPT 90K 中文部分，JSONL，每轮使用 human/assistant 成对字段。
+  # 同一个目录还包含英文文件，因此用 include_patterns 精确选择中文文件。
+  - name: "sharegpt_zh"
+    adapter: "canonical_messages"
+    group: "sharegpt_zh_en"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/ShareGPT-Chinese-English-90k"
+    options:
+      category: "zh_general"
+      min_user_turns: 2
+      messages_key: "conversation"
+      include_patterns:
+        - "common_zh_70k.jsonl"
+
+  # ShareGPT 90K 英文部分。与中文部分共享 group，便于 Manifest 汇总双语来源。
+  - name: "sharegpt_en"
+    adapter: "canonical_messages"
+    group: "sharegpt_zh_en"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/ShareGPT-Chinese-English-90k"
+    options:
+      category: "en_general"
+      min_user_turns: 2
+      messages_key: "conversation"
+      include_patterns:
+        - "common_en_70k.jsonl"
+
+  # UltraChat-200k 的 train_sft Parquet，字段为 messages。
+  # 只下载并读取 train_sft，不使用 train_gen/test 等 generation 划分。
+  - name: "ultrachat_200k"
+    adapter: "canonical_messages"
+    group: "ultrachat_200k"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/UltraChat-200k"
+    options:
+      category: "en_general"
+      min_user_turns: 2
+
+  # MOSS-002 中文 helpfulness/honesty，JSON 数组。
+  # moss_sft 会解析 plain_text 中的 [Human]/[MOSS] 和 <eoh>/<eoa> 标记；
+  # min_user_turns: 2 只保留真正的多轮 conversation。
+  - name: "moss_002_zh"
+    adapter: "moss_sft"
+    group: "moss_002"
+    path: "E:/Academic/Datasets/TaiChu/SFT/raw/MOSS-002-SFT"
+    options:
+      category: "zh_general"
+      min_user_turns: 2
+
+# 单条完整 conversation 渲染后的 token 上限。超限记录直接拒绝，不做静默截断。
+# 必须与模型训练上下文保持兼容；当前模型最大位置长度为 2048。
+max_seq_length: 2048
+
+# 验证集按 category 分层抽取的比例。0.02 表示每个有足够样本的 category
+# 约保留 2% 作为 validation。
+validation_ratio: 0.02
+
+# 用于配额选择、验证集划分和推理样本保留的全局随机种子。
+# 相同数据、配置和 seed 会产生稳定选择结果。
+seed: 42
+
+# 清洗后整段 conversation 的总字符数下限/上限。
+min_chars: 32
+max_chars: 200000
+
+# 所有 user message 的累计字符数下限，用于过滤过短且信息量不足的提问。
+min_user_chars: 8
+
+# True 表示只在 assistant 内容和 assistant 结束符上计算 loss；
+# user、system 等 token 的 label 会设为 -100。
 assistant_only_loss: true
+
+# True 表示对每个 assistant 的 <|taichu_end|> 也计算 loss，
+# 让模型学习在回答结束后主动停止。
 train_on_eos: true
-truncation: "left"
-invalid_policy: "error"
+
+# 含推理块的来源按确定性规则保留约 25% 的 reasoning 样本；
+# 其余样本会删除 <|think|>...<|/think|>，只监督最终回答。
+reasoning_sample_ratio: 0.25
+
+# 删除来源中的 system message。当前 SFT/Chat 推理协议默认不带 system prompt。
+drop_system: true
+
+# min_assistant_tokens 是整段 conversation 所有 assistant token 的总下限，
+# 因而多轮对话里的“好的”“是的”等短回复不会导致整条样本被误删。
+min_assistant_tokens: 32
+
+# max_assistant_tokens 是单条 assistant 回复的 token 上限；任一条超限则整条
+# conversation 被拒绝。该限制用于控制超长回答和显存峰值。
+max_assistant_tokens: 512
+
+# 每个 Binary Dataset shard 最多写入的样本数。
 shard_size: 50000
 
+# 每次交给 tokenizer 的记录数。过大增加内存峰值，过小降低吞吐。
+preprocess_batch_size: 2048
+
+# 特殊 token 必须与 taichu_tokenizer 以及训练/推理配置完全一致。
+# 不要仅通过修改 YAML 注入新 token；这些 token 还必须在词表和模型中存在。
 pad_token: "<|pad|>"
 bos_token: "<|taichu_start|>"
 eos_token: "<|taichu_end|>"
-add_eos: true
-
-splits:
-  train:
-    - "./data/raw/sft/train"
-  validation:
-    - "./data/raw/sft/validation"
