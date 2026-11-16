@@ -1,26 +1,36 @@
-# TaiChu 80M conversational entry configuration.
+# TaiChu 对话入口配置样例。
+# 相对路径均以本配置文件所在目录为基准解析。
 
-# Best validation inference artifact from the local 80M experiment.
+# 最小推理检查点路径；应指向 best_models 或 final_models 中的模型产物。
 checkpoint: "../experiments/80m_8B/taichu_80m_sft_v1/best_models/best_model.pt"
 
-# Hugging Face-compatible tokenizer bundle containing chat_template.jinja.
+# Hugging Face 兼容的 Tokenizer 目录；需包含 chat_template.jinja。
 tokenizer: "../taichu_tokenizer"
 
-# SFT v1 is trained without a system message; keep inference identical.
+# 系统提示词；留空表示与无 system message 的 SFT 训练协议保持一致。
 system_prompt: ""
+# 推理模式；off 表示不生成 think 推理块。
 reasoning_mode: "off"
 
-# auto selects CUDA when available; CPU falls back to float32.
+# 推理设备；auto 优先选择 CUDA，无 GPU 时回退 CPU。
 device: "auto"
+# 推理精度；auto 根据设备和检查点自动选择，CPU 回退到 float32。
 dtype: "auto"
 
-# null uses the checkpoint's max_position_embeddings.
+# 最大上下文 Token 数；null 表示使用检查点中的 max_position_embeddings。
 context_tokens: null
 
+# Token 采样参数。
 sampling:
+  # 每次回答最多生成的新 Token 数。
   max_new_tokens: 1024
+  # 温度；越高输出越随机，0 表示贪心解码。
   temperature: 0.8
+  # Top-K 候选数量；null 表示禁用该过滤。
   top_k: 50
+  # Top-P 累积概率阈值；null 表示禁用该过滤。
   top_p: 0.9
+  # 重复 Token 惩罚系数；必须大于等于 1。
   repetition_penalty: 1.05
+  # 采样随机种子；用于尽量复现相同输出。
   seed: 42

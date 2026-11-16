@@ -1,58 +1,95 @@
-# TaiChu Byte-Level BPE Tokenizer training configuration.
+# TaiChu Byte-Level BPE Tokenizer 训练配置样例。
+# 相对路径均以本配置文件所在目录为基准解析。
+#
+# 使用说明：
+#   1. 下列 files 是项目内示例目录，不包含真实语料路径。
+#   2. 将文件放入示例目录，或把 files 替换为自己的 JSONL/JSON 路径。
+#   3. 输出目录为 save.directory，可按实验名称修改。
+#   4. 在仓库根目录执行：
+#      python -m trainer.train_tokenizer `
+#        --config configs/TaiChu_Tokenizer_config.yaml
 
+# 训练语料读取配置。
 data:
+  # 语料文件、目录或 Glob 模式列表；当前只支持 JSON/JSONL/NDJSON。
   files:
-    # Formal 4.0 GB tokenizer corpus: Chinese 3.201 GB + English 0.803 GB.
-    - 'E:\Academic\Datasets\TaiChu\Pretrain\tokenizer\ch\*.jsonl'
-    - 'E:\Academic\Datasets\TaiChu\Pretrain\tokenizer\en\*.jsonl'
+    # 中文 Tokenizer 训练语料示例目录。
+    - "./data/tokenizer/source/ch/*.jsonl"
+    # 英文 Tokenizer 训练语料示例目录。
+    - "./data/tokenizer/source/en/*.jsonl"
+  # 每个输入文件重复读取的训练轮数。
   epoch: 1
+  # JSON/JSONL 记录中作为正文的字段名。
   text_key: "text"
 
-  # Character-based guard, not a byte count. Truncation is counted in logs.
+  # 单条文本最大字符数；按字符而非字节计算，截断次数会写入日志。
   max_text_chars: 200000
+  # 是否跳过清洗后为空的记录。
   skip_empty: true
 
-  # The old Python process pool is intentionally disabled. Tokenizers performs
-  # native pretokenization in parallel without duplicating the Python heap.
+  # Python 进程池 Worker 数；Tokenizers 库会在原生侧并行预分词。
   num_workers: 1
 
-  # Only used for a top-level JSON object. JSONL and top-level JSON arrays are
-  # always streamed and do not need this setting.
+  # 顶层 JSON 对象中的数组前缀；JSONL 和顶层 JSON 数组无需该字段。
   json_prefix: null
+  # 是否允许一次性完整加载 JSON；false 可避免大文件产生高内存峰值。
   allow_full_json_load: false
 
-# NFC preserves Chinese punctuation and avoids collapsing newlines or code
-# indentation. Whitespace normalization caused lossy tokenizer round trips.
+# Unicode 规范化配置。
 normalizer:
+  # 规范化方式；nfc 保留中文标点、换行和代码缩进。
   type: "nfc"
 
+# 预分词配置。
 pre_tokenizer:
+  # 预分词器类型；当前只支持 bytelevel。
   type: "bytelevel"
+  # 是否在每个文本前添加空格前缀。
   add_prefix_space: false
+  # 是否按 GPT-2 正则规则切分文本。
   use_regex: true
+  # 是否将数字拆分为独立片段。
   digit_split: true
 
+# BPE 训练器配置。
 trainer:
+  # 目标词表大小；必须大于字节字母表与特殊 Token 的总数。
   vocab_size: 32768
+  # Token Pair 进入词表所需的最小出现频率。
   min_frequency: 2
+  # 是否显示 Tokenizer 训练进度。
   show_progress: true
 
+# 运行时监控配置。
 runtime:
+  # 运行状态监控与日志刷新的间隔秒数。
   monitor_interval_seconds: 0.1
+  # 每处理多少条记录更新一次进度。
   progress_every_records: 100000
-  # true 时在训练进程内执行完整 Transformers 重载和 Jinja 渲染，峰值会明显增加。
-  # 轻量原生重载默认开启；完整验证可用 trainer.validate_tokenizer 单独执行。
+  # 是否在训练进程内执行完整 Transformers 重载和 Jinja 渲染。
+  # true 会显著增加内存峰值；完整验证建议使用 trainer.validate_tokenizer。
   full_reload_validation: false
 
+# 写入 Tokenizer 配置文件的模型元数据。
 model_meta:
+  # 模型系列名称。
   name: "TaiChu"
+  # 模型版本号。
   version: "1.0.0"
+  # 作者信息。
   author: "Hsuan Tong"
+  # 许可证名称。
   license: "Apache 2.0"
+  # 模型描述。
   description: "Tokenizer for TaiChu large language model"
+  # 联系邮箱。
   contact: "hsuantx@163.com"
 
+# Tokenizer 产物保存配置。
 save:
+  # Tokenizer 输出目录；必须位于可写位置。
   directory: "../experiments/tokenizer_zh_en_32k"
+  # Tokenizer 支持的最大序列长度；写入 tokenizer_config.json。
   model_max_length: 32768
+  # 输出目录已存在时是否覆盖。
   overwrite: true

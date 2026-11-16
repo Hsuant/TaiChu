@@ -1,17 +1,29 @@
-# TaiChu 80M raw-text continuation probe configuration.
+# TaiChu 原始文本续写探针配置样例。
+# 相对路径均以本配置文件所在目录为基准解析。
 
+# 预训练最小推理检查点路径。
 checkpoint: "../experiments/80m_8B/taichu_80m_pretrain_v1/best_models/TaiChu_80M.pt"
+# Tokenizer 目录；必须与检查点训练时一致。
 tokenizer: "../taichu_tokenizer"
 
+# 推理设备；auto 优先选择 CUDA，无 GPU 时回退 CPU。
 device: "auto"
+# 推理精度；auto 根据设备和检查点自动选择。
 dtype: "auto"
+# 最大上下文 Token 数；null 表示使用检查点配置。
 context_tokens: null
 
-# Raw next-token continuation uses the model's ordinary pretraining distribution.
+# 原始续写使用模型的普通预训练 next-token 分布。
 sampling:
+  # 每次续写最多生成的新 Token 数。
   max_new_tokens: 256
+  # 温度；较低值使续写更确定。
   temperature: 0.2
+  # Top-K 候选数量。
   top_k: 5
+  # Top-P 累积概率阈值。
   top_p: 0.9
+  # 重复 Token 惩罚系数；1 表示不惩罚。
   repetition_penalty: 1.00
+  # 采样随机种子。
   seed: 42

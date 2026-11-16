@@ -1,49 +1,50 @@
-# TaiChu 80M dense decoder-only 模型配置。
+# TaiChu 80M Dense Decoder-only 模型配置样例。
 # 使用仓库自带 32768 词表 Tokenizer 时，参数量为 80,757,248。
+# 所有基础配置统一以 80M 为默认样例。
 
-# 模型配置名称；用于日志、实验和检查点追踪。
+# 模型配置名称；用于日志、实验元数据和检查点追踪。
 model_name: "TaiChu-80M"
 
 # Transformer 主体结构。
 architecture:
   # Tokenizer 词表大小；必须与 Tokenizer 实际词表一致或更大。
   vocab_size: 32768
-  # 隐藏层维度。
+  # 隐藏层维度；决定模型主干特征宽度。
   hidden_size: 512
   # Transformer 解码器层数。
   num_layers: 16
-  # Query 注意力头数。
+  # Query 注意力头数；hidden_size 必须能被该值整除。
   num_attention_heads: 8
   # Key/Value 注意力头数；小于 Query 头数时启用 GQA。
   num_key_value_heads: 2
-  # SwiGLU 前馈层中间维度。
+  # SwiGLU 前馈网络中间层维度。
   intermediate_size: 2176
-  # 位置编码支持的最大上下文长度。
+  # 模型支持的最大上下文长度；训练序列长度不得超过该值。
   max_position_embeddings: 2048
-  # RoPE 基础频率。
+  # RoPE 旋转位置编码的基础频率。
   rope_theta: 10000.0
-  # RMSNorm 数值稳定项。
+  # RMSNorm 的数值稳定项；用于避免归一化时除零。
   rms_norm_eps: 1.0e-6
-  # 是否共享输入 Embedding 与输出 Head 权重。
+  # 是否让输入 Embedding 与输出 Head 共享权重。
   tie_word_embeddings: true
 
 # 激活函数与前馈网络类型。
 activation:
-  # SwiGLU 内部使用的 SiLU 激活函数。
+  # 隐藏层激活函数；SwiGLU 内部使用 SiLU。
   hidden_act: "silu"
   # 前馈网络实现；swiglu 表示门控前馈网络。
   ffn_type: "swiglu"
 
 # 注意力实现配置。
 attention:
-  # 是否优先使用 FlashAttention；不可用时自动回退到其他 SDPA 后端。
+  # 是否优先使用 FlashAttention；不可用时回退到其他 SDPA 后端。
   use_flash_attention: true
 
-# Dropout 正则化配置。
+# Dropout 正则化配置；预训练通常保持 0。
 regularization:
-  # 注意力权重 Dropout 概率。
+  # 注意力概率矩阵的 Dropout 比例。
   attention_dropout: 0.0
-  # Transformer 隐藏层残差 Dropout 概率。
+  # Transformer 隐藏层输出的 Dropout 比例。
   hidden_dropout: 0.0
-  # Token Embedding Dropout 概率。
+  # Token Embedding 输出的 Dropout 比例。
   embedding_dropout: 0.0
