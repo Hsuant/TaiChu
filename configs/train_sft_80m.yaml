@@ -1,0 +1,83 @@
+# TaiChu 80M 通用 SFT 训练配置。
+# Runtime 数据定义只维护在 data_sft_unified.yaml，避免训练配置与数据配置漂移。
+data_config: "./data_sft_unified.yaml"
+
+# Tokenizer 必须与预训练基座和 unified Binary Dataset 完全一致。
+tokenizer:
+  path: "./taichu_tokenizer/tokenizer.json"
+  backend: "tokenizers"
+
+# SFT 使用比预训练更低的学习率，避免破坏基座已获得的语言能力。
+optimizer:
+  learning_rate: 2.0e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1.0e-8
+
+# 先线性 Warmup，再在剩余步数内 Cosine 衰减到峰值的 10%。
+# stable_ratio=0 表示 Warmup 后立即进入衰减，符合常见 SFT 配方。
+scheduler:
+  warmup_ratio: 0.03
+  stable_ratio: 0.0
+  min_lr_ratio: 0.1
+  decay_type: "cosine"
+
+# SFT 以完整 Epoch 数作为预算，而不是用 padding 后的最大长度估算 Token。
+# 实际最大步数 = floor(每个 Epoch 的 DataLoader Batch 数 / 梯度累积步数)
+#             × epochs，再由训练装配层向上取整。
+training:
+  epochs: 2.0
+  micro_batch_size: 16
+  gradient_accumulation_steps: 6
+  save_interval: 200
+  log_interval: 10
+  output_dir: "./experiments"
+  experiment_name: "taichu_80m_sft_v1"
+  use_mixed_precision: true
+  dtype: "bfloat16"
+  max_grad_norm: 1.0
+  seed: 42
+  compile_model: true
+  compile_mode: "default"
+  compile_dynamic: true
+  distributed_timeout_minutes: 30
+  dataloader:
+    pin_memory: true
+    persistent_workers: true
+    drop_last: true
+
+# 验证 Loss 只统计 assistant 标签位置，最佳模型按该 Loss 选择。
+evaluating:
+  batch_size: 16
+  eval_interval: 200
+  log_interval: 10
+  empty_prefix_eos_ppl: false
+  prompts:
+    - "请用中文解释什么是过拟合，并给出两个缓解方法。"
+    - "Solve 3x + 7 = 22 and explain each step."
+    - "Write a Python function that returns the second largest unique value in a list."
+    - "用三句话比较监督微调与预训练的目标差异。"
+  num_generate_tokens: 256
+  dataloader:
+    pin_memory: true
+    persistent_workers: false
+    drop_last: false
+
+early_stopping:
+  enabled: false
+  monitor: "val_loss"
+  patience: 3
+  min_delta: 1.0e-4
+  mode: "min"
+
+swanlab:
+  use_swanlab: true
+  swanlab_project: "TaiChu"
+  swanlab_experiment_name: "taichu_80m_sft"
+  swanlab_log_dir: "./experiments/taichu_80m_sft_v1/swanlogs"
+  swanlab_mode: "online"
+  swanlab_workspace: null
+  swanlab_id: null
+  swanlab_resume: null
+  swanlab_init_kwargs: {}

@@ -1,0 +1,69 @@
+# TaiChu 150M SFT 训练配置。
+data_config: "./data_sft_unified.yaml"
+
+tokenizer:
+  path: "./taichu_tokenizer/tokenizer.json"
+  backend: "tokenizers"
+
+optimizer:
+  learning_rate: 1.5e-5
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+
+scheduler:
+  warmup_ratio: 0.03
+  stable_ratio: 0.0
+  min_lr_ratio: 0.1
+  decay_type: "cosine"
+
+training:
+  epochs: 2.0
+  micro_batch_size: 2
+  gradient_accumulation_steps: 32
+  save_interval: 200
+  log_interval: 10
+  output_dir: "./experiments"
+  experiment_name: "unified_2epoch_v1"
+  use_mixed_precision: true
+  dtype: "bfloat16"
+  max_grad_norm: 1.0
+  seed: 42
+  compile_model: true
+  compile_mode: "default"
+  compile_dynamic: true
+  distributed_timeout_minutes: 30
+  dataloader:
+    pin_memory: true
+    persistent_workers: true
+    drop_last: true
+
+evaluating:
+  batch_size: 2
+  eval_interval: 200
+  log_interval: 10
+  empty_prefix_eos_ppl: false
+  prompts:
+    - "请用中文解释什么是过拟合，并给出两个缓解方法。"
+    - "Solve 3x + 7 = 22 and explain each step."
+    - "Write a Python function that returns the second largest unique value in a list."
+  num_generate_tokens: 256
+  dataloader:
+    pin_memory: true
+    persistent_workers: false
+    drop_last: false
+
+early_stopping:
+  enabled: false
+  monitor: "val_loss"
+  patience: 3
+  min_delta: 1.0e-4
+  mode: "min"
+
+swanlab:
+  use_swanlab: false
+  swanlab_project: "TaiChu-SFT"
+  swanlab_experiment_name: "taichu_150m_sft"
+  swanlab_log_dir: "./swanlogs"
+  swanlab_mode: "local"

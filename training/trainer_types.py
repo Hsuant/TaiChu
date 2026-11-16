@@ -38,6 +38,19 @@ class TrainerComponents:
 
 
 @dataclass(frozen=True, slots=True)
+class TrainingStepStatistics:
+    """Token-weighted statistics for one optimizer step."""
+
+    nll_nats: float
+    token_count: int
+    correct_count: int
+    bpb_nll_nats: float
+    bpb_bytes: int
+    non_padding_tokens: int
+    padded_tokens: int
+
+
+@dataclass(frozen=True, slots=True)
 class TrainerSettings:
     max_steps: int
     gradient_accumulation_steps: int
@@ -56,6 +69,9 @@ class TrainerSettings:
     num_generate_tokens: int
     compute_empty_prefix: bool
     init_step: int = 0
+    epochs: float | None = None
+    token_budget: int | None = None
+    tokens_consumed: int = 0
     best_val_loss: float = float("inf")
     last_val_loss: float | None = None
     last_eval_step: int | None = None
@@ -72,6 +88,14 @@ class TrainerSettings:
             raise ValueError("invalid distributed rank configuration")
         if self.init_step < 0:
             raise ValueError("init_step cannot be negative")
+        if self.token_budget is not None and self.token_budget <= 0:
+            raise ValueError("token_budget must be positive")
+        if self.tokens_consumed < 0:
+            raise ValueError("tokens_consumed cannot be negative")
 
 
-__all__ = ["TrainerComponents", "TrainerSettings"]
+__all__ = [
+    "TrainerComponents",
+    "TrainerSettings",
+    "TrainingStepStatistics",
+]
