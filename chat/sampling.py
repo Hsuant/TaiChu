@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 import torch.nn.functional as F
 
@@ -14,12 +16,21 @@ def sample_next_token(
     generated_token_ids: list[int],
     config: SamplingConfig,
     generator: torch.Generator,
+    suppress_token_ids: Sequence[int] = (),
 ) -> torch.Tensor:
     """Sample one token from a one-dimensional logits vector."""
 
     if logits.dim() != 1:
         raise ValueError("logits must be one-dimensional")
     scores = logits.clone()
+    if suppress_token_ids:
+        suppressed = torch.tensor(
+            sorted({int(token_id) for token_id in suppress_token_ids}),
+            dtype=torch.long,
+            device=logits.device,
+        )
+        if suppressed.numel():
+            scores.index_fill_(0, suppressed, float("-inf"))
 
     if config.repetition_penalty > 1.0 and generated_token_ids:
         token_ids = torch.tensor(

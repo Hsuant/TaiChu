@@ -10,6 +10,8 @@ class ChatTokenizer(Protocol):
     """Minimal tokenizer contract used by sessions and the chat engine."""
 
     eos_token_id: int
+    think_token_id: int
+    end_think_token_id: int
 
     def render(
         self,
@@ -35,8 +37,14 @@ class HFChatTokenizer:
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
         if eos_token_id is None:
             raise ValueError("tokenizer must define eos_token_id")
+        think_token_id = tokenizer.convert_tokens_to_ids("<|think|>")
+        end_think_token_id = tokenizer.convert_tokens_to_ids("<|/think|>")
+        if think_token_id is None or end_think_token_id is None:
+            raise ValueError("tokenizer must define canonical reasoning tokens")
         self._tokenizer = tokenizer
         self.eos_token_id = int(eos_token_id)
+        self.think_token_id = int(think_token_id)
+        self.end_think_token_id = int(end_think_token_id)
 
     @property
     def vocab_size(self) -> int:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
+from chat.reasoning import ReasoningMode
 from chat.tokenizer import ChatTokenizer
 
 
@@ -12,9 +13,13 @@ from chat.tokenizer import ChatTokenizer
 class ChatMessage:
     role: str
     content: str
+    reasoning_content: str = ""
 
     def as_dict(self) -> dict[str, str]:
-        return {"role": self.role, "content": self.content}
+        message = {"role": self.role, "content": self.content}
+        if self.reasoning_content:
+            message["reasoning_content"] = self.reasoning_content
+        return message
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +28,7 @@ class PreparedPrompt:
     token_ids: tuple[int, ...]
     messages: tuple[ChatMessage, ...]
     dropped_turns: int
+    force_reasoning: bool
 
 
 class ContextLengthError(ValueError):
@@ -35,6 +41,7 @@ class Conversation:
     def __init__(self, tokenizer: ChatTokenizer, system_prompt: str = "") -> None:
         self._tokenizer = tokenizer
         self._system_prompt = system_prompt.strip()
+        self._reasoning_mode = ReasoningMode.OFF
         self._messages: list[ChatMessage] = []
 
     @property
@@ -48,14 +55,27 @@ class Conversation:
     def set_system_prompt(self, prompt: str) -> None:
         self._system_prompt = prompt.strip()
 
+    @property
+    def reasoning_mode(self) -> ReasoningMode:
+        return self._reasoning_mode
+
+    def set_reasoning_mode(self, mode: ReasoningMode | str) -> None:
+        self._reasoning_mode = (
+            mode if isinstance(mode, ReasoningMode) else ReasoningMode.parse(mode)
+        )
+
     def clear(self) -> None:
         self._messages.clear()
 
     def add_user(self, content: str) -> None:
         self._append("user", content)
 
-    def add_assistant(self, content: str) -> None:
-        self._append("assistant", content)
+    def add_assistant(
+        self,
+        content: str,
+        reasoning_content: str = "",
+    ) -> None:
+        self._append("assistant", content, reasoning_content)
 
     def remove_last_user(self) -> None:
         if self._messages and self._messages[-1].role == "user":
@@ -102,20 +122,36 @@ class Conversation:
             token_ids=tuple(token_ids),
             messages=tuple(body),
             dropped_turns=dropped_turns,
+            force_reasoning=self._reasoning_mode is ReasoningMode.ON,
         )
 
-    def _append(self, role: str, content: str) -> None:
+    def _append(
+        self,
+        role: str,
+        content: str,
+        reasoning_content: str = "",
+    ) -> None:
         text = content.strip()
         if not text:
             raise ValueError(f"{role} message cannot be empty")
-        self._messages.append(ChatMessage(role=role, content=text))
+        reasoning = reasoning_content.strip()
+        self._messages.append(
+            ChatMessage(
+                role=role,
+                content=text,
+                reasoning_content=reasoning,
+            )
+        )
 
     def _render_prompt(self, body: Sequence[ChatMessage]) -> str:
         messages: list[dict[str, str]] = []
         if self._system_prompt:
             messages.append({"role": "system", "content": self._system_prompt})
         messages.extend(message.as_dict() for message in body)
-        return self._tokenizer.render(messages, add_generation_prompt=True)
+        prompt = self._tokenizer.render(messages, add_generation_prompt=True)
+        if self._reasoning_mode is ReasoningMode.ON:
+            prompt += "<|think|>\n"
+        return prompt
 
 
 __all__ = [

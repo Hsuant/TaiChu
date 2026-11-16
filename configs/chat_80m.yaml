@@ -1,13 +1,14 @@
 # TaiChu 80M conversational entry configuration.
 
 # Best validation inference artifact from the local 80M experiment.
-checkpoint: "../experiments/80m/taichu_80m_pretrain_v1/best_models/best_model.pt"
+checkpoint: "../experiments/80m_8B/taichu_80m_sft_v1/best_models/best_model.pt"
 
 # Hugging Face-compatible tokenizer bundle containing chat_template.jinja.
 tokenizer: "../taichu_tokenizer"
 
-# The pretrained checkpoint remains the primary system prompt context.
-system_prompt: "你是 TaiChu（太初），一个诚实、清晰的中文对话助手。回答应直接、准确；不确定时明确说明。"
+# SFT v1 is trained without a system message; keep inference identical.
+system_prompt: ""
+reasoning_mode: "off"
 
 # auto selects CUDA when available; CPU falls back to float32.
 device: "auto"
@@ -17,7 +18,7 @@ dtype: "auto"
 context_tokens: null
 
 sampling:
-  max_new_tokens: 256
+  max_new_tokens: 1024
   temperature: 0.8
   top_k: 50
   top_p: 0.9

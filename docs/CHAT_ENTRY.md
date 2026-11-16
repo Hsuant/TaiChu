@@ -39,12 +39,31 @@ python -m chat `
 默认权重：
 
 ```text
-experiments/80m/taichu_80m_pretrain_v1/best_models/best_model.pt
+experiments/80m/pretrain/4b_v2/best_models/best_model.pt
 ```
 
 可通过 `--checkpoint` 切换到其他同架构的最小推理产物。模型结构直接读取产物
 内嵌的 `model_config`，不再需要独立 `model_config` 配置。完整训练 Checkpoint
 不能直接作为聊天权重，应先从 `checkpoints/` 使用评估或导出工具生成推理产物。
+
+## 思考模式
+
+配置默认使用 `reasoning_mode: "off"`。运行时可切换：
+
+```text
+/think          强制先输出标准思考块
+/think auto     由模型决定
+/no_think       禁止 <|think|>，直接回答
+```
+
+也可通过启动参数指定：
+
+```powershell
+python -m chat --reasoning-mode auto
+```
+
+思考模式必须与 SFT 数据协议一致。新 SFT 数据使用
+`reasoning_sample_ratio` 同时构建 think/no_think 样本。
 
 ## 交互命令
 

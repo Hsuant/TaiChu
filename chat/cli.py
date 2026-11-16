@@ -10,6 +10,7 @@ from typing import Sequence
 
 from chat.config import ChatConfig, SamplingConfig, load_chat_config
 from chat.engine import ChatEngine, ReplyResult
+from chat.reasoning import ReasoningMode
 from chat.runtime import ChatRuntime, load_chat_runtime
 from chat.session import Conversation
 
@@ -18,6 +19,8 @@ _HELP = """命令:
   /help            显示帮助
   /clear           清空当前对话
   /system <文本>   设置当前会话的系统提示
+  /think [auto]    开启思考或设为自动
+  /no_think        关闭思考
   /stats           显示上一轮生成统计
   /exit, /quit     退出
 """
@@ -41,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float)
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--system", help="override the system prompt")
+    parser.add_argument(
+        "--reasoning-mode",
+        choices=("on", "off", "auto"),
+    )
     parser.add_argument("--prompt", help="run one prompt and exit")
     parser.add_argument(
         "--no-stream",
@@ -67,6 +74,11 @@ def _apply_overrides(config: ChatConfig, args: argparse.Namespace) -> ChatConfig
         "device": args.device,
         "dtype": args.dtype,
         "system_prompt": args.system,
+        "reasoning_mode": (
+            ReasoningMode.parse(args.reasoning_mode)
+            if args.reasoning_mode is not None
+            else None
+        ),
         "sampling": sampling,
     }
     if args.checkpoint:
@@ -79,6 +91,7 @@ def _apply_overrides(config: ChatConfig, args: argparse.Namespace) -> ChatConfig
 
 def _build_engine(runtime: ChatRuntime, config: ChatConfig) -> ChatEngine:
     conversation = Conversation(runtime.tokenizer, config.system_prompt)
+    conversation.set_reasoning_mode(config.reasoning_mode)
     return ChatEngine(
         model=runtime.model,
         tokenizer=runtime.tokenizer,
@@ -110,6 +123,7 @@ def _print_banner(runtime: ChatRuntime, config: ChatConfig) -> None:
         f"top_k={config.sampling.top_k}, top_p={config.sampling.top_p}, "
         f"max_new_tokens={config.sampling.max_new_tokens}"
     )
+    print(f"思考模式: {config.reasoning_mode.value}")
     print("提示: 当前为预训练基座权重，未经过 SFT/偏好对齐。")
     print(_HELP.rstrip())
 
@@ -123,7 +137,9 @@ def _print_stats(result: ReplyResult | None) -> None:
         f"generated={result.generated_tokens} tokens, "
         f"{result.tokens_per_second:.2f} tok/s, "
         f"elapsed={result.elapsed_seconds:.2f}s, "
-        f"dropped_turns={result.dropped_turns}"
+        f"dropped_turns={result.dropped_turns}, "
+        f"reasoning_mode={result.reasoning_mode.value}, "
+        f"thinking={result.thinking}"
     )
 
 
@@ -168,6 +184,19 @@ def run_interactive(
             engine.conversation.set_system_prompt(argument)
             engine.conversation.clear()
             print("系统提示已更新，会话历史已清空。")
+            continue
+        if command == "/think":
+            mode = (
+                ReasoningMode.parse(argument)
+                if argument.strip()
+                else ReasoningMode.ON
+            )
+            engine.conversation.set_reasoning_mode(mode)
+            print(f"思考模式已设为 {mode.value}。")
+            continue
+        if command == "/no_think":
+            engine.conversation.set_reasoning_mode(ReasoningMode.OFF)
+            print("思考模式已关闭。")
             continue
         if command == "/stats":
             _print_stats(last_result)

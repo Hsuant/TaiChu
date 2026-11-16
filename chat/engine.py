@@ -9,6 +9,7 @@ from typing import Callable
 import torch
 
 from chat.config import SamplingConfig
+from chat.reasoning import ReasoningMode, parse_reasoning_tokens
 from chat.sampling import sample_next_token
 from chat.session import Conversation
 from chat.text import IncrementalTextDecoder
@@ -19,6 +20,9 @@ from model.model import TaiChuModel
 @dataclass(frozen=True, slots=True)
 class ReplyResult:
     text: str
+    reasoning_text: str
+    reasoning_mode: ReasoningMode
+    thinking: bool
     generated_tokens: int
     prompt_tokens: int
     dropped_turns: int
@@ -72,28 +76,49 @@ class ChatEngine:
         started = time.perf_counter()
         self._conversation.add_user(user_text)
         try:
+            reasoning_mode = self._conversation.reasoning_mode
             input_budget = (
                 self._max_context_tokens - self._sampling.max_new_tokens
             )
             prompt = self._conversation.prepare(input_budget)
             decoder = IncrementalTextDecoder(self._tokenizer.decode)
+            stream_during_generation = (
+                stream and reasoning_mode is ReasoningMode.OFF
+            )
             generated_token_ids = self._generate_token_ids(
                 prompt.token_ids,
                 decoder=decoder,
-                on_text=on_text if stream else None,
+                on_text=on_text if stream_during_generation else None,
+                reasoning_mode=reasoning_mode,
             )
-            tail = decoder.finish()
-            if tail and stream and on_text is not None:
-                on_text(tail)
-            text = decoder.text.strip()
+            if stream_during_generation:
+                tail = decoder.finish()
+                if tail and on_text is not None:
+                    on_text(tail)
+            parsed = parse_reasoning_tokens(
+                generated_token_ids,
+                mode=reasoning_mode,
+                think_token_id=self._tokenizer.think_token_id,
+                end_think_token_id=self._tokenizer.end_think_token_id,
+                decode=self._tokenizer.decode,
+            )
+            text = parsed.answer_text
             if not text:
                 raise RuntimeError("model produced no visible response text")
+            if stream and not stream_during_generation and on_text is not None:
+                on_text(text)
 
             self._conversation.apply_prompt(prompt)
-            self._conversation.add_assistant(text)
+            self._conversation.add_assistant(
+                text,
+                reasoning_content=parsed.reasoning_text,
+            )
             elapsed = time.perf_counter() - started
             return ReplyResult(
                 text=text,
+                reasoning_text=parsed.reasoning_text,
+                reasoning_mode=reasoning_mode,
+                thinking=parsed.thinking,
                 generated_tokens=len(generated_token_ids),
                 prompt_tokens=len(prompt.token_ids),
                 dropped_turns=prompt.dropped_turns,
@@ -109,6 +134,7 @@ class ChatEngine:
         *,
         decoder: IncrementalTextDecoder,
         on_text: Callable[[str], None] | None,
+        reasoning_mode: ReasoningMode,
     ) -> list[int]:
         current = torch.tensor(
             [prompt_ids],
@@ -132,6 +158,11 @@ class ChatEngine:
                     generated_token_ids=generated,
                     config=self._sampling,
                     generator=self._generator,
+                    suppress_token_ids=(
+                        (self._tokenizer.think_token_id,)
+                        if reasoning_mode is ReasoningMode.OFF
+                        else ()
+                    ),
                 )
                 next_token_id = int(next_token.item())
                 if next_token_id == self._tokenizer.eos_token_id:

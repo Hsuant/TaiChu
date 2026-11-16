@@ -8,6 +8,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from chat.reasoning import ReasoningMode
+
 
 _TOP_LEVEL_KEYS = {
     "checkpoint",
@@ -16,6 +18,7 @@ _TOP_LEVEL_KEYS = {
     "device",
     "dtype",
     "context_tokens",
+    "reasoning_mode",
     "sampling",
 }
 _SAMPLING_KEYS = {
@@ -94,6 +97,7 @@ class ChatConfig:
     device: str = "auto"
     dtype: str = "auto"
     context_tokens: int | None = None
+    reasoning_mode: ReasoningMode = ReasoningMode.OFF
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 
     def __post_init__(self) -> None:
@@ -123,6 +127,12 @@ class ChatConfig:
                 raise ValueError("context_tokens must be at least 2 or null")
         if not isinstance(self.sampling, SamplingConfig):
             raise TypeError("sampling must be a SamplingConfig")
+        mode = (
+            self.reasoning_mode
+            if isinstance(self.reasoning_mode, ReasoningMode)
+            else ReasoningMode.parse(str(self.reasoning_mode))
+        )
+        object.__setattr__(self, "reasoning_mode", mode)
 
 
 def _required_path(
@@ -175,6 +185,7 @@ def load_chat_config(path: str | Path) -> ChatConfig:
         device=raw.get("device", "auto"),
         dtype=raw.get("dtype", "auto"),
         context_tokens=raw.get("context_tokens"),
+        reasoning_mode=raw.get("reasoning_mode", ReasoningMode.OFF.value),
         sampling=SamplingConfig(**dict(sampling_raw)),
     )
 
