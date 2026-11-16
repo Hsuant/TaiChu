@@ -13,15 +13,16 @@ from training.config import OptimizerConfig, SchedulerConfig
 
 @dataclass(frozen=True, slots=True)
 class StepBudget:
-    target_tokens: int
+    target_tokens: int | None
     micro_batch_size: int
     gradient_accumulation_steps: int
     world_size: int
     sequence_length: int
+    step_limit: int | None = None
+    token_budget: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
-            "target_tokens",
             "micro_batch_size",
             "gradient_accumulation_steps",
             "world_size",
@@ -29,6 +30,16 @@ class StepBudget:
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.target_tokens is not None and self.target_tokens <= 0:
+            raise ValueError("target_tokens must be positive")
+        if self.step_limit is not None and self.step_limit <= 0:
+            raise ValueError("step_limit must be positive")
+        if self.token_budget is not None and self.token_budget <= 0:
+            raise ValueError("token_budget must be positive")
+        if self.target_tokens is None and self.step_limit is None:
+            raise ValueError(
+                "step_limit is required when target_tokens is not configured"
+            )
 
     @property
     def global_batch_size(self) -> int:
@@ -44,6 +55,10 @@ class StepBudget:
 
     @property
     def max_steps(self) -> int:
+        if self.step_limit is not None:
+            return self.step_limit
+        if self.target_tokens is None:
+            raise RuntimeError("target_tokens is not configured")
         return math.ceil(self.target_tokens / self.tokens_per_step)
 
 

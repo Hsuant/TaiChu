@@ -7,19 +7,20 @@
 
 ```text
 configs/ -> training/cli.py + training/config.py
-                       |
-                       v
-          trainer/train_pretrain.py::run_pretraining
-                |      |      |
-                v      v      v
-           model/   dataset/  training/*
-                              |
-                              v
-          trainer/train_pretrain.py::CausalLMTrainer
-                              |
-                 +------------+------------+
-                 v                         v
-        CausalLMEvaluator           CheckpointManager
+                         |
+          +--------------+--------------+
+          v                             v
+PretrainingTask                  SFTTask
+trainer/train_pretrain.py        trainer/train_sft.py
+          |                             |
+          +-------------+---------------+
+                        v
+        training/causal_lm.py
+        CausalLMTrainingPipeline -> CausalLMTrainer
+                        |
+          +-------------+-------------+
+          v                           v
+  CausalLMEvaluator           CheckpointManager
 ```
 
 目录职责：
@@ -30,6 +31,8 @@ configs/ -> training/cli.py + training/config.py
 | `dataset/` | 类型化样本、离线准备、二进制存储、采样、Packing、Batch、Runtime |
 | `training/config.py` | 训练配置数据类、严格 YAML 解析、跨模块校验 |
 | `training/cli.py` | 参数定义和不可变配置覆盖 |
+| `training/causal_lm.py` | 任务接口、共享装配 Pipeline 和 Causal LM 训练循环 |
+| `training/paths.py` | `output_dir / experiment_name` 目录解析与配置快照路径 |
 | `training/environment.py` | 设备、随机种子、torchrun/DDP 环境 |
 | `training/optimization.py` | AdamW 参数分组、StepBudget、WSD 调度 |
 | `training/model_setup.py` | `torch.compile`、编译预热、DDP 包装 |
@@ -40,14 +43,15 @@ configs/ -> training/cli.py + training/config.py
 | `training/validation.py` | Token 级验证指标公式 |
 | `training/evaluator.py` | 训练验证和独立评估共享的评估流程 |
 | `training/trainer_types.py` | 训练器输入组件与运行参数的不可变契约 |
-| `trainer/train_pretrain.py` | 预训练装配、恢复、主体训练循环、CLI 入口和执行生命周期 |
+| `trainer/train_pretrain.py` | 预训练 Task 与 CLI 入口 |
+| `trainer/train_sft.py` | SFT Task、预训练权重初始化和 CLI 入口 |
 | `eval/evaluate_pretrain_model.py` | 独立评估 CLI，复用共享评估器 |
 
 ## 2. 核心接口
 
 ### 配置
 
-`PretrainConfig` 聚合以下不可变配置：
+`TrainingRunConfig` 聚合以下不可变配置：
 
 - `OptimizerConfig`
 - `SchedulerConfig`
@@ -57,7 +61,7 @@ configs/ -> training/cli.py + training/config.py
 - `EarlyStoppingConfig`
 - `SwanLabConfig`
 
-训练 batch 只有一个来源：`data.batching.micro_batch_size`。
+训练 batch 只有一个来源：`training.micro_batch_size`。
 `training.gradient_accumulation_steps` 只负责累积次数。未知配置键会直接报错，
 避免拼写错误被默认值静默吞掉。
 
@@ -71,6 +75,21 @@ rank, local_rank, world_size, device, backend
 
 `RANK` 与 `LOCAL_RANK` 分离，因此多节点训练不会再把 local rank 误当作
 global rank。单进程运行不会因为机器存在多张 GPU 而误启动 DDP。
+
+### 任务策略
+
+`CausalLMTask` 是任务与共享运行时之间的接口：
+
+```text
+validate_args()
+load_configs()
+build_step_budget()
+prepare_model()
+prompt_renderer_factory()
+```
+
+`PretrainingTask` 只实现 Token Budget；`SFTTask` 只实现 Epoch Budget、预训练产物
+初始化和 Chat Prompt 渲染。两个入口互不导入，共享能力全部位于 `training/`。
 
 ### 训练
 
@@ -133,14 +152,18 @@ final_models/final_model.pt
 
 ```text
 parse CLI
-  -> load strict YAML
+  -> task.validate_args()
+  -> task.load_configs()
   -> initialize runtime and seeds
-  -> resolve experiment directory
+  -> resolve experiments/<scale>/<stage>/<name>
+  -> write model/training/config snapshots
   -> load tokenizer
   -> build model
+  -> task.prepare_model() for non-resume runs
   -> optional compile + shape warmup
   -> optional DDP
   -> build train/validation loaders
+  -> task.build_step_budget()
   -> build optimizer and WSD scheduler
   -> optional checkpoint resume
   -> build evaluator and diagnostics
@@ -172,7 +195,7 @@ parse CLI
 | 实验目录 | `ExperimentPaths` |
 | 日志 sink | `LogManager` / `SwanLabLogger` |
 
-## 5. 未来训练任务
+## 5. 任务装配与未来训练任务
 
 可以复用的稳定能力：
 
@@ -182,9 +205,13 @@ parse CLI
 - Optimizer、Scheduler、Checkpoint、RNG 恢复
 - 日志、诊断、验证指标和独立评估框架
 
-任务专属层应自行实现：
+SFT 已通过任务装配层接入：`trainer.train_sft` 复用
+`training.causal_lm` 和 `CausalLMTrainer`，只在模型初始化、Epoch Step
+预算与生成 Prompt 渲染上提供 SFT 差异，不依赖预训练入口。Assistant-only 监督由
+`SFTSequenceSample.labels` 进入统一 Causal LM Loss。
 
-- SFT：复用 Causal LM objective，接入已有 loss mask。
+后续任务专属层应自行实现：
+
 - Preference / DPO：新增 pair 输入和 preference objective。
 - Reward Model：新增 Reward Head 和 pair ranking objective。
 - PPO / GRPO：新增 rollout、reference model、advantage 和策略目标。
@@ -197,7 +224,7 @@ objective、batch contract 和执行流程承载。
 当前维护工作区完整测试：
 
 ```text
-249 passed, 2 skipped, 150 subtests passed
+268 passed, 3 skipped, 152 subtests passed
 ```
 
 CPU 模拟训练完成 79 步，训练、验证、Checkpoint 和独立评估均成功。

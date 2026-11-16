@@ -227,7 +227,7 @@ class LogManager:
         """关闭所有资源。"""
         if self.writer is not None:
             self.writer.close()
-        for handler in self.logger.handlers:
+        for handler in list(self.logger.handlers):
             handler.close()
             self.logger.removeHandler(handler)
 

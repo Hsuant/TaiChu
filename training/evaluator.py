@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 from torch.amp.autocast_mode import autocast
@@ -54,6 +54,24 @@ class EvaluationResult:
         return values
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationResult:
+    prompt: str
+    generated_text: str
+    generated_tokens: int
+    hit_eos: bool
+    finish_reason: str
+
+    def to_dict(self) -> dict[str, str | int | bool]:
+        return {
+            "prompt": self.prompt,
+            "generated_text": self.generated_text,
+            "generated_tokens": self.generated_tokens,
+            "hit_eos": self.hit_eos,
+            "finish_reason": self.finish_reason,
+        }
+
+
 class CausalLMEvaluator:
     """Evaluate a causal language model on the unified validation loader."""
 
@@ -70,6 +88,7 @@ class CausalLMEvaluator:
         logger=None,
         rank: int = 0,
         world_size: int = 1,
+        prompt_renderer: Callable[[str], str] | None = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -81,6 +100,7 @@ class CausalLMEvaluator:
         self.logger = logger
         self.rank = rank
         self.world_size = world_size
+        self.prompt_renderer = prompt_renderer
 
     @torch.no_grad()
     def evaluate(
@@ -347,17 +367,22 @@ class CausalLMEvaluator:
         prompts: Sequence[str],
         *,
         num_tokens: int,
-    ) -> list[dict[str, str]]:
+    ) -> list[GenerationResult]:
         if not prompts or self.rank != 0:
             if self.world_size > 1:
                 torch.distributed.barrier()
             return []
         model = unwrap_model(self.model)
-        results: list[dict[str, str]] = []
+        results: list[GenerationResult] = []
         with torch.compiler.set_stance("force_eager"):
             for prompt in prompts:
+                prompt_text = (
+                    self.prompt_renderer(prompt)
+                    if self.prompt_renderer is not None
+                    else prompt
+                )
                 ids = self.tokenizer.encode(
-                    prompt,
+                    prompt_text,
                     add_special_tokens=False,
                 ).ids
                 input_ids = torch.tensor(
@@ -368,19 +393,33 @@ class CausalLMEvaluator:
                 generated = model.generate(
                     input_ids,
                     max_new_tokens=num_tokens,
-                    temperature=0.8,
-                    top_k=50,
+                    temperature=0.0,
                     eos_token_id=self.eos_token_id,
                 )
-                text = self.tokenizer.decode(generated[0].tolist())
-                results.append({"prompt": prompt, "generated_text": text})
+                completion_ids = generated[0, input_ids.size(1) :].tolist()
+                text = self.tokenizer.decode(completion_ids)
+                hit_eos = (
+                    self.eos_token_id is not None
+                    and self.eos_token_id in completion_ids
+                )
+                result = GenerationResult(
+                    prompt=prompt,
+                    generated_text=text,
+                    generated_tokens=len(completion_ids),
+                    hit_eos=hit_eos,
+                    finish_reason="eos" if hit_eos else "length",
+                )
+                results.append(result)
                 if self.logger is not None:
                     self.logger.info(
-                        f"[生成测试] 提示: {prompt}\n生成结果: {text}\n{'-' * 60}"
+                        f"[生成测试] 提示: {prompt}\n"
+                        f"生成结果: {text}\n"
+                        f"tokens={result.generated_tokens} "
+                        f"finish={result.finish_reason}\n{'-' * 60}"
                     )
         if self.world_size > 1:
             torch.distributed.barrier()
         return results
 
 
-__all__ = ["CausalLMEvaluator", "EvaluationResult"]
+__all__ = ["CausalLMEvaluator", "EvaluationResult", "GenerationResult"]

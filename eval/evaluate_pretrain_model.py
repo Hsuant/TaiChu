@@ -189,7 +189,10 @@ def main(argv=None) -> None:
                 prompts,
                 num_tokens=args.num_generate_tokens,
             )
-            _write_json(output_dir / "generated_samples.json", samples)
+            _write_json(
+                output_dir / "generated_samples.json",
+                [sample.to_dict() for sample in samples],
+            )
             log_manager.info(
                 f"生成样本已保存: {output_dir / 'generated_samples.json'}"
             )

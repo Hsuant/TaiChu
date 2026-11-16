@@ -60,6 +60,39 @@ bpb = total_nll_nats / (ln(2) × UTF-8_bytes_without_special_tokens)
 
 实现使用 Chunk 与精确选择，避免把超大验证集全部常驻内存。
 
+### 训练指标
+
+SFT 的训练 Loss 与验证 Loss 使用同一套 Shift 和 `ignore_index=-100` 规则。由于
+Assistant-only 标签将 Prompt 和 Padding 设为 `-100`，有效监督 Token 数满足：
+
+```text
+supervised_tokens = count(labels[:, 1:] != -100)
+train_loss = sum(CrossEntropy(shift_logits, shift_labels)) / supervised_tokens
+```
+
+每次训练日志还输出：
+
+| 指标 | 口径 |
+|---|---|
+| `train/perplexity` | `exp(train_loss)`，仅在相同 Tokenizer 下可比 |
+| `train/accuracy` | 有效 Assistant Next-Token 的 Top-1 命中率 |
+| `train/bpb` | 与验证 BPB 相同，按目标 UTF-8 字节数归一化 |
+| `train/non_padding_tokens` | 当前优化步的全局非 Padding 输入 Token 数 |
+| `train/supervised_tokens` | 当前优化步的全局有效监督 Token 数 |
+| `train/padded_tokens` | 当前优化步的全局 Padding 后输入 Token 数 |
+| `train/supervision_ratio` | `supervised_tokens / padded_tokens` |
+| `train/tokens_per_sec` | 两次日志之间的全局非 Padding Token 吞吐 |
+| `train/supervised_tokens_per_sec` | 两次日志之间的有效监督 Token 吞吐 |
+| `train/padded_tokens_per_sec` | 两次日志之间的全局 Padding Token 吞吐 |
+| `train/progress` | 当前优化步数除以预算步数 |
+| `train/epoch` | 按配置 Epoch 数换算的连续训练进度 |
+
+Loss 不再使用 Padding 后长度作分母；所有 Token 指标与 Loss 分子先在各 Rank 求和，
+再按全局有效监督 Token 数归一化。`train/grad_norm` 是裁剪前的全局梯度范数，
+`train/accuracy` 与置信区间无关，不能替代任务级正确率或人工质量评估。
+MFU 使用所有 Rank 的 Padding Token 总量与单卡峰值算力计算，避免多卡训练时只统计
+本卡 Token 而低估利用率。
+
 ## 3. 独立评估
 
 ```powershell

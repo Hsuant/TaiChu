@@ -62,6 +62,21 @@ def capture_rng_state() -> dict[str, Any]:
     return state
 
 
+def _cpu_rng_byte_tensor(value: Any, name: str) -> torch.Tensor:
+    """Return a contiguous CPU uint8 tensor suitable for RNG restoration."""
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if value.device.type == "meta":
+        raise ValueError(f"{name} cannot be restored from a meta tensor")
+    state = value.detach().to(
+        device="cpu",
+        dtype=torch.uint8,
+    ).contiguous().clone()
+    if state.numel() == 0:
+        raise ValueError(f"{name} cannot be empty")
+    return state
+
+
 def restore_rng_state(state: Mapping[str, Any] | None) -> None:
     """Restore a state produced by :func:`capture_rng_state`."""
     if state is None:
@@ -71,9 +86,24 @@ def restore_rng_state(state: Mapping[str, Any] | None) -> None:
     if "numpy" in state:
         np.random.set_state(state["numpy"])
     if "torch_cpu" in state:
-        torch.set_rng_state(state["torch_cpu"])
+        torch.set_rng_state(
+            _cpu_rng_byte_tensor(state["torch_cpu"], "rng_state['torch_cpu']")
+        )
     if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        cuda_states = state["torch_cuda"]
+        if isinstance(cuda_states, torch.Tensor):
+            cuda_states = [cuda_states]
+        if not isinstance(cuda_states, (list, tuple)):
+            raise TypeError("rng_state['torch_cuda'] must be a tensor or sequence")
+        torch.cuda.set_rng_state_all(
+            [
+                _cpu_rng_byte_tensor(
+                    item,
+                    f"rng_state['torch_cuda'][{index}]",
+                )
+                for index, item in enumerate(cuda_states)
+            ]
+        )
 
 
 @dataclass(frozen=True, slots=True)
