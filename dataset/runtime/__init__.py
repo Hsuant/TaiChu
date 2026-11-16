@@ -1,7 +1,11 @@
 """Runtime data pipeline, online source and resume contracts."""
 from .checkpoint import DataState, ResumableBatchIterator, skip_batches
 from .dataset import IndexedTokenDataset
-from .loader import UnifiedDataLoader, UnifiedDataLoaderFactory
+from .loader import (
+    UnifiedDataLoader,
+    UnifiedDataLoaderFactory,
+    build_sft_data_loader,
+)
 from .online import ExperienceBuffer, HybridSampleSource
 
 __all__ = [
@@ -12,5 +16,6 @@ __all__ = [
     "ResumableBatchIterator",
     "UnifiedDataLoader",
     "UnifiedDataLoaderFactory",
+    "build_sft_data_loader",
     "skip_batches",
 ]

@@ -26,7 +26,8 @@ class TaskCollator:
             if not packed:
                 raise RuntimeError(
                     "packing emitted no sequences for this batch; "
-                    "increase micro_batch_size or disable drop_last_remainder"
+                    "increase training.micro_batch_size or disable "
+                    "drop_last_remainder"
                 )
         return self.builder(packed)
 
@@ -111,7 +112,7 @@ class UnifiedDataLoaderFactory:
         self,
         *,
         split: str = "train",
-        batch_size: int | None = None,
+        batch_size: int,
         rank: int | None = None,
         world_size: int | None = None,
         num_workers: int | None = None,
@@ -119,6 +120,8 @@ class UnifiedDataLoaderFactory:
         persistent_workers: bool = False,
         drop_last: bool | None = None,
     ) -> UnifiedDataLoader:
+        if int(batch_size) <= 0:
+            raise TaiChuConfigurationError("batch_size must be positive")
         rank, world_size = self._distributed_context(rank, world_size)
         reader = BinaryDatasetReader(
             self.config.storage.path_for(split),
@@ -194,11 +197,7 @@ class UnifiedDataLoaderFactory:
             kwargs["prefetch_factor"] = self.config.storage.prefetch_factor
         return UnifiedDataLoader(
             dataset=dataset,
-            batch_size=(
-                self.config.batching.micro_batch_size
-                if batch_size is None
-                else int(batch_size)
-            ),
+            batch_size=int(batch_size),
             sampler=sampler,
             num_workers=workers,
             pin_memory=pin_memory,
@@ -216,4 +215,41 @@ class UnifiedDataLoaderFactory:
         return self.task.input_adapter_factory()
 
 
-__all__ = ["UnifiedDataLoader", "UnifiedDataLoaderFactory"]
+def build_sft_data_loader(
+    config: UnifiedDataConfig,
+    *,
+    pad_token_id: int,
+    batch_size: int,
+    split: str = "train",
+    rank: int | None = None,
+    world_size: int | None = None,
+    num_workers: int | None = None,
+    pin_memory: bool = True,
+    persistent_workers: bool = False,
+    drop_last: bool | None = None,
+) -> UnifiedDataLoader:
+    """Build an SFT loader through the unified runtime pipeline."""
+    if config.task_type not in {"sft", "instruction_tuning"}:
+        raise TaiChuConfigurationError(
+            "SFT loader requires task_type='sft' or 'instruction_tuning'"
+        )
+    return UnifiedDataLoaderFactory(
+        config,
+        pad_token_id=pad_token_id,
+    ).create(
+        split=split,
+        batch_size=batch_size,
+        rank=rank,
+        world_size=world_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        drop_last=drop_last,
+    )
+
+
+__all__ = [
+    "UnifiedDataLoader",
+    "UnifiedDataLoaderFactory",
+    "build_sft_data_loader",
+]

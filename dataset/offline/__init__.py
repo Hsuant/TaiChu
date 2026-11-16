@@ -20,7 +20,9 @@ from .pretraining import (
     PretrainingSource,
     SegmentationConfig,
     SplitConfig,
+    TokenSelectionConfig,
     load_pretraining_config,
+    select_pretraining_split,
 )
 from .subset_validation import subset_validation_dataset
 
@@ -33,6 +35,14 @@ def __getattr__(name: str) -> Any:
         from .prepare import UnifiedDataPreparation
 
         return UnifiedDataPreparation
+    if name in {"SFTDataPreparation", "SFTBuildConfig", "load_sft_build_config"}:
+        from .sft import SFTBuildConfig, SFTDataPreparation, load_sft_build_config
+
+        return {
+            "SFTDataPreparation": SFTDataPreparation,
+            "SFTBuildConfig": SFTBuildConfig,
+            "load_sft_build_config": load_sft_build_config,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -46,12 +56,17 @@ __all__ = [
     "RewardPreprocessor",
     "RoleTagRenderer",
     "SFTPreprocessor",
+    "SFTBuildConfig",
+    "SFTDataPreparation",
     "SegmentationConfig",
     "SplitConfig",
     "TextTokenizer",
+    "TokenSelectionConfig",
     "TrajectoryPreprocessor",
     "UnifiedDataPreparation",
     "load_preparation_config",
     "load_pretraining_config",
+    "load_sft_build_config",
+    "select_pretraining_split",
     "subset_validation_dataset",
 ]

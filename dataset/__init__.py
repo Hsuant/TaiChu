@@ -27,6 +27,10 @@ def __getattr__(name: str) -> Any:
         from .runtime import UnifiedDataLoaderFactory
 
         return UnifiedDataLoaderFactory
+    if name == "build_sft_data_loader":
+        from .runtime import build_sft_data_loader
+
+        return build_sft_data_loader
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -46,4 +50,5 @@ __all__ = [
     "UnifiedDataConfig",
     "UnifiedDataLoaderFactory",
     "UnifiedPackingConfig",
+    "build_sft_data_loader",
 ]
