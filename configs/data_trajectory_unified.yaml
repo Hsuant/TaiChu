@@ -22,5 +22,4 @@ data:
 
   batching:
     strategy: trajectory
-    micro_batch_size: 2
     pad_to_multiple_of: 8

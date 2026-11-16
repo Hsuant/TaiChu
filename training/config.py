@@ -66,7 +66,9 @@ class DataLoaderRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainingConfig:
-    target_tokens: int = 2_000_000_000
+    target_tokens: int | None = None
+    epochs: float | None = None
+    micro_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     save_interval: int = 5_000
     log_interval: int = 10
@@ -85,8 +87,16 @@ class TrainingConfig:
     )
 
     def __post_init__(self) -> None:
-        if self.target_tokens <= 0:
+        if self.target_tokens is not None and self.epochs is not None:
+            raise ValueError(
+                "training cannot set both target_tokens and epochs"
+            )
+        if self.target_tokens is not None and self.target_tokens <= 0:
             raise ValueError("training.target_tokens must be positive")
+        if self.epochs is not None and self.epochs <= 0:
+            raise ValueError("training.epochs must be positive")
+        if self.micro_batch_size <= 0:
+            raise ValueError("training.micro_batch_size must be positive")
         if self.gradient_accumulation_steps <= 0:
             raise ValueError("training.gradient_accumulation_steps must be positive")
         if self.save_interval < 0 or self.log_interval < 0:
@@ -176,7 +186,7 @@ class SwanLabConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class PretrainConfig:
+class TrainingRunConfig:
     tokenizer_path: str
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
@@ -192,6 +202,7 @@ _TOP_LEVEL_KEYS = {
     "optimizer",
     "scheduler",
     "data",
+    "data_config",
     "training",
     "evaluating",
     "early_stopping",
@@ -244,13 +255,13 @@ def _parse_dataloader(raw: Any, section: str, default_drop_last: bool):
     return values
 
 
-def load_pretraining_config(path: str | Path) -> PretrainConfig:
-    """Load and validate a strict pretraining YAML configuration."""
+def _load_training_run_config(path: str | Path) -> TrainingRunConfig:
+    """Load a strict causal-LM training configuration."""
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     if not isinstance(raw, Mapping):
-        raise ValueError("pretraining config must be a YAML mapping")
+        raise ValueError("training config must be a YAML mapping")
     unknown = set(raw) - _TOP_LEVEL_KEYS
     if unknown:
         raise ValueError(f"unknown top-level config keys: {sorted(unknown)}")
@@ -280,10 +291,22 @@ def load_pretraining_config(path: str | Path) -> PretrainConfig:
         raw.get("scheduler", {}),
         "scheduler",
     )
-    data = UnifiedDataConfig.from_dict(raw.get("data", {}))
+    has_inline_data = "data" in raw
+    has_data_config = "data_config" in raw
+    if has_inline_data == has_data_config:
+        raise ValueError(
+            "training config requires exactly one of data or data_config"
+        )
+    if has_data_config:
+        data_path = Path(raw["data_config"])
+        if not data_path.is_absolute():
+            data_path = config_path.parent / data_path
+        data = UnifiedDataConfig.from_yaml(data_path.resolve())
+    else:
+        data = UnifiedDataConfig.from_dict(raw["data"])
 
     training_raw = dict(raw.get("training", {}))
-    if "target_tokens" in training_raw:
+    if training_raw.get("target_tokens") is not None:
         training_raw["target_tokens"] = parse_token_count(
             training_raw["target_tokens"]
         )
@@ -322,7 +345,7 @@ def load_pretraining_config(path: str | Path) -> PretrainConfig:
         raw.get("swanlab", {}),
         "swanlab",
     )
-    return PretrainConfig(
+    return TrainingRunConfig(
         tokenizer_path=tokenizer_path,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -334,8 +357,18 @@ def load_pretraining_config(path: str | Path) -> PretrainConfig:
     )
 
 
+def load_pretraining_config(path: str | Path) -> TrainingRunConfig:
+    """Load the shared training schema for a pretraining run."""
+    return _load_training_run_config(path)
+
+
+def load_sft_config(path: str | Path) -> TrainingRunConfig:
+    """Load the shared training schema for a supervised fine-tuning run."""
+    return _load_training_run_config(path)
+
+
 def validate_pretraining_config(
-    config: PretrainConfig,
+    config: TrainingRunConfig,
     model_config: ModelConfig,
 ) -> None:
     """Validate relationships that span model, data, and training configs."""
@@ -343,6 +376,11 @@ def validate_pretraining_config(
         raise ValueError(
             f"pretraining requires data.task_type='pretraining', "
             f"got {config.data.task_type!r}"
+        )
+    if config.training.epochs is not None:
+        raise ValueError(
+            "pretraining uses target_tokens or a full dataset pass; "
+            "epochs is not supported"
         )
     if config.data.packing.max_seq_length > model_config.max_position_embeddings:
         raise ValueError(
@@ -358,16 +396,58 @@ def validate_pretraining_config(
         )
 
 
+def validate_sft_config(
+    config: TrainingRunConfig,
+    model_config: ModelConfig,
+) -> None:
+    """Validate the SFT runtime contract before allocating model state."""
+    if config.data.task_type not in {"sft", "instruction_tuning"}:
+        raise ValueError(
+            "SFT requires data.task_type='sft' or 'instruction_tuning', "
+            f"got {config.data.task_type!r}"
+        )
+    if config.training.epochs is None:
+        raise ValueError("SFT requires training.epochs")
+    if config.data.packing.max_seq_length > model_config.max_position_embeddings:
+        raise ValueError(
+            "data.packing.max_seq_length cannot exceed "
+            "model.max_position_embeddings"
+        )
+    if (
+        config.data.packing.enabled
+        and config.data.packing.strategy != "sample_isolated"
+    ):
+        raise ValueError(
+            "SFT packing requires strategy='sample_isolated'"
+        )
+    if (
+        config.data.batching.strategy != "fixed_length"
+        or config.data.batching.padding_free
+    ):
+        raise ValueError(
+            "SFT training currently requires fixed_length batching"
+        )
+    if (
+        config.evaluating.eval_interval > 0
+        and config.data.storage.validation_path is None
+    ):
+        raise ValueError(
+            "validation_path is required when evaluating.eval_interval > 0"
+        )
+
+
 __all__ = [
     "DataLoaderRuntimeConfig",
     "EarlyStoppingConfig",
     "EvaluatingConfig",
     "OptimizerConfig",
-    "PretrainConfig",
     "SchedulerConfig",
     "SwanLabConfig",
     "TrainingConfig",
+    "TrainingRunConfig",
     "load_pretraining_config",
+    "load_sft_config",
     "parse_token_count",
     "validate_pretraining_config",
+    "validate_sft_config",
 ]

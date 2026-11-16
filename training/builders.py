@@ -100,6 +100,7 @@ def build_data_loaders(
     data_config: UnifiedDataConfig,
     evaluating: EvaluatingConfig,
     *,
+    micro_batch_size: int,
     training_dataloader: DataLoaderRuntimeConfig,
     runtime: RuntimeContext,
     device: torch.device,
@@ -112,7 +113,7 @@ def build_data_loaders(
     train = _create_loader(
         factory,
         split="train",
-        batch_size=data_config.batching.micro_batch_size,
+        batch_size=micro_batch_size,
         runtime=runtime,
         device=device,
         options=training_dataloader,

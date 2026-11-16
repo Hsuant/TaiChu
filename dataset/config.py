@@ -82,7 +82,6 @@ class UnifiedPackingConfig:
 @dataclass(frozen=True, slots=True)
 class BatchingConfig:
     strategy: str = "fixed_length"
-    micro_batch_size: int = 1
     pad_to_multiple_of: int = 1
     padding_free: bool = False
 
@@ -98,8 +97,6 @@ class BatchingConfig:
                 "batching.strategy must be fixed_length, padding_free, "
                 "preference_pair, reward_pair or trajectory"
             )
-        if self.micro_batch_size <= 0:
-            raise TaiChuConfigurationError("batching.micro_batch_size must be positive")
         if self.pad_to_multiple_of <= 0:
             raise TaiChuConfigurationError(
                 "batching.pad_to_multiple_of must be positive"

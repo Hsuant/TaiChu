@@ -47,16 +47,16 @@ data:
     drop_last_remainder: false
   batching:
     strategy: fixed_length
-    micro_batch_size: 4
     pad_to_multiple_of: 8
 
 training:
   target_tokens: "5.2B"
+  micro_batch_size: 4
   gradient_accumulation_steps: 64
   save_interval: 1000
   log_interval: 10
-  output_dir: "./experiments/small_models"
-  experiment_name: "taichu_150m_pretrain_v1"
+  output_dir: "./experiments"
+  experiment_name: "5_2b_v1"
   use_mixed_precision: true
   dtype: "bfloat16"
   seed: 42

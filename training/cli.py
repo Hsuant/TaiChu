@@ -1,4 +1,4 @@
-"""Command-line interface and typed config overrides for pretraining."""
+"""Command-line interface and typed overrides for causal-LM training."""
 
 from __future__ import annotations
 
@@ -7,14 +7,33 @@ from dataclasses import replace
 from typing import Sequence
 
 from model.config import ModelConfig
-from training.config import PretrainConfig, parse_token_count
+from training.config import TrainingRunConfig, parse_token_count
 
 
-def build_pretraining_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="TaiChu pretraining")
+def _build_training_parser(
+    *,
+    description: str,
+    config_option: str,
+    config_dest: str,
+    config_help: str,
+    budget: str,
+    include_initialization: bool = False,
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model_config", required=True, help="model YAML")
-    parser.add_argument("--pretrain_config", required=True, help="training YAML")
+    parser.add_argument(
+        config_option,
+        dest=config_dest,
+        required=True,
+        help=config_help,
+    )
     parser.add_argument("--resume", default=None, help="checkpoint path")
+    if include_initialization:
+        parser.add_argument(
+            "--init_from",
+            default=None,
+            help="pretrained model artifact",
+        )
 
     parser.add_argument("--model_name")
     parser.add_argument("--hidden_size", type=int)
@@ -26,8 +45,13 @@ def build_pretraining_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_experts", type=int)
     parser.add_argument("--top_k", type=int)
 
-    parser.add_argument("--target_tokens")
-    parser.add_argument("--train_batch_size", type=int)
+    if budget == "tokens":
+        parser.add_argument("--target_tokens")
+    elif budget == "epochs":
+        parser.add_argument("--epochs", type=float)
+    else:
+        raise ValueError(f"unsupported budget kind {budget!r}")
+    parser.add_argument("--micro_batch_size", type=int)
     parser.add_argument("--eval_batch_size", type=int)
     parser.add_argument("--gradient_accumulation_steps", type=int)
     parser.add_argument("--learning_rate", type=float)
@@ -91,17 +115,44 @@ def build_pretraining_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_pretraining_parser() -> argparse.ArgumentParser:
+    return _build_training_parser(
+        description="TaiChu pretraining",
+        config_option="--pretrain_config",
+        config_dest="pretrain_config",
+        config_help="pretraining YAML",
+        budget="tokens",
+    )
+
+
 def parse_pretraining_args(
     argv: Sequence[str] | None = None,
 ) -> argparse.Namespace:
     return build_pretraining_parser().parse_args(argv)
 
 
+def build_sft_parser() -> argparse.ArgumentParser:
+    return _build_training_parser(
+        description="TaiChu supervised fine-tuning",
+        config_option="--sft_config",
+        config_dest="sft_config",
+        config_help="SFT training YAML",
+        budget="epochs",
+        include_initialization=True,
+    )
+
+
+def parse_sft_args(
+    argv: Sequence[str] | None = None,
+) -> argparse.Namespace:
+    return build_sft_parser().parse_args(argv)
+
+
 def apply_cli_overrides(
     model_config: ModelConfig,
-    config: PretrainConfig,
+    config: TrainingRunConfig,
     args: argparse.Namespace,
-) -> tuple[ModelConfig, PretrainConfig]:
+) -> tuple[ModelConfig, TrainingRunConfig]:
     """Apply CLI values without mutating loaded config objects."""
     model_values = {
         "model_name": args.model_name,
@@ -131,6 +182,7 @@ def apply_cli_overrides(
         model_config = replace(model_config, **model_values)
 
     training_values = {
+        "micro_batch_size": args.micro_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "save_interval": args.save_interval,
         "log_interval": args.log_interval,
@@ -146,8 +198,12 @@ def apply_cli_overrides(
         for key, value in training_values.items()
         if value is not None
     }
-    if args.target_tokens is not None:
-        training_values["target_tokens"] = parse_token_count(args.target_tokens)
+    target_tokens = getattr(args, "target_tokens", None)
+    epochs = getattr(args, "epochs", None)
+    if target_tokens is not None:
+        training_values["target_tokens"] = parse_token_count(target_tokens)
+    if epochs is not None:
+        training_values["epochs"] = float(epochs)
     training = (
         replace(config.training, **training_values)
         if training_values
@@ -239,16 +295,6 @@ def apply_cli_overrides(
     )
 
     data = config.data
-    if args.train_batch_size is not None:
-        if args.train_batch_size <= 0:
-            raise ValueError("--train_batch_size must be positive")
-        data = replace(
-            data,
-            batching=replace(
-                data.batching,
-                micro_batch_size=args.train_batch_size,
-            ),
-        )
     if args.max_seq_len is not None:
         data = replace(
             data,
@@ -273,5 +319,7 @@ def apply_cli_overrides(
 __all__ = [
     "apply_cli_overrides",
     "build_pretraining_parser",
+    "build_sft_parser",
     "parse_pretraining_args",
+    "parse_sft_args",
 ]

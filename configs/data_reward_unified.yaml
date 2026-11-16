@@ -21,5 +21,4 @@ data:
 
   batching:
     strategy: reward_pair
-    micro_batch_size: 4
     pad_to_multiple_of: 8

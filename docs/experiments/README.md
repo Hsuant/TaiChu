@@ -9,6 +9,25 @@
 |---|---|---|---|---|---|
 | 2026-11-10 | `taichu_80m_4B` | TaiChu-80M Dense | 完成 | 预训练链路跑通，Loss 明显下降并进入平台区 | [查看](2026-11-10-taichu-80m-4b.md) |
 
+## 产物目录
+
+新训练运行统一写入：
+
+```text
+experiments/<model_scale>/<stage>/<experiment_name>/
+```
+
+例如：
+
+```text
+experiments/80m/pretrain/4b_v2/
+experiments/80m/sft/unified_2epoch_v1/
+experiments/150m/pretrain/5_2b_v1/
+```
+
+每个 Run 的 `config/`、`metadata.json`、Checkpoint、模型产物和日志结构见
+[实验目录说明](../../experiments/README.md)。
+
 ## 必填证据
 
 每个实验至少记录：

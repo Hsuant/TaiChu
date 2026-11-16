@@ -1,21 +1,23 @@
 # 配置指南
 
-TaiChu 的配置分为模型、预训练、数据准备、推理四类。所有加载器都拒绝未知字段，
+TaiChu 的配置分为模型、预训练、SFT、数据准备、推理五类。所有加载器都拒绝未知字段，
 避免拼写错误被默认值静默吞掉。
 
 ## 1. 配置关系
 
 ```mermaid
 flowchart LR
-    A["TaiChu_80M.yaml"] --> C["train_pretrain_80m.yaml"]
-    B["Taichu_Tokenizer_config.yaml"] --> D["taichu_tokenizer/"]
-    D --> C
-    E["sample_pretrain_80m.yaml"] --> F["prepare_pretrain_data.yaml"]
-    F --> G["data/unified/taichu_80m"]
-    G --> C
-    C --> H["experiments/"]
-    H --> I["chat_80m.yaml"]
-    H --> J["pretrain_probe_80m.yaml"]
+    A["TaiChu-80M/150M/190M"] --> P["train_pretrain_80m/150m/190m"]
+    A --> S["train_sft_80m/150m/190m"]
+    D["taichu_tokenizer/"] --> P
+    D --> S
+    G["Pretraining Binary Dataset"] --> P
+    K["data_sft_unified.yaml"] --> S
+    E["pretrain final_model.pt"] --> S
+    P --> R1["experiments/<scale>/pretrain/<run>"]
+    S --> R2["experiments/<scale>/sft/<run>"]
+    R1 --> I["chat_80m.yaml"]
+    R1 --> J["pretrain_probe_80m.yaml"]
 ```
 
 ## 2. 模型配置
@@ -92,28 +94,36 @@ swanlab
 三档都使用 AdamW、`beta=(0.9, 0.95)`、`weight_decay=0.1`、BF16 AMP、
 `max_grad_norm=1.0`、Seed `42`。
 
+`training.output_dir` 是实验父目录，Run 目录由
+`output_dir / experiment_name` 唯一确定。模型规格和 stage 仅作为元数据，
+不会再次拼入路径。例如：
+
+```text
+experiments/80m_8B/sft/taichu_sft_v1/
+```
+
+解析是幂等的：如果 `output_dir` 已经是完整实验目录，则不会再次追加
+`experiment_name`。模型规格和 stage 的不同不会产生额外目录层级。
+
 ### 3.3 Batch 与梯度累积
 
 训练 Batch 的唯一来源是：
 
 ```yaml
-data:
-  batching:
-    micro_batch_size: 8
-
 training:
+  micro_batch_size: 8
   gradient_accumulation_steps: 32
 ```
 
-单进程每步 Token：
+预训练目标 Token 统计的是实际非 Padding 输入 Token，不使用
+`micro_batch_size × sequence_length` 作为数据量。Trainer 在每次优化更新后累计
+全局非 Padding Token，并在达到 `target_tokens` 后停止。
 
-```text
-tokens_per_step =
-    micro_batch_size
-    × gradient_accumulation_steps
-    × world_size
-    × sequence_length
-```
+`sequence_length` 只是 Packing 的物理上限。Runtime Packing 会把多条短样本组合为
+连续序列，因此实际 Step 数由数据 Token 数和 Packing 结果决定。
+
+如果预训练配置不填写 `target_tokens`，则默认训练一个完整 DataLoader Epoch。此时
+`epochs` 仍不适用于预训练，不应同时填写。
 
 多卡时如果希望保持 `524,288 Token / Step`，应把
 `gradient_accumulation_steps` 按 `world_size` 缩小。
@@ -124,11 +134,11 @@ tokens_per_step =
 data:
   schema_version: 1
   task_type: pretraining
-  dataset_id: taichu-pretraining-v1
+  dataset_id: taichu-pretraining-4b
   storage:
     format: binary_mmap
-    train_path: "./data/unified/taichu_80m/train"
-    validation_path: "./data/unified/taichu_80m/validation"
+    train_path: "./data/unified/taichu_80m_4b/train"
+    validation_path: "./data/unified/taichu_80m_4b/validation"
     num_workers: 2
     prefetch_factor: 2
   sampling:
@@ -147,9 +157,70 @@ data:
     drop_last_remainder: false
   batching:
     strategy: fixed_length
-    micro_batch_size: 8
     pad_to_multiple_of: 8
 ```
+
+训练 batch 参数位于 `training`：
+
+```yaml
+training:
+  micro_batch_size: 8
+```
+
+### 3.5 SFT 配置
+
+`configs/train_sft_80m.yaml` 通过 `data_config` 引用
+`configs/data_sft_unified.yaml`，避免重复维护 SFT Runtime 数据字段。训练配置
+只允许 `data` 与 `data_config` 二选一，且两者不能同时出现。
+
+```yaml
+data_config: "./data_sft_unified.yaml"
+
+training:
+  epochs: 2.0
+  micro_batch_size: 4
+  gradient_accumulation_steps: 16
+```
+
+SFT 不使用 `target_tokens` 估算步数，因为会话级 padding 会使
+`max_seq_length × batch` 明显大于真实 input token。训练器按 DataLoader 的真实
+Batch 数、梯度累积和 `epochs` 推导 `max_steps`。
+
+SFT/推理协议只识别 `<|think|>` 与 `<|/think|>`。离线数据准备会将来源中的
+`<think>`、`</think>` 转换为标准特殊 Token；Chat Template 不把旧文本标签当作
+推理控制符。每轮消息只使用一个 `<|taichu_end|>`，Assistant EOS 直接纳入 Loss。
+
+SFT 构建配置新增：
+
+- `reasoning_sample_ratio`: 确定性保留含标准推理块样本的比例。其余样本删除
+  推理块，只监督最终回答。
+- `drop_system`: 删除所有 system message，保证推理时无需 system prompt。
+- `min_assistant_tokens`: 整段 conversation 的 Assistant Token 总数下限，避免
+  多轮对话中的短回复（如“好的”）导致整条样本被删除。
+- `max_assistant_tokens`: 单条 Assistant 回复的 Token 上限。
+- 验证集按 category 分层，构建 Manifest 记录推理比例、Assistant Token 分位数
+  以及来源/类别监督 Token 占比；同时记录多轮样本数量与占比。
+
+默认 SFT 构建 profile 为 `80m_multiturn`，输出
+`SFT/unified/80m_multiturn_v1`。它保留原 129,000 条配比并新增 40,000 条
+中英多轮样本。来源、许可证和下载方式见
+[多轮 SFT 数据来源](MULTITURN_SFT_DATA.md)。
+构建完成后，需要把 `configs/data_sft_unified.yaml` 的 `dataset_id` 与
+`storage` 路径切到 `80m_multiturn_v1`，再启动训练。
+
+关键约束：
+
+- `task_type` 必须为 `sft` 或 `instruction_tuning`。
+- `packing.strategy` 必须为 `sample_isolated`。
+- 当前 Trainer 只接受 `fixed_length`，拒绝尚未接入模型的 `padding_free` 扁平契约。
+- `--init_from` 只加载预训练最小模型产物；`--resume` 恢复完整 SFT Checkpoint，
+  两者互斥。
+
+| 模型 | SFT 配置 | Effective Batch | 初始 LR |
+|---|---|---:|---:|
+| 80M | `train_sft_80m.yaml` | 64 | `2e-5` |
+| 150M | `train_sft_150m.yaml` | 64 | `1.5e-5` |
+| 190M | `train_sft_190m.yaml` | 32 | `1e-5` |
 
 ## 4. 数据准备配置
 
@@ -195,19 +266,18 @@ python -m dataset.offline.prepare `
 
 输出目录已存在时默认失败；中断后的 Staging 目录可通过 `--restart` 处理。
 
-## 5. 当前路径与身份问题
+## 5. 路径与身份约束
 
-本轮文档审计发现以下配置问题，但按照任务约束未修改实验配置：
+80M 重建配置当前统一使用：
 
-1. `prepare_pretrain_data.yaml` 的 `output_dir` 是作者本机
-   `E:/Academic/...` 路径。
-2. `train_pretrain_80m.yaml` 的训练/验证路径同样是 `E:/Academic/...`。
-3. `prepare_pretrain_data.yaml` 的 `dataset_id` 为 `taichu-pretraining`，
-   而 `train_pretrain_80m.yaml` 为 `taichu-pretraining-v1`。
-4. 150M/190M 训练配置使用仓库相对路径 `./data/unified/...`，与 80M
-   配置不一致。
+1. `prepare_pretrain_data.yaml` 的 `dataset_id` 为
+   `taichu-pretraining-4b`。
+2. `train_pretrain_80m.yaml` 使用同一 `dataset_id`。
+3. prepare 输出与 training 输入均指向
+   `E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m_4b`。
+4. 150M/190M 训练配置继续使用各自的仓库相对路径。
 
-公开复现时应同时修改并保持：
+公开复现时应保持：
 
 ```text
 prepare.dataset_id
@@ -226,7 +296,7 @@ train.data.storage.validation_path
 ### Chat
 
 ```yaml
-checkpoint: "../experiments/80m/taichu_80m_pretrain_v1/best_models/best_model.pt"
+checkpoint: "../experiments/80m/pretrain/4b_v2/best_models/best_model.pt"
 tokenizer: "../taichu_tokenizer"
 device: "auto"
 dtype: "auto"

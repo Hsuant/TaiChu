@@ -23,5 +23,4 @@ data:
 
   batching:
     strategy: preference_pair
-    micro_batch_size: 1
     pad_to_multiple_of: 8

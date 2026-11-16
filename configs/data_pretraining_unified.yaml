@@ -27,6 +27,5 @@ data:
 
   batching:
     strategy: fixed_length
-    micro_batch_size: 2
     pad_to_multiple_of: 8
     padding_free: false
