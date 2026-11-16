@@ -1,20 +1,21 @@
 # 项目状态
 
-> 更新时间：2026-11-12
+> 更新时间：2026-11-14
 > 维护原则：这里记录“当前事实”，未来计划统一写入 [Roadmap](roadmap.md)。
 
 ## 当前快照
 
 | 维度 | 状态 |
 |---|---|
-| 当前阶段 | 预训练基座研究与工程验证 |
+| 当前阶段 | 预训练基座与 SFT 训练工程验证 |
 | 可用公开模型档位 | 80M / 150M / 190M 配置；完整权重不随仓库分发 |
 | 第一公开实验 | TaiChu-80M，SwanLab Run `zxdscptz`，状态“完成” |
-| 代码测试基线 | `249 passed, 2 skipped, 150 subtests passed` |
-| 数据主路径 | 文档级抽样 → 去重/划分 → Binary mmap → Packing → Pretraining |
+| 代码测试基线 | `268 passed, 3 skipped, 152 subtests passed` |
+| 数据主路径 | 文档级/会话数据 → 去重/选择 → Binary mmap → Packing → Pretraining / SFT |
 | 推理入口 | 独立评估、原始文本续写、终端 Chat |
-| 指令模型 | 未实现 |
-| SFT / DPO / RLHF / Agent | 训练算法未实现；仅部分数据 Schema 已存在 |
+| 指令模型 | 尚无经过验证的 SFT 公开权重 |
+| SFT | 数据构建、Assistant-only 训练、恢复与集成测试已实现 |
+| DPO / RLHF / Agent | 训练算法未实现；仅部分数据 Schema 已存在 |
 
 ## 已完成
 
@@ -47,6 +48,8 @@
 - AdamW、WSD、AMP、梯度累积与裁剪。
 - Token 加权 Loss、有限性检查和分布式同步保护。
 - DDP、`torch.compile`、编译形状预热。
+- `CausalLMTask + CausalLMTrainingPipeline` 共享运行时，预训练/SFT 入口互不依赖。
+- `experiments/<scale>/<stage>/<run>` 目录与启动配置快照。
 - 原子 Checkpoint、RNG/DataState 恢复、最佳与最终最小推理产物。
 - TensorBoard、SwanLab、结构化日志和诊断指标。
 
@@ -77,12 +80,13 @@
 | P1 | GPU、DCU、AMP、多卡 NCCL 未完成统一实机审计 | 不能宣称通用硬件稳定性 | 在目标环境执行短跑与通信测试 |
 | P1 | `tokenizer_config.json` 的 `model_info.license` 为 Apache 2.0 | 与仓库 CC BY-NC 4.0 冲突 | 正式发布前统一元数据 |
 | P1 | 无下游 Benchmark | 无法评价知识、推理、代码与安全 | 固定评测版本和 Prompt 后再报告 |
-| P2 | SFT/DPO/RLHF 只有部分数据契约 | 不能把 Schema 当作训练能力 | 任务算法与评估完成后再标记已实现 |
+| P1 | SFT 尚未完成目标硬件短跑与质量评估 | 不能把训练脚本等同于可用指令模型 | 完成训练、固定评测和产物归档后再发布权重 |
+| P2 | DPO/RLHF 只有部分数据契约 | 不能把 Schema 当作训练能力 | 任务算法与评估完成后再标记已实现 |
 
 ## 当前结论
 
-TaiChu 已完成一条可审计的 **Tokenizer → 数据 → 预训练 → Checkpoint →
-评估 → 推理** 工程链路，并完成一次 80M 公开预训练运行。项目尚未完成指令微调、
-偏好优化、Agent 训练、GPU 多卡稳定性验证或下游能力评测。
+TaiChu 已完成一条可审计的 **Tokenizer → 数据 → 预训练 → SFT → Checkpoint →
+评估 → 推理** 训练代码链路，并完成一次 80M 公开预训练运行。SFT 尚无经过验证的
+公开权重；偏好优化、Agent 训练、GPU 多卡稳定性验证和下游能力评测仍未完成。
 
-本轮文档不改变模型、训练逻辑或实验配置。所有配置与训练代码仍以仓库当前实现为准。
+所有能力状态仍以仓库当前代码、测试和可追溯实验产物为准。

@@ -72,9 +72,9 @@
 
 ### 7. SFT 最小闭环
 
-- [ ] 接入现有 `SFTSequenceSample` 与 Assistant-only Loss。
-- [ ] 实现 SFT Trainer、Checkpoint、验证与推理脚本。
-- [ ] 建立数据 Manifest、训练配置和独立实验档案。
+- [x] 接入现有 `SFTSequenceSample` 与 Assistant-only Loss。
+- [x] 实现 SFT Trainer、Checkpoint、验证和恢复入口。
+- [ ] 完成目标硬件 SFT 运行，并建立独立实验档案与质量评估。
 
 **验收标准**：完成一次可恢复 SFT 运行，报告 Loss、验证指标和固定 Prompt 输出。
 

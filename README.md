@@ -13,7 +13,7 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.10%2B-EE4C2C?style=flat-square&logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![Pretraining](https://img.shields.io/badge/Stage-Pretraining-2F6F64?style=flat-square)](#八训练实验)
 [![Parameters](https://img.shields.io/badge/Models-80M%20%7C%20150M%20%7C%20190M-C58A3A?style=flat-square)](#四模型与-tokenizer)
-[![Tests](https://img.shields.io/badge/Audit-249%20passed%20%7C%202%20skipped-2F6F64?style=flat-square)](#十项目进度)
+[![Tests](https://img.shields.io/badge/Audit-268%20passed%20%7C%203%20skipped-2F6F64?style=flat-square)](#十项目进度)
 [![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-5B6573?style=flat-square)](LICENSE)
 [![GitHub](https://img.shields.io/github/stars/Hsuant/TaiChu?style=flat-square&logo=github)](https://github.com/Hsuant/TaiChu)
 
@@ -29,8 +29,8 @@
 
 <img src="docs/assets/taichu-banner.svg" alt="TaiChu 太初：从 Tokenizer 到预训练、对齐、Agent 与持续评估的 LLM 工程" width="100%">
 
-> 当前公开成果是 **80M 预训练基座实验**。仓库尚未实现 SFT、DPO、RLHF 或 Agent
-> 训练，现有相关 Schema 只代表数据契约，不代表算法能力。
+> 当前公开模型成果是 **80M 预训练基座实验**。仓库已实现可恢复的 SFT 训练路径，
+> 但尚无经过验证的 SFT 公开权重；DPO、RLHF 与 Agent 训练仍未实现。
 
 </div>
 
@@ -81,7 +81,7 @@ TaiChu 希望最终形成一套覆盖预训练、SFT、偏好优化与 Agent 数
 | **训练执行** | AdamW、WSD、AMP、梯度累积、梯度裁剪、DDP、`torch.compile`、早停 | 单进程可调试，多卡路径保留严格状态协调 |
 | **实验追踪** | TensorBoard、SwanLab、结构化日志、资源摘要、独立评估 | 训练日志与评估产物可长期归档 |
 | **推理入口** | 原始文本续写探针、终端 Chat、KV Cache 流式生成 | 区分预训练分布观察与对话协议验证 |
-| **质量保障** | 架构、数值、数据、恢复、评估与端到端 CPU 预检 | 当前本地审计为 `249 passed, 2 skipped, 150 subtests passed` |
+| **质量保障** | 架构、数值、数据、SFT/预训练恢复与端到端 CPU 预检 | 当前本地审计为 `268 passed, 3 skipped, 152 subtests passed` |
 
 > 测试数量来自 2026-11-12 的当前维护工作区。仓库历史最后一次提交已删除
 > `tests/`，而本工作区又将其加入忽略规则；若要在公开仓库复现测试基线，需先
@@ -115,8 +115,8 @@ flowchart LR
 model/       Decoder 结构、Attention、RoPE、FFN、生成
 tokenizer/   BPE 训练、规范化、特殊 Token、Chat Template
 dataset/     数据 Schema、离线准备、二进制存储、采样、Packing、Runtime
-training/    配置、优化器、环境、Checkpoint、评估、日志、模型产物
-trainer/     预训练装配与主体训练循环
+training/    共享训练运行时、Task 接口、实验路径、优化器、Checkpoint、评估
+trainer/     预训练与 SFT 的任务策略和命令入口
 eval/        基座定量评估与原始文本续写探针
 chat/        终端对话入口、上下文管理与流式采样
 configs/     模型、训练、数据与推理配置
@@ -142,7 +142,7 @@ docs/        架构、状态、实验与维护文档
 | **TaiChu-190M** | 191,394,816 | 1,024 | 14 | 16 / 4 | 2,816 | 2,048 |
 
 模型配置位于 [`configs/`](configs/)，训练配置位于同目录的
-`train_pretrain_{80m,150m,190m}.yaml`。
+`train_pretrain_{80m,150m,190m}.yaml` 与 `train_sft_{80m,150m,190m}.yaml`。
 
 ### 4.2 技术实现
 
@@ -203,8 +203,9 @@ TaiChu 只保留一条训练数据主路径：**原始记录 → 离线准备 �
 
 ### 5.1 当前数据来源
 
-80M 预设定义 10 个语料来源，原始抽样预算为 18 GB，其中中文约 60%、
-英文约 40%。这是 **仓库配置预算**，不等同于已经证明的第一阶段实际消耗量。
+80M 预设定义 10 个语料来源，原始候选抽样预算为 24 GB，其中中文约 60%、
+英文约 40%。prepare 阶段再按来源 token 配额选择最终 4B 非 padding input
+token 训练集。
 
 | 语言组 | 来源 |
 |---|---|
@@ -295,10 +296,22 @@ Token/Step，应同步缩小梯度累积次数。
 
 这些是配置推导值，不是已完成训练结果。
 
+三档模型按相同阶段命名空间组织，训练入口与配置互不复用任务代码：
+
+| 模型 | 预训练配置 | SFT 配置 |
+|---|---|---|
+| TaiChu-80M | `train_pretrain_80m.yaml` | `train_sft_80m.yaml` |
+| TaiChu-150M | `train_pretrain_150m.yaml` | `train_sft_150m.yaml` |
+| TaiChu-190M | `train_pretrain_190m.yaml` | `train_sft_190m.yaml` |
+
 ### 6.3 产物结构
 
 ```text
-experiments/<experiment_name>/
+<training.output_dir>/<experiment_name>/
+├── config/
+│   ├── model.yaml
+│   └── training.yaml
+├── metadata.json
 ├── best_models/
 │   └── best_model.pt
 ├── checkpoints/
@@ -311,6 +324,8 @@ experiments/<experiment_name>/
 └── logs/
 ```
 
+- `training.output_dir` 是用户指定的实验父目录，不会再自动追加模型规格或 stage。
+- `config/` 与 `metadata.json` 保存启动时解析后的配置快照。
 - `checkpoints/` 保存可恢复训练的完整状态。
 - `best_models/` 与 `final_models/` 只保存推理所需的模型配置、权重、步数和指标。
 - 最小推理产物可通过 `torch.load(..., weights_only=True, mmap=True)` 读取。
@@ -386,6 +401,32 @@ python -m trainer.train_pretrain `
   --resume <experiment-dir>/checkpoints/checkpoint-<step>.pt
 ```
 
+### 7.5 监督微调
+
+新 SFT 运行必须从预训练最小模型产物初始化；`--resume` 则只接受完整训练
+Checkpoint，并恢复 optimizer、scheduler、Scaler、RNG 与数据位置：
+
+```powershell
+python -m trainer.train_sft `
+  --model_config configs/TaiChu_80M.yaml `
+  --sft_config configs/train_sft_80m.yaml `
+  --init_from <pretrain-experiment>/final_models/final_model.pt
+```
+
+150M 与 190M 只替换对应的 `TaiChu_150M.yaml / train_sft_150m.yaml` 或
+`TaiChu_190M.yaml / train_sft_190m.yaml`。所有规模共享同一 SFT Runtime 数据配置。
+
+```powershell
+python -m trainer.train_sft `
+  --model_config configs/TaiChu_80M.yaml `
+  --sft_config configs/train_sft_80m.yaml `
+  --resume <sft-experiment>/checkpoints/checkpoint-<step>.pt
+```
+
+SFT 使用 assistant-only labels、会话隔离 packing、按有效监督 Token 归一化的 Loss，
+并以真实 DataLoader 批次和 `epochs` 推导训练步数。`--init_from` 与 `--resume`
+互斥，避免把推理产物当作可恢复训练状态。
+
 完整配置说明与已知路径冲突见 [配置指南](docs/CONFIGURATION.md)。
 
 ## 八、训练实验
@@ -425,7 +466,8 @@ python -m trainer.train_pretrain `
 
 - 80M 预训练已完成一次完整公开运行，支持“链路已跑通”的结论。
 - Loss 下降与平台化表明模型完成了该数据分布下的下一 Token 学习过程。
-- 目前 **没有** SFT、DPO、RLHF 或 Agent 训练成果。
+- SFT 训练代码与 CPU 集成测试已完成，但目前 **没有**经过验证的 SFT 公开权重。
+- DPO、RLHF 与 Agent 训练目前仍未实现。
 - 目前 **没有** MMLU、C-Eval、HumanEval、GSM8K 等下游 Benchmark 结果。
 - 真实数据集 Manifest、最终验证指标、精确 Step 与加速器型号需从实验环境补齐。
 
@@ -484,11 +526,13 @@ Chat 入口实现 Chat Template、多轮上下文裁剪、KV Cache 流式生成�
 | Tokenizer | 已完成 | 32K 词表、特殊 Token、Chat Template、验证与导出 |
 | 统一数据基础设施 | 已完成并通过测试 | 文档级准备、二进制存储、Packing、Runtime Resume |
 | 预训练框架 | 已完成并通过测试 | 单进程、WSD、AMP、Checkpoint、评估、日志 |
+| SFT 训练框架 | 已完成并通过测试 | 预训练初始化、assistant-only Loss、Epoch 预算、恢复与产物 |
 | 80M 第一阶段预训练 | 已完成一次公开实验 | 精确指标与 Manifest 待归档 |
 | 150M / 190M | 配置与测试基线完成 | 尚无可核实的公开训练记录 |
 | GPU 多卡稳定性 | 待实机验证 | CUDA/加速器、NCCL 与吞吐尚需目标硬件审计 |
 | 下游 Benchmark | 未实现 | 暂无 MMLU、C-Eval、HumanEval、GSM8K 等结果 |
-| SFT / DPO / RLHF / Agent | 未实现 | 现有 Schema 不代表训练算法已完成 |
+| SFT 公开权重 | 未完成 | 训练脚本已实现，尚缺目标硬件训练与质量评估 |
+| DPO / RLHF / Agent | 未实现 | 现有 Schema 不代表训练算法已完成 |
 
 事实维护入口：[项目状态](docs/project-status.md)。未来工作入口：
 [Roadmap](docs/roadmap.md)。
@@ -523,7 +567,7 @@ Chat 入口实现 Chat Template、多轮上下文裁剪、KV Cache 流式生成�
 ### Changed
 
 - README 严格按项目介绍、模型、数据、训练、实验、评估的顺序重排。
-- 统一测试基线为 `249 passed, 2 skipped, 150 subtests passed`。
+- 统一测试基线为 `251 passed, 3 skipped, 150 subtests passed`。
 - 统一模型参数量、配置路径、Checkpoint 与推理产物说明。
 
 ### Fixed
@@ -550,7 +594,7 @@ Chat 入口实现 Chat Template、多轮上下文裁剪、KV Cache 流式生成�
 | P0 | 明确测试目录版本控制与 CI | 公开仓库可执行测试，PR 自动校验文档链接与代码回归 |
 | P1 | 目标硬件短跑审计 | 单卡 AMP、`torch.compile`、Checkpoint 恢复通过 |
 | P1 | 多卡 NCCL 审计 | 2/4 卡通信、恢复、吞吐与故障演练通过 |
-| P1 | SFT 最小闭环 | Assistant-only Loss、训练器、评估和数据 Manifest 完整 |
+| P1 | SFT 实机闭环 | 目标硬件短跑、质量评估、公开配置与模型产物可追溯 |
 | P2 | DPO / Reward / GRPO | 算法、Reference Model、Rollout 与独立评估可复现 |
 | P2 | 下游 Benchmark | 固定版本、固定 Prompt、可导出原始结果 |
 

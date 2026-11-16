@@ -15,6 +15,7 @@
 | 配置 | [配置指南](CONFIGURATION.md) | 模型、训练、数据、SwanLab 的字段关系 |
 | 数据 | [统一数据基础设施](UNIFIED_DATA_INFRASTRUCTURE.md) | Schema、Storage、Sampling、Packing、Runtime |
 | 数据 | [预训练数据管线](PRETRAINING_DATA_PIPELINE.md) | 清洗、去重、滑窗、Manifest 与性能说明 |
+| 数据 | [多轮 SFT 数据来源](MULTITURN_SFT_DATA.md) | 中英多轮数据、许可证、下载与配比 |
 | 训练 | [训练架构](TRAINING_ARCHITECTURE.md) | 组件分层、控制流、状态所有权与恢复 |
 | 评估 | [评估与推理](EVALUATION_AND_INFERENCE.md) | 指标、独立评估、续写与 Chat |
 | 推理 | [Chat 入口](CHAT_ENTRY.md) | 终端会话、上下文裁剪与采样 |
