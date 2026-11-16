@@ -1,6 +1,7 @@
 # Pretraining Data Pipeline
 
-> 当前配置：80M 原始抽样目标 18 GB，训练目标 4.0B Token。
+> 当前配置：80M 原始候选抽样目标 24 GB，最终训练目标为 4.0B 非 padding
+> input Token。
 > 本文的性能数字是维护者本机历史测量，只用于解释瓶颈与容量规划，不是当前机器基准。
 
 ## Pipeline
@@ -16,6 +17,7 @@ raw JSONL / GZ / Parquet
   -> stable cluster-level train / validation / diagnostic split
   -> whole-document tokenization
   -> 2046-token windows, stride 1918, overlap 128
+  -> optional source-token quota selection for train
   -> one independent PretrainingSample per window
   -> Binary Shard + Manifest
 ```
@@ -26,6 +28,26 @@ The command is:
 python -m dataset.offline.prepare `
   --config configs/prepare_pretrain_data.yaml
 ```
+
+## Source Token Quotas
+
+`selection` in `prepare_pretrain_data.yaml` optionally fixes the final train
+split to a non-padding input-token budget. Source targets are read from the
+sampling stage's `sampling_manifest.json`; they are normalized automatically,
+so the training configuration does not repeat source weights.
+
+Selection runs only after cleaning, duplicate clustering, split assignment and
+window tokenization. Each source gets a token quota:
+
+```text
+source_quota = target_tokens * source_target_bytes / total_target_bytes
+```
+
+Windows are shuffled deterministically inside each source and selected until the
+quota is reached. A source may overshoot by at most one window. If any source
+lacks enough candidate tokens, preparation fails before publishing the dataset.
+The final root manifest records target quotas, available tokens, actual selected
+tokens and source token shares.
 
 The SQLite staging database stores document text and exact digests. MinHash
 signatures are used to populate LSH rows but are not retained per document, and

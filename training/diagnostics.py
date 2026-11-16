@@ -109,7 +109,7 @@ class GradientNormMonitor:
 
 
 class ModelFlopsUtilization:
-    """Approximate model FLOPs utilization from actual padded token counts."""
+    """Approximate global MFU from all-rank padded token counts."""
 
     def __init__(self, peak_flops: float, log_file: str | Path | None = None) -> None:
         if peak_flops <= 0:

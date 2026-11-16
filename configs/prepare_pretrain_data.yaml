@@ -17,16 +17,16 @@
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
 
 # 处理后数据集的输出目录；目录已存在时不会覆盖。
-output_dir: "E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m"
+output_dir: "./data/Pretrain/unified/taichu_80m_4b"
 
 # 任务类型；预训练固定为 pretraining，增量预训练可使用 cpt。
 task_type: "pretraining"
 
 # 数据集稳定标识；用于 Manifest、追踪和训练恢复。
-dataset_id: "taichu-pretraining"
+dataset_id: "taichu-pretraining-4b"
 
 # 数据处理版本；处理逻辑或输入语义变化时应同步升级。
-version: "1"
+version: "2"
 
 # 原始 JSONL/Parquet 记录中正文文本的字段名。
 text_column: "text"
@@ -109,6 +109,18 @@ cleaning:
   # 精确去重开关；文档级预训练应保持 true。
   deduplicate: true
 
+# 训练窗口目标 token 配额。来源目标从抽样 manifest 自动继承，避免训练
+# 配置再次声明来源比例。
+selection:
+  # 最终训练集非 padding input token 目标。
+  target_tokens: "4B"
+  # 数据抽样阶段生成的来源目标比例。
+  mixture_manifest_path: "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/sampling_manifest.json"
+  # 当前只支持非 padding input token 配额。
+  metric: "input_tokens"
+  # 来源内部窗口选择的固定随机种子。
+  seed: 42
+
 # 十个固定来源。每个来源同时读取抽样阶段生成的 train 与 validation 文件，
 # 然后在去重后重新执行 cluster 级划分，避免原始 split 泄漏。
 sources:
@@ -119,9 +131,9 @@ sources:
     # 来源文件路径；支持文件、目录、JSONL、JSONL.GZ 和 Parquet。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/fineweb2_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/fineweb2_zh.jsonl"
       # 抽样生成的验证侧文件，后续会与训练侧一起重新聚类划分。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/fineweb2_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/fineweb2_zh.jsonl"
 
   # 中文行业语料来源。
   - name: "industrycorpus_zh"
@@ -130,9 +142,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/industrycorpus_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/industrycorpus_zh.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/industrycorpus_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/industrycorpus_zh.jsonl"
 
   # 中文百科与 Wiki 来源。
   - name: "baike_wiki_zh"
@@ -141,9 +153,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/baike_wiki_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/baike_wiki_zh.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/baike_wiki_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/baike_wiki_zh.jsonl"
 
   # 中文高质量 CCI 来源。
   - name: "cci_hq_zh"
@@ -152,9 +164,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/cci_hq_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/cci_hq_zh.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/cci_hq_zh.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/cci_hq_zh.jsonl"
 
   # 英文 FineWeb 来源。
   - name: "fineweb_en"
@@ -163,9 +175,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/fineweb_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/fineweb_en.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/fineweb_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/fineweb_en.jsonl"
 
   # 英文 FineWeb-Edu 来源。
   - name: "fineweb_edu_en"
@@ -174,9 +186,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/fineweb_edu_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/fineweb_edu_en.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/fineweb_edu_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/fineweb_edu_en.jsonl"
 
   # 英文百科与 Wiki 来源。
   - name: "baike_wiki_en"
@@ -185,9 +197,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/baike_wiki_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/baike_wiki_en.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/baike_wiki_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/baike_wiki_en.jsonl"
 
   # 英文 PES2O 来源，短文档较多，不应按长度降权。
   - name: "pes2o_en"
@@ -196,9 +208,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/pes2o_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/pes2o_en.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/pes2o_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/pes2o_en.jsonl"
 
   # 英文数学与代码来源。
   - name: "automath_code_en"
@@ -207,9 +219,9 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/automath_code_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/automath_code_en.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/automath_code_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/automath_code_en.jsonl"
 
   # 英文数学论文来源，优先保留完整长文档。
   - name: "automath_arxiv_en"
@@ -218,6 +230,6 @@ sources:
     # 来源文件路径。
     paths:
       # 抽样生成的训练侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/train/automath_arxiv_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/train/automath_arxiv_en.jsonl"
       # 抽样生成的验证侧文件。
-      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m/validation/automath_arxiv_en.jsonl"
+      - "E:/Academic/Datasets/TaiChu/Pretrain/raw/taichu_80m_4b/validation/automath_arxiv_en.jsonl"

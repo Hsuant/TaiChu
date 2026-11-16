@@ -8,6 +8,35 @@ from typing import Any
 from ..config import CleaningConfig
 
 
+def _parse_token_count(value: int | float | str) -> int:
+    if isinstance(value, bool):
+        raise ValueError("selection.target_tokens cannot be boolean")
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, float):
+        result = int(value)
+    elif isinstance(value, str):
+        text = value.strip().upper()
+        multipliers = {
+            "K": 1_000,
+            "M": 1_000_000,
+            "B": 1_000_000_000,
+            "T": 1_000_000_000_000,
+        }
+        suffix = text[-1:] if text else ""
+        if suffix in multipliers:
+            result = int(float(text[:-1]) * multipliers[suffix])
+        else:
+            result = int(float(text))
+    else:
+        raise TypeError(
+            f"unsupported selection.target_tokens type: {type(value).__name__}"
+        )
+    if result <= 0:
+        raise ValueError("selection.target_tokens must be positive")
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class SegmentationConfig:
     max_sequence_length: int = 2048
@@ -99,6 +128,24 @@ class PretrainingSource:
 
 
 @dataclass(frozen=True, slots=True)
+class TokenSelectionConfig:
+    target_tokens: int
+    mixture_manifest_path: Path
+    metric: str = "input_tokens"
+    seed: int = 42
+
+    def __post_init__(self) -> None:
+        if self.target_tokens <= 0:
+            raise ValueError("selection.target_tokens must be positive")
+        if not str(self.mixture_manifest_path):
+            raise ValueError("selection.mixture_manifest_path is required")
+        if self.metric != "input_tokens":
+            raise ValueError("selection.metric currently supports only input_tokens")
+        if self.seed < 0:
+            raise ValueError("selection.seed cannot be negative")
+
+
+@dataclass(frozen=True, slots=True)
 class PretrainingConfig:
     tokenizer_path: Path
     output_dir: Path
@@ -124,6 +171,7 @@ class PretrainingConfig:
             max_chars=10_000_000,
         )
     )
+    selection: TokenSelectionConfig | None = None
 
     def __post_init__(self) -> None:
         if not self.dataset_id or not self.version:
@@ -145,6 +193,11 @@ class PretrainingConfig:
             raise ValueError("output_workers must be positive when configured")
         if self.fingerprint_batch_size <= 0:
             raise ValueError("fingerprint_batch_size must be positive")
+        if self.selection is not None and not isinstance(
+            self.selection,
+            TokenSelectionConfig,
+        ):
+            raise ValueError("selection must be a TokenSelectionConfig")
 
 
 def load_pretraining_config(path: str | Path) -> PretrainingConfig:
@@ -184,6 +237,22 @@ def load_pretraining_config(path: str | Path) -> PretrainingConfig:
             )
         )
 
+    selection = values.get("selection")
+    if selection is not None:
+        if not isinstance(selection, dict):
+            raise ValueError("selection must be a mapping")
+        unknown = set(selection) - set(TokenSelectionConfig.__dataclass_fields__)
+        if unknown:
+            raise ValueError(f"unknown selection keys: {sorted(unknown)}")
+        selection_values = dict(selection)
+        selection_values["target_tokens"] = _parse_token_count(
+            selection_values["target_tokens"]
+        )
+        selection_values["mixture_manifest_path"] = Path(
+            selection_values["mixture_manifest_path"]
+        )
+        values["selection"] = TokenSelectionConfig(**selection_values)
+
     for nested, cls in (
         ("segmentation", SegmentationConfig),
         ("dedup", DedupConfig),
@@ -217,5 +286,6 @@ __all__ = [
     "PretrainingConfig",
     "SegmentationConfig",
     "SplitConfig",
+    "TokenSelectionConfig",
     "load_pretraining_config",
 ]

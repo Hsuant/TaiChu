@@ -56,7 +56,7 @@ python -m dataset.offline.prepare `
 ## 输出结构
 
 ```text
-data/unified/taichu_80m/
+data/unified/taichu_80m_4b/
 ├── dataset_manifest.json
 ├── train/
 │   ├── manifest.json

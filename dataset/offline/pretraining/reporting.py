@@ -79,6 +79,7 @@ def build_manifest(
     started_at: str,
     staging: Path,
     processing_version: str,
+    selection_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     sources: dict[str, dict[str, Any]] = defaultdict(_source_counter)
     languages: dict[str, dict[str, int]] = defaultdict(
@@ -301,6 +302,11 @@ def build_manifest(
         },
         "leakage": dict(leakage),
         "artifacts": {"duplicate_clusters": "duplicate_clusters.jsonl"},
+        "selection": (
+            dict(selection_report)
+            if selection_report is not None
+            else None
+        ),
     }
 
 
@@ -323,6 +329,16 @@ def _config_snapshot(config: PretrainingConfig) -> dict[str, Any]:
         "dedup": asdict(config.dedup),
         "splits": asdict(config.splits),
         "cleaning": asdict(config.cleaning),
+        "selection": (
+            {
+                **asdict(config.selection),
+                "mixture_manifest_path": str(
+                    config.selection.mixture_manifest_path
+                ),
+            }
+            if config.selection is not None
+            else None
+        ),
         "sources": [
             {
                 "name": source.name,

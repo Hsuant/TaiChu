@@ -1,11 +1,12 @@
 # TaiChu 80M 原始预训练语料抽样配置。
 # 该配置仅做来源配比和字节预算控制，不做 Tokenization、去重或最终 split。
 
-# 原始抽样目标总量，单位十进制 GB。
-target_total_gb: 18.0
+# 原始候选抽样总量，单位十进制 GB。最终训练集由 prepare 阶段按 4B token
+# 配额选择，因此候选量需高于目标训练量。
+target_total_gb: 24.0
 
 # 抽样输出目录；处理配置必须指向该目录下的同名来源文件。
-output_dir: "./data/raw/taichu_80m"
+output_dir: "./data/raw/taichu_80m_4b"
 
 # 抽样 Hash 的固定随机种子。
 seed: 42

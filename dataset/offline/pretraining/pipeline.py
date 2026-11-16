@@ -27,7 +27,11 @@ from .fingerprinting import (
     compute_fingerprints,
 )
 from .hashing import cluster_id, split_for_cluster
-from .output import verify_split_isolation, write_splits
+from .output import (
+    apply_training_selection,
+    verify_split_isolation,
+    write_splits,
+)
 from .reporting import build_manifest
 from .store import get_state, open_store, record_error, set_state
 from .tokenization import initialize_tokenizer_worker, tokenize_batch
@@ -127,6 +131,13 @@ class PretrainingDataPreparation:
                 staging=staging,
                 processing_version=PROCESSING_VERSION,
             )
+            selection_report = None
+            if self.config.selection is not None:
+                train_manifest, selection_report = apply_training_selection(
+                    config=self.config,
+                    staging=staging,
+                )
+                split_manifests["train"] = train_manifest
             leakage = verify_split_isolation(staging, split_manifests)
             manifest = build_manifest(
                 config=self.config,
@@ -139,6 +150,7 @@ class PretrainingDataPreparation:
                 started_at=started_at,
                 staging=staging,
                 processing_version=PROCESSING_VERSION,
+                selection_report=selection_report,
             )
             (staging / "dataset_manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",

@@ -238,10 +238,13 @@ def _final_split_metadata(
     split: str,
     tokenizer_version: str,
     processing_version: str,
+    stats: Mapping[str, int],
 ) -> dict[str, Any]:
     return {
         "task_type": config.task_type,
         "split": split,
+        "actual_input_tokens": int(stats["input_tokens"]),
+        "actual_loss_tokens": int(stats["loss_tokens"]),
         "processing_version": processing_version,
         "tokenizer_path": str(config.tokenizer_path),
         "tokenizer_version": tokenizer_version,
@@ -317,6 +320,7 @@ def _merge_parts(
                 split=split,
                 tokenizer_version=tokenizer_version,
                 processing_version=processing_version,
+                stats=stats,
             ),
         ).with_content_hash()
         manifest.write(split_dir)
