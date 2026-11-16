@@ -7,8 +7,8 @@ TaiChu 的配置分为模型、预训练、SFT、数据准备、推理五类。�
 
 ```mermaid
 flowchart LR
-    A["TaiChu-80M/150M/190M"] --> P["train_pretrain_80m/150m/190m"]
-    A --> S["train_sft_80m/150m/190m"]
+    A["TaiChu_80M.yaml"] --> P["train_pretrain_80m.yaml"]
+    A --> S["train_sft_80m.yaml"]
     D["taichu_tokenizer/"] --> P
     D --> S
     G["Pretraining Binary Dataset"] --> P
@@ -75,24 +75,18 @@ early_stopping
 swanlab
 ```
 
-### 3.2 三档预设
+### 3.2 保留样例
 
-| 字段 | 80M | 150M | 190M |
-|---|---:|---:|---:|
-| Learning Rate | `3e-4` | `3e-4` | `3e-4` |
-| Warmup Ratio | 0.03 | 0.02 | 0.02 |
-| Stable Ratio | 0.70 | 0.70 | 0.70 |
-| Min LR Ratio | 0.19 | 0.10 | 0.10 |
-| Target Tokens | 4.0B | 5.2B | 7.0B |
-| Micro Batch | 8 | 4 | 2 |
-| Accumulation | 32 | 64 | 128 |
-| Token / Step（单进程） | 524,288 | 524,288 | 524,288 |
-| Save Interval | 1,000 | 1,000 | 1,000 |
-| Eval Interval | 500 | 500 | 500 |
-| Compile Mode | `default` | `auto` | `auto` |
+基础预训练配置为 `train_pretrain_80m.yaml`：
 
-三档都使用 AdamW、`beta=(0.9, 0.95)`、`weight_decay=0.1`、BF16 AMP、
-`max_grad_norm=1.0`、Seed `42`。
+- Learning Rate 为 `3e-4`，Warmup Ratio 为 `0.03`，Stable Ratio 为 `0.70`
+- Min LR Ratio 为 `0.19`，Decay Type 为 `cosine`
+- Target Tokens 为 `4.0B`
+- Micro Batch 为 `8`，Accumulation 为 `32`
+- 单进程 Token / Step 为 `524,288`
+- Save Interval 为 `1,000`，Eval Interval 为 `500`
+- 使用 AdamW、`beta=(0.9, 0.95)`、`weight_decay=0.1`、BF16 AMP、
+  `max_grad_norm=1.0`、Seed `42`
 
 `training.output_dir` 是实验父目录，Run 目录由
 `output_dir / experiment_name` 唯一确定。模型规格和 stage 仅作为元数据，
@@ -216,11 +210,9 @@ SFT 构建配置新增：
 - `--init_from` 只加载预训练最小模型产物；`--resume` 恢复完整 SFT Checkpoint，
   两者互斥。
 
-| 模型 | SFT 配置 | Effective Batch | 初始 LR |
+| 当前样例 | SFT 配置 | Effective Batch | 初始 LR |
 |---|---|---:|---:|
-| 80M | `train_sft_80m.yaml` | 64 | `2e-5` |
-| 150M | `train_sft_150m.yaml` | 64 | `1.5e-5` |
-| 190M | `train_sft_190m.yaml` | 32 | `1e-5` |
+| 80M | `train_sft_80m.yaml` | 96 | `2e-5` |
 
 ## 4. 数据准备配置
 
@@ -268,14 +260,10 @@ python -m dataset.offline.prepare `
 
 ## 5. 路径与身份约束
 
-80M 重建配置当前统一使用：
-
-1. `prepare_pretrain_data.yaml` 的 `dataset_id` 为
-   `taichu-pretraining-4b`。
-2. `train_pretrain_80m.yaml` 使用同一 `dataset_id`。
-3. prepare 输出与 training 输入均指向
-   `E:/Academic/Datasets/TaiChu/Pretrain/unified/taichu_80m_4b`。
-4. 150M/190M 训练配置继续使用各自的仓库相对路径。
+当前预训练样例统一使用 80M/4B 数据预算：
+`prepare_pretrain_data.yaml` 生成 `taichu-pretraining-4b`，
+`train_pretrain_80m.yaml` 读取同一数据集身份。正式训练前仍应确认输出目录与实际
+数据位置一致。
 
 公开复现时应保持：
 

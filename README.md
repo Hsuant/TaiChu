@@ -141,8 +141,9 @@ docs/        架构、状态、实验与维护文档
 | **TaiChu-150M** | 149,057,280 | 768 | 18 | 12 / 4 | 2,304 | 2,048 |
 | **TaiChu-190M** | 191,394,816 | 1,024 | 14 | 16 / 4 | 2,816 | 2,048 |
 
-模型配置位于 [`configs/`](configs/)，训练配置位于同目录的
-`train_pretrain_{80m,150m,190m}.yaml` 与 `train_sft_{80m,150m,190m}.yaml`。
+上表保留三档架构参数用于设计对照。当前 [`configs/`](configs/) 按用途去重，
+以 80M 作为唯一基础样例 `TaiChu_80M.yaml`，预训练与 SFT 分别使用
+`train_pretrain_80m.yaml` 与 `train_sft_80m.yaml`。
 
 ### 4.2 技术实现
 
@@ -296,13 +297,11 @@ Token/Step，应同步缩小梯度累积次数。
 
 这些是配置推导值，不是已完成训练结果。
 
-三档模型按相同阶段命名空间组织，训练入口与配置互不复用任务代码：
+训练入口与配置互不复用任务代码；仓库只保留一份同用途配置样例：
 
-| 模型 | 预训练配置 | SFT 配置 |
+| 当前样例 | 预训练配置 | SFT 配置 |
 |---|---|---|
 | TaiChu-80M | `train_pretrain_80m.yaml` | `train_sft_80m.yaml` |
-| TaiChu-150M | `train_pretrain_150m.yaml` | `train_sft_150m.yaml` |
-| TaiChu-190M | `train_pretrain_190m.yaml` | `train_sft_190m.yaml` |
 
 ### 6.3 产物结构
 
@@ -413,8 +412,8 @@ python -m trainer.train_sft `
   --init_from <pretrain-experiment>/final_models/final_model.pt
 ```
 
-150M 与 190M 只替换对应的 `TaiChu_150M.yaml / train_sft_150m.yaml` 或
-`TaiChu_190M.yaml / train_sft_190m.yaml`。所有规模共享同一 SFT Runtime 数据配置。
+当前只维护 190M 配置样例。所有 SFT 任务共享同一
+`data_sft_unified.yaml` Runtime 数据配置。
 
 ```powershell
 python -m trainer.train_sft `
