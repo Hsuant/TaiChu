@@ -1,6 +1,11 @@
 # TaiChu 通用 SFT Runtime 数据配置。
 # 该文件只负责训练时读取 unified Binary Dataset；source 构建和 tokenization
 # 由 configs/prepare_sft_data.yaml 控制。
+#
+# 使用说明：
+#   1. 先运行 prepare_sft_data.yaml 生成 selected profile 输出。
+#   2. 下列路径是项目内示例；数据目录变化时同步替换。
+#   3. dataset_id 必须与构建 Manifest 及 SFT 训练配置一致。
 data:
   # 统一数据配置 Schema 版本。
   schema_version: 1
@@ -9,34 +14,46 @@ data:
   # 必须与 prepare_sft_data.yaml 中的 dataset_id 保持一致。
   dataset_id: taichu-sft-80m-v1
 
+  # Binary Dataset 存储位置与读取并发配置。
   storage:
     # 当前支持的训练存储格式。
     format: binary_mmap
     # 由通用 SFT 构建流程生成的 source=unified 输出。
-    train_path: "../data/SFT/unified/80m_v1/train"
-    validation_path: "../data/SFT/unified/80m_v1/validation"
+    train_path: "./data/SFT/unified/80m_v1/train"
+    # 与训练集同源的验证集目录；启用验证时必须存在。
+    validation_path: "./data/SFT/unified/80m_v1/validation"
     # DataLoader worker 和预取配置。
     num_workers: 4
+    # 每个 Worker 预先读取的 Batch 数。
     prefetch_factor: 2
 
+  # 样本采样配置。
   sampling:
     # distributed 同时支持单卡和多卡 Rank 分片。
     strategy: distributed
+    # 是否在每个 Epoch 重新打乱样本顺序。
     shuffle: true
+    # 采样顺序的固定随机种子。
     seed: 42
     # SFT 训练丢弃最后一个不足一个 micro batch 的尾部。
     drop_last: true
 
+  # 会话级序列拼接配置。
   packing:
     # SFT 使用整 conversation 级 packing，禁止跨 conversation 拼接 Attention。
     enabled: true
+    # SFT 必须使用 sample_isolated，禁止不同会话共享 Attention。
     strategy: sample_isolated
     # 必须与模型最大上下文及 prepare_sft_data.yaml 保持一致。
     max_seq_length: 2048
+    # 序列长度向上对齐的倍数。
     pad_to_multiple_of: 8
 
+  # Batch 张量构造配置。
   batching:
     # fixed_length 输出二维 Batch；切换 padding_free 时输出扁平 cu_seqlens 契约。
     strategy: fixed_length
+    # Batch 序列长度向上对齐的倍数。
     pad_to_multiple_of: 8
+    # 是否启用无 Padding 扁平契约；当前 SFT Trainer 要求 false。
     padding_free: false

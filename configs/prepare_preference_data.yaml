@@ -1,21 +1,46 @@
+# 通用偏好数据离线构建配置样例。
+# 原始 chosen/rejected JSONL 经清洗、去重和分词后写入 Unified Binary Dataset。
+#
+# 使用说明：
+#   1. splits 中的路径均为项目内示例，不指向真实数据。
+#   2. 将 train/validation 列表替换为自己的原始数据文件或目录。
+#   3. 在仓库根目录运行：
+#      python -m dataset.offline.prepare `
+#        --config configs/prepare_preference_data.yaml
+
+# 输出数据集的任务类型；偏好优化固定为 preference。
 task_type: "preference"
+# 数据集稳定标识；训练配置必须使用相同值。
 dataset_id: "taichu-preference-v1"
+# 数据处理逻辑版本；输入语义或输出格式变化时应升级。
 version: "1"
 
+# Tokenizer JSON 路径；必须与训练模型词表一致。
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
+# Unified Binary Dataset 输出目录。
 output_dir: "./data/unified/preference"
 
+# 单条偏好样本允许的最大 Token 数。
 max_seq_length: 4096
+# 是否在每条记录末尾追加 EOS Token。
 add_eos: true
+# 非法记录策略；error 立即失败，skip 跳过并记录。
 invalid_policy: "error"
+# 每个 Binary Shard 最多写入的样本数。
 shard_size: 50000
 
+# Padding Token；必须存在于 Tokenizer 词表中。
 pad_token: "<|pad|>"
+# 文档起始 Token；必须与 Tokenizer 和训练配置一致。
 bos_token: "<|taichu_start|>"
+# 文档结束 Token；必须与 Tokenizer 和训练配置一致。
 eos_token: "<|taichu_end|>"
 
+# 训练与验证原始数据来源。
 splits:
+  # 训练集输入目录列表；目录内文件由构建器读取。
   train:
     - "./data/raw/preference/train"
+  # 验证集输入目录列表；必须与训练集隔离。
   validation:
     - "./data/raw/preference/validation"

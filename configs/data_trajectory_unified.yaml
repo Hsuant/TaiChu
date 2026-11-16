@@ -1,25 +1,52 @@
+# 通用轨迹数据 Runtime 配置样例。
+# 该文件描述离线 PPO/轨迹训练的 Binary Dataset 读取方式。
+#
+# 使用说明：先运行 prepare_trajectory_data.yaml，再按生成目录替换 storage 路径。
+# 当前路径均为项目内示例，dataset_id 必须与 Manifest 保持一致。
+
+# 数据配置根节点。
 data:
+  # 统一数据配置 Schema 版本；当前只支持 1。
   schema_version: 1
+  # 训练任务类型；在线 Rollout 轨迹使用 ppo。
   task_type: ppo
+  # 数据集稳定标识；断点恢复会校验该值。
   dataset_id: taichu-online-rollouts-v1
 
+  # Binary Dataset 存储与读取配置。
   storage:
+    # 存储后端类型；当前只支持 binary_mmap。
     format: binary_mmap
+    # 轨迹训练集目录。
     train_path: ./data/unified/trajectory/train
+    # 轨迹验证集目录。
     validation_path: ./data/unified/trajectory/validation
+    # 每个 DataLoader 的子进程数；轨迹数据默认在主进程读取。
     num_workers: 0
 
+  # 样本采样配置。
   sampling:
+    # 采样策略；distributed 支持单卡与多卡 Rank 分片。
     strategy: distributed
+    # 是否打乱轨迹顺序；PPO 通常按采集顺序消费。
     shuffle: false
+    # 采样顺序的固定随机种子。
     seed: 42
+    # 是否丢弃不足一个完整 Batch 的尾部轨迹。
     drop_last: false
 
+  # 运行时序列拼接配置。
   packing:
+    # 轨迹内部结构需保持完整，因此禁用跨样本 Packing。
     enabled: false
+    # 无 Packing 策略。
     strategy: none
+    # 单条轨迹允许的最大长度。
     max_seq_length: 4096
 
+  # Batch 张量构造配置。
   batching:
+    # trajectory 构造轨迹专用 Batch。
     strategy: trajectory
+    # Batch 序列长度向上对齐的倍数。
     pad_to_multiple_of: 8

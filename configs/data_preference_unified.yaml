@@ -1,26 +1,54 @@
+# 通用偏好数据 Runtime 配置样例。
+# 该文件只描述配对样本的读取与 Batch 组织方式。
+#
+# 使用说明：先运行 prepare_preference_data.yaml，再按生成目录替换 storage 路径。
+# 当前路径均为项目内示例，dataset_id 必须与 Manifest 保持一致。
+
+# 数据配置根节点。
 data:
+  # 统一数据配置 Schema 版本；当前只支持 1。
   schema_version: 1
+  # 训练任务类型；偏好优化使用 preference。
   task_type: preference
+  # 数据集稳定标识；断点恢复会校验该值。
   dataset_id: taichu-preference-v1
 
+  # Binary Dataset 存储与读取配置。
   storage:
+    # 存储后端类型；当前只支持 binary_mmap。
     format: binary_mmap
+    # 偏好训练集目录。
     train_path: ./data/unified/preference/train
+    # 偏好验证集目录。
     validation_path: ./data/unified/preference/validation
+    # 每个 DataLoader 的子进程数；0 表示主进程读取。
     num_workers: 2
+    # 每个 Worker 预先读取的 Batch 数。
     prefetch_factor: 2
 
+  # 样本采样配置。
   sampling:
+    # pair_aware 保证 chosen/rejected 配对不会在分布式分片中被拆散。
     strategy: pair_aware
+    # 是否在每个 Epoch 重新打乱配对顺序。
     shuffle: true
+    # 采样顺序的固定随机种子。
     seed: 42
+    # 是否丢弃不足一个完整配对 Batch 的尾部样本。
     drop_last: false
 
+  # 运行时序列拼接配置。
   packing:
+    # 偏好样本需要保留完整配对，因此禁用跨样本 Packing。
     enabled: false
+    # 无 Packing 策略。
     strategy: none
+    # 单条偏好样本允许的最大长度。
     max_seq_length: 4096
 
+  # Batch 张量构造配置。
   batching:
+    # preference_pair 输出 chosen/rejected 成对 Batch。
     strategy: preference_pair
+    # 配对序列长度向上对齐的倍数。
     pad_to_multiple_of: 8

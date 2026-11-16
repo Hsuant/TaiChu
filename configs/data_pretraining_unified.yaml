@@ -1,31 +1,66 @@
-data:
-  schema_version: 1
-  task_type: pretraining
-  dataset_id: taichu-pretraining-v1
+# 通用预训练 Runtime 数据配置样例。
+# 该文件只描述训练时如何读取 Binary Dataset，不负责原始数据抽样与 Tokenization。
+#
+# 使用说明：
+#   1. 先运行 prepare_pretrain_data.yaml 生成 Binary Dataset。
+#   2. 下列路径是项目内示例；数据生成到其他位置时同步替换。
+#   3. dataset_id 必须与 prepare manifest 和训练配置一致。
 
+# 数据配置根节点。
+data:
+  # 统一数据配置 Schema 版本；当前只支持 1。
+  schema_version: 1
+  # 训练任务类型；预训练 Loader 使用 pretraining。
+  task_type: pretraining
+  # 数据集稳定标识；断点恢复会校验该值。
+  dataset_id: taichu-pretraining-4b
+
+  # Binary Dataset 存储与读取配置。
   storage:
+    # 存储后端类型；当前只支持 binary_mmap。
     format: binary_mmap
-    train_path: ./data/unified/pretraining/train
-    validation_path: ./data/unified/pretraining/validation
+    # 训练集 Binary Dataset 目录。
+    train_path: ./data/unified/taichu_80m_4b/train
+    # 验证集 Binary Dataset 目录。
+    validation_path: ./data/unified/taichu_80m_4b/validation
+    # 是否校验 Bin/Index 文件校验和；会增加启动与读取开销。
     verify_checksums: false
+    # 每个 DataLoader 的子进程数；0 表示主进程读取。
     num_workers: 4
+    # 每个 Worker 预先读取的 Batch 数。
     prefetch_factor: 2
 
+  # 样本采样配置。
   sampling:
+    # 采样策略；distributed 支持单卡与多卡 Rank 分片。
     strategy: distributed
+    # 是否在每个 Epoch 重新打乱样本顺序。
     shuffle: true
+    # 采样顺序的固定随机种子。
     seed: 42
+    # 是否丢弃不足一个完整 Batch 的尾部样本。
     drop_last: true
+    # 是否在分布式训练时补齐样本，使各 Rank 的 Batch 数一致。
     pad_to_world_size: true
 
+  # 运行时序列拼接配置。
   packing:
+    # 是否启用流式 Packing。
     enabled: true
+    # Packing 策略；stream 表示跨样本拼接并保留 segment 边界。
     strategy: stream
+    # 物理训练序列最大长度；不得超过模型最大上下文。
     max_seq_length: 2048
+    # Packed Sequence 长度向上对齐的倍数。
     pad_to_multiple_of: 8
+    # 是否丢弃不足一个完整 Packed Sequence 的尾部内容。
     drop_last_remainder: false
 
+  # Batch 张量构造配置。
   batching:
+    # Batch 策略；fixed_length 使用固定长度 Padding。
     strategy: fixed_length
+    # Batch 序列长度向上对齐的倍数。
     pad_to_multiple_of: 8
+    # 是否使用无 Padding 的扁平序列契约；预训练当前输出固定长度 Batch。
     padding_free: false
