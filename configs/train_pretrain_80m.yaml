@@ -1,5 +1,9 @@
-# TaiChu 80M 预训练训练配置。
-# 数据来自 configs/prepare_pretrain_data.yaml 生成的 Binary Dataset。
+# TaiChu 80M 预训练训练配置样例。
+# 数据来自 configs/prepare_pretrain_data.yaml 生成的 Unified Binary Dataset。
+#
+# 历史 190M 参考参数（不再单独维护运行文件）：
+#   target_tokens="7B", micro_batch_size=2, gradient_accumulation_steps=128
+#   output_dir="./experiments", experiment_name="7b_v1"
 
 # 优化器配置。
 optimizer:
@@ -44,10 +48,10 @@ data:
   storage:
     # 存储后端类型；当前只支持 binary_mmap。
     format: binary_mmap
-    # 训练集 Binary Dataset 目录。
-    train_path: "./data/Pretrain/unified/taichu_80m_4b/train"
-    # 验证集 Binary Dataset 目录。
-    validation_path: "./data/Pretrain/unified/taichu_80m_4b/validation"
+    # 训练集 Binary Dataset 示例目录。
+    train_path: "./data/unified/taichu_80m_4b/train"
+    # 验证集 Binary Dataset 示例目录。
+    validation_path: "./data/unified/taichu_80m_4b/validation"
     # 每个 DataLoader worker 进程数；0 表示主进程读取。
     num_workers: 2
     # 每个 worker 预取 Batch 数。
@@ -72,7 +76,7 @@ data:
   packing:
     # 是否启用流式 Packing。
     enabled: true
-    # Packing 策略；stream 表示跨样本流式拼接并保留 segment 边界。
+    # Packing 策略；stream 表示跨样本拼接并保留 segment 边界。
     strategy: stream
     # 物理训练序列最大长度；必须包含 BOS/EOS。
     max_seq_length: 2048
@@ -182,9 +186,9 @@ swanlab:
   swanlab_mode: "local"
   # SwanLab 工作区；留空时使用账号默认工作区。
   swanlab_workspace: null
-  # 要恢复的 SwanLab 实验 ID；断点恢复时会优先读取检查点中保存的 ID。
+  # 要恢复的 SwanLab 实验 ID。
   swanlab_id: null
   # SwanLab 恢复策略；恢复已有 ID 时建议使用 "must"。
   swanlab_resume: null
-  # 其他官方 swanlab.init 参数，例如 tags、group、job_type。
+  # 其他官方 swanlab.init 参数。
   swanlab_init_kwargs: {}

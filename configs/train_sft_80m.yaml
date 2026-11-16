@@ -1,83 +1,142 @@
-# TaiChu 80M 通用 SFT 训练配置。
+# TaiChu 80M 通用 SFT 训练配置样例。
 # Runtime 数据定义只维护在 data_sft_unified.yaml，避免训练配置与数据配置漂移。
+
+# SFT Runtime 数据配置的相对路径；不能与内联 data 同时出现。
 data_config: "./data_sft_unified.yaml"
 
-# Tokenizer 必须与预训练基座和 unified Binary Dataset 完全一致。
+# Tokenizer 必须与预训练基座和 Binary Dataset 完全一致。
 tokenizer:
+  # Tokenizer JSON 文件路径。
   path: "./taichu_tokenizer/tokenizer.json"
+  # Tokenizer 后端；当前仅支持 tokenizers。
   backend: "tokenizers"
 
 # SFT 使用比预训练更低的学习率，避免破坏基座已获得的语言能力。
 optimizer:
+  # AdamW 峰值学习率。
   learning_rate: 2.0e-5
+  # 权重衰减系数。
   weight_decay: 0.1
+  # AdamW 一阶矩指数衰减率。
   beta1: 0.9
+  # AdamW 二阶矩指数衰减率。
   beta2: 0.999
+  # AdamW 分母的数值稳定项。
   epsilon: 1.0e-8
 
-# 先线性 Warmup，再在剩余步数内 Cosine 衰减到峰值的 10%。
-# stable_ratio=0 表示 Warmup 后立即进入衰减，符合常见 SFT 配方。
+# 学习率调度器配置。
 scheduler:
+  # 总训练步数中用于线性 Warmup 的比例。
   warmup_ratio: 0.03
+  # Warmup 后保持峰值学习率的比例；0 表示立即开始衰减。
   stable_ratio: 0.0
+  # 最终学习率相对峰值学习率的下限。
   min_lr_ratio: 0.1
+  # 稳定阶段后的学习率衰减曲线。
   decay_type: "cosine"
 
-# SFT 以完整 Epoch 数作为预算，而不是用 padding 后的最大长度估算 Token。
-# 实际最大步数 = floor(每个 Epoch 的 DataLoader Batch 数 / 梯度累积步数)
-#             × epochs，再由训练装配层向上取整。
+# SFT 以完整 Epoch 数作为预算。
 training:
+  # 训练数据完整遍历的轮数；SFT 必须设置该字段。
   epochs: 2.0
+  # 单卡单次前向的 Micro Batch 大小。
   micro_batch_size: 16
+  # 每次优化器更新前的梯度累计步数。
   gradient_accumulation_steps: 6
+  # 每隔多少优化器 Step 保存一次检查点。
   save_interval: 200
+  # 每隔多少优化器 Step 输出一次训练日志。
   log_interval: 10
+  # 实验输出父目录。
   output_dir: "./experiments"
+  # 当前实验名称；与 output_dir 共同确定运行目录。
   experiment_name: "taichu_80m_sft_v1"
+  # 是否启用自动混合精度。
   use_mixed_precision: true
+  # 混合精度计算类型；支持 bfloat16 或 float16。
   dtype: "bfloat16"
+  # 梯度裁剪的最大范数。
   max_grad_norm: 1.0
+  # 数据顺序、Dropout 和初始化的固定随机种子。
   seed: 42
+  # 是否使用 torch.compile 编译模型。
   compile_model: true
+  # torch.compile 模式。
   compile_mode: "default"
+  # 是否允许 torch.compile 为动态形状重新编译。
   compile_dynamic: true
+  # DDP 集合通信超时时间，单位分钟。
   distributed_timeout_minutes: 30
+  # 训练 DataLoader 运行时配置。
   dataloader:
+    # 是否将 Batch 固定到页锁定内存。
     pin_memory: true
+    # 是否在多 Epoch 训练中保留 Worker 进程。
     persistent_workers: true
+    # 是否丢弃最后一个不完整 Batch。
     drop_last: true
 
-# 验证 Loss 只统计 assistant 标签位置，最佳模型按该 Loss 选择。
+# 验证与生成诊断配置。
 evaluating:
+  # 验证 DataLoader 的 Batch 大小。
   batch_size: 16
+  # 每隔多少训练 Step 执行一次验证。
   eval_interval: 200
+  # 每隔多少验证 Batch 输出一次日志。
   log_interval: 10
+  # 是否计算空前缀条件下的 EOS 概率指标。
   empty_prefix_eos_ppl: false
+  # 验证后用于生成质量检查的 Prompt 列表。
   prompts:
+    # 中文概念解释 Prompt。
     - "请用中文解释什么是过拟合，并给出两个缓解方法。"
+    # 英文数学步骤 Prompt。
     - "Solve 3x + 7 = 22 and explain each step."
+    # 英文代码生成 Prompt。
     - "Write a Python function that returns the second largest unique value in a list."
+    # 中英文 SFT 概念对比 Prompt。
     - "用三句话比较监督微调与预训练的目标差异。"
+  # 每个 Prompt 最大生成的 Token 数。
   num_generate_tokens: 256
+  # 验证 DataLoader 运行时配置。
   dataloader:
+    # 是否将验证 Batch 固定到页锁定内存。
     pin_memory: true
+    # 是否保留验证 Worker 进程。
     persistent_workers: false
+    # 是否丢弃最后一个不完整验证 Batch。
     drop_last: false
 
+# 早停配置。
 early_stopping:
+  # 是否启用早停。
   enabled: false
+  # 早停监控指标；当前只支持 val_loss。
   monitor: "val_loss"
+  # 指标连续未改善时允许的最大验证次数。
   patience: 3
+  # 判定指标改善所需的最小变化量。
   min_delta: 1.0e-4
+  # 优化方向；min 表示指标越小越好。
   mode: "min"
 
+# SwanLab 实验跟踪配置。
 swanlab:
+  # 是否启用 SwanLab 日志。
   use_swanlab: true
+  # SwanLab 项目名称。
   swanlab_project: "TaiChu"
+  # SwanLab 实验名称。
   swanlab_experiment_name: "taichu_80m_sft"
+  # SwanLab 日志存放目录。
   swanlab_log_dir: "./experiments/taichu_80m_sft_v1/swanlogs"
+  # SwanLab 运行模式；online 表示上传到云端。
   swanlab_mode: "online"
+  # SwanLab 工作区；留空时使用账号默认工作区。
   swanlab_workspace: null
+  # 要恢复的 SwanLab 实验 ID。
   swanlab_id: null
+  # SwanLab 恢复策略；恢复已有 ID 时建议使用 "must"。
   swanlab_resume: null
+  # 其他官方 swanlab.init 参数。
   swanlab_init_kwargs: {}
