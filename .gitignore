@@ -36,7 +36,8 @@ desktop.ini
 node_modules/
 
 # Training and evaluation artifacts
-/experiments/
+/experiments/*
+!/experiments/README.md
 swanlogs/
 wandb/
 mlruns/
@@ -62,10 +63,9 @@ nohup.out
 .ipynb_checkpoints/
 
 # Large or generated datasets
-/data/raw/
-/data/packed/
-/data/processed/
-/data/unified/
+/data/eval/
+/data/pretrain/
+/data/sft/
 *.tcbin
 *.tcidx
 *.arrow
