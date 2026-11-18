@@ -41,6 +41,9 @@ CHAT_TEMPLATE = r"""{%- if messages and messages[0]['role'] == 'system' -%}
 {%- if add_generation_prompt -%}
     {%- if not (loop_messages and loop_messages[-1]['role'] == 'assistant') -%}
         {{- '<|taichu_start|>assistant\n' -}}
+        {%- if force_reasoning -%}
+            {{- '<|think|>\n' -}}
+        {%- endif -%}
     {%- endif -%}
 {%- endif -%}
 """

@@ -65,6 +65,11 @@ python -m chat --reasoning-mode auto
 思考模式必须与 SFT 数据协议一致。新 SFT 数据使用
 `reasoning_sample_ratio` 同时构建 think/no_think 样本。
 
+推理入口通过 Tokenizer 的 Chat Template 渲染强制思考前缀
+(`force_reasoning=True`)。思考区段会以 `[思考]` / `[/思考]` 标识，
+与正式回答分开显示。为避免小模型耗尽全部生成预算，思考段最多使用
+256 个新 Token；超限时自动闭合 `<|/think|>`，剩余预算用于正式回答。
+
 ## 交互命令
 
 | 命令 | 行为 |

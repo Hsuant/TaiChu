@@ -38,7 +38,11 @@ def parse_reasoning_tokens(
     end_think_token_id: int,
     decode: Callable[[Sequence[int]], str],
 ) -> ReasoningOutput:
-    """Split generated IDs into canonical reasoning and final answer spans."""
+    """Split generated IDs into canonical reasoning and final answer spans.
+
+    A started think block without a closing token remains reasoning; callers
+    must not present it as the formal answer.
+    """
     if mode is ReasoningMode.OFF:
         return ReasoningOutput(
             mode=mode,
@@ -60,8 +64,15 @@ def parse_reasoning_tokens(
     start = 1 if not forced else 0
     try:
         end = token_ids.index(end_think_token_id, start)
-    except ValueError as exc:
-        raise RuntimeError("thinking response did not emit <|/think|>") from exc
+    except ValueError:
+        # The model ran out of budget before closing the think block. Keep the
+        # text classified as reasoning so it is never shown as the answer.
+        return ReasoningOutput(
+            mode=mode,
+            thinking=True,
+            reasoning_text=decode(token_ids[start:]).strip(),
+            answer_text="",
+        )
     reasoning_ids = token_ids[start:end]
     answer_ids = token_ids[end + 1 :]
     return ReasoningOutput(

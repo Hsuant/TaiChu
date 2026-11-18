@@ -148,10 +148,11 @@ class Conversation:
         if self._system_prompt:
             messages.append({"role": "system", "content": self._system_prompt})
         messages.extend(message.as_dict() for message in body)
-        prompt = self._tokenizer.render(messages, add_generation_prompt=True)
-        if self._reasoning_mode is ReasoningMode.ON:
-            prompt += "<|think|>\n"
-        return prompt
+        return self._tokenizer.render(
+            messages,
+            add_generation_prompt=True,
+            force_reasoning=self._reasoning_mode is ReasoningMode.ON,
+        )
 
 
 __all__ = [

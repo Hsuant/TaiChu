@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -61,16 +61,29 @@ class TaiChuModel(nn.Module):
         output_head: 语言模型头
     """
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        *,
+        on_progress: Optional[Callable[[str], None]] = None,
+    ):
         """根据配置初始化模型。
 
         Args:
             config: 包含所有超参数的数据类，结构对应 YAML 文件
+            on_progress: 可选进度回调；用于推理加载时逐组件汇报构建状态
         """
         super().__init__()
         self.config = config
 
+        def report(message: str) -> None:
+            if on_progress is not None:
+                on_progress(message)
+
         # 词嵌入
+        report(
+            f"词嵌入层 ({config.vocab_size:,} x {config.hidden_size:,})"
+        )
         self.token_embedding = TokenEmbedding(
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
@@ -78,6 +91,7 @@ class TaiChuModel(nn.Module):
         )
 
         # 旋转位置编码
+        report("RoPE 位置编码")
         head_dim = config.hidden_size // config.num_attention_heads
         self.rope = RoPEPositionEncoding(
             head_dim=head_dim,
@@ -86,15 +100,19 @@ class TaiChuModel(nn.Module):
         )
 
         # Transformer 层堆叠
-        self.layers = nn.ModuleList([
-            TaiChuBlock(config, layer_idx=i)
-            for i in range(config.num_layers)
-        ])
+        self.layers = nn.ModuleList()
+        for layer_idx in range(config.num_layers):
+            report(
+                f"Transformer 层 {layer_idx + 1}/{config.num_layers}"
+            )
+            self.layers.append(TaiChuBlock(config, layer_idx=layer_idx))
 
         # 最终归一化层
+        report("最终 RMSNorm")
         self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         # 输出头
+        report("输出头")
         self.output_head = TaiChuOutputHead(
             hidden_size=config.hidden_size,
             vocab_size=config.vocab_size,
@@ -106,6 +124,7 @@ class TaiChuModel(nn.Module):
             self.output_head.linear.weight = self.token_embedding.embedding.weight
 
         # 初始化所有权重（除了已经初始化过的嵌入和输出头）
+        report("权重初始化")
         self.apply(self._init_weights)
 
     def _init_weights(self, module):

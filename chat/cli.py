@@ -6,7 +6,7 @@ import argparse
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from chat.config import ChatConfig, SamplingConfig, load_chat_config
 from chat.engine import ChatEngine, ReplyResult
@@ -124,7 +124,6 @@ def _print_banner(runtime: ChatRuntime, config: ChatConfig) -> None:
         f"max_new_tokens={config.sampling.max_new_tokens}"
     )
     print(f"思考模式: {config.reasoning_mode.value}")
-    print("提示: 当前为预训练基座权重，未经过 SFT/偏好对齐。")
     print(_HELP.rstrip())
 
 
@@ -146,6 +145,47 @@ def _print_stats(result: ReplyResult | None) -> None:
 def _write_chunk(text: str) -> None:
     sys.stdout.write(text)
     sys.stdout.flush()
+
+
+def _write_result(result: ReplyResult) -> None:
+    if result.thinking and result.reasoning_text:
+        _write_chunk("[思考]\n")
+        _write_chunk(result.reasoning_text)
+        _write_chunk("\n[/思考]\n\n")
+    if result.text:
+        _write_chunk(result.text)
+    elif result.thinking:
+        _write_chunk("[模型未输出正式回答]\n")
+
+
+def _stream_writers() -> tuple[
+    Callable[[str], None],
+    Callable[[str], None],
+    Callable[[], None],
+]:
+    reasoning_open = False
+
+    def on_reasoning(text: str) -> None:
+        nonlocal reasoning_open
+        if not reasoning_open:
+            _write_chunk("[思考]\n")
+            reasoning_open = True
+        _write_chunk(text)
+
+    def on_answer(text: str) -> None:
+        nonlocal reasoning_open
+        if reasoning_open:
+            _write_chunk("\n[/思考]\n\n")
+            reasoning_open = False
+        _write_chunk(text)
+
+    def close_reasoning() -> None:
+        nonlocal reasoning_open
+        if reasoning_open:
+            _write_chunk("\n[/思考]\n\n")
+            reasoning_open = False
+
+    return on_reasoning, on_answer, close_reasoning
 
 
 def run_interactive(
@@ -206,22 +246,35 @@ def run_interactive(
             continue
 
         print("太初 > ", end="", flush=True)
+        if stream:
+            on_reasoning, on_text, close_reasoning = _stream_writers()
+        else:
+            on_reasoning = on_text = close_reasoning = None
         try:
             last_result = engine.respond(
                 user_text,
                 stream=stream,
-                on_text=_write_chunk if stream else None,
+                on_text=on_text,
+                on_reasoning=on_reasoning,
             )
-            if not stream:
-                _write_chunk(last_result.text)
+            if stream:
+                close_reasoning()
+                if not last_result.text:
+                    _write_chunk("[模型未输出正式回答]\n")
+            else:
+                _write_result(last_result)
             print()
             if last_result.dropped_turns:
                 print(
                     f"[上下文已裁剪 {last_result.dropped_turns} 轮旧对话]"
                 )
         except KeyboardInterrupt:
+            if close_reasoning is not None:
+                close_reasoning()
             print("\n[已停止生成]")
         except (RuntimeError, ValueError) as exc:
+            if close_reasoning is not None:
+                close_reasoning()
             print(f"\n[生成失败: {exc}]")
 
 
@@ -229,16 +282,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         config = _apply_overrides(load_chat_config(args.config), args)
-        runtime = load_chat_runtime(config)
+        runtime = load_chat_runtime(config, show_progress=True)
         engine = _build_engine(runtime, config)
         if args.prompt is not None:
-            result = engine.respond(
-                args.prompt,
-                stream=not args.no_stream,
-                on_text=_write_chunk if not args.no_stream else None,
-            )
             if args.no_stream:
-                _write_chunk(result.text)
+                result = engine.respond(args.prompt, stream=False)
+                _write_result(result)
+            else:
+                on_reasoning, on_text, close_reasoning = _stream_writers()
+                try:
+                    result = engine.respond(
+                        args.prompt,
+                        stream=True,
+                        on_text=on_text,
+                        on_reasoning=on_reasoning,
+                    )
+                finally:
+                    close_reasoning()
+                if not result.text:
+                    _write_chunk("[模型未输出正式回答]\n")
             print()
             return 0
         _print_banner(runtime, config)

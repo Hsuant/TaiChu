@@ -18,6 +18,7 @@ class ChatTokenizer(Protocol):
         messages: Sequence[Mapping[str, str]],
         *,
         add_generation_prompt: bool = True,
+        force_reasoning: bool = False,
     ) -> str:
         ...
 
@@ -74,11 +75,13 @@ class HFChatTokenizer:
         messages: Sequence[Mapping[str, str]],
         *,
         add_generation_prompt: bool = True,
+        force_reasoning: bool = False,
     ) -> str:
         rendered = self._tokenizer.apply_chat_template(
             list(messages),
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
+            force_reasoning=force_reasoning,
         )
         if not isinstance(rendered, str):
             raise TypeError("chat template must render to a string")
