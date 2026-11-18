@@ -1,5 +1,5 @@
 # TaiChu 80M 预训练训练配置样例。
-# 数据来自 configs/prepare_pretrain_data.yaml 生成的 Unified Binary Dataset。
+# 数据来自 configs/prepare_pretrain_data.yaml 生成的 Parquet Dataset。
 #
 # 历史 190M 参考参数（不再单独维护运行文件）：
 #   target_tokens="7B", micro_batch_size=2, gradient_accumulation_steps=128
@@ -29,67 +29,15 @@ scheduler:
   # 稳定阶段后的学习率衰减曲线。
   decay_type: "cosine"
 
+# 预训练 Runtime 数据配置；与内联 data 不能同时出现。
+data_config: "./data_pretraining_unified.yaml"
+
 # Tokenizer 配置。
 tokenizer:
   # 训练入口实际加载的 Tokenizer 文件路径。
   path: "./taichu_tokenizer/tokenizer.json"
   # Tokenizer 后端；tokenizers 表示使用原生 Tokenizers 库。
   backend: "tokenizers"
-
-# 训练数据与 DataLoader 配置。
-data:
-  # 统一数据配置 Schema 版本。
-  schema_version: 1
-  # 训练任务类型；必须与 Binary Dataset 的样本类型匹配。
-  task_type: pretraining
-  # 数据集稳定标识；用于实验追踪和恢复校验。
-  dataset_id: taichu-pretraining-4b
-  # 二进制 mmap 存储配置。
-  storage:
-    # 存储后端类型；当前只支持 binary_mmap。
-    format: binary_mmap
-    # 训练集 Binary Dataset 示例目录。
-    train_path: "./data/unified/taichu_80m_4b/train"
-    # 验证集 Binary Dataset 示例目录。
-    validation_path: "./data/unified/taichu_80m_4b/validation"
-    # 每个 DataLoader worker 进程数；0 表示主进程读取。
-    num_workers: 2
-    # 每个 worker 预取 Batch 数。
-    prefetch_factor: 2
-  # 样本采样配置。
-  sampling:
-    # 采样策略；distributed 支持单卡和多卡 Rank 分片。
-    strategy: distributed
-    # 是否在每个 Epoch 重新打乱样本顺序。
-    shuffle: true
-    # 采样顺序的固定随机种子。
-    seed: 42
-    # 是否丢弃不足一个完整 Batch 的尾部样本。
-    drop_last: true
-  # Padding Token；必须与 Tokenizer 和数据处理配置一致。
-  pad_token: "<|pad|>"
-  # 文档起始 Token；必须与 Tokenizer 实际 ID 一致。
-  bos_token: "<|taichu_start|>"
-  # 文档结束 Token；必须与 Tokenizer 实际 ID 一致。
-  eos_token: "<|taichu_end|>"
-  # Runtime Packing 配置。
-  packing:
-    # 是否启用流式 Packing。
-    enabled: true
-    # Packing 策略；stream 表示跨样本拼接并保留 segment 边界。
-    strategy: stream
-    # 物理训练序列最大长度；必须包含 BOS/EOS。
-    max_seq_length: 2048
-    # Padding 后序列长度向上对齐的倍数。
-    pad_to_multiple_of: 8
-    # 是否丢弃不足一个完整 Packed Sequence 的尾部内容。
-    drop_last_remainder: false
-  # Batch 构造配置。
-  batching:
-    # Batch 策略；fixed_length 使用固定长度 Padding。
-    strategy: fixed_length
-    # Batch Tensor 序列长度向上对齐的倍数。
-    pad_to_multiple_of: 8
 
 # 训练循环配置。
 training:

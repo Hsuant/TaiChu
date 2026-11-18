@@ -136,7 +136,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def sample_to_storage(sample: CommonSample) -> tuple[dict[str, Any], dict[str, list]]:
-    """Split a typed sample into JSON metadata and binary numeric arrays."""
+    """Split a typed sample into JSON metadata and numeric array fields."""
     if not is_dataclass(sample):
         raise TypeError("sample must be a dataclass instance")
     sample_type = getattr(sample, "sample_type", "")

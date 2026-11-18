@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Prepare task-specific raw records into unified binary datasets."""
+"""Prepare task-specific raw records into unified offline datasets."""
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
 from collections.abc import Callable, Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from tokenizers import Tokenizer
 from tqdm import tqdm
 
-from ..storage import BinarySampleWriter
+from ..storage import ParquetSampleWriter
 from ..storage.fs import atomic_replace_directory
 from ..tasks import get_task
 from .adapters import (
@@ -156,6 +156,7 @@ class UnifiedDataPreparation:
                 "version": self.config.version,
                 "task_type": self.config.task_type,
                 "sample_type": self.task.sample_type,
+                "format": "parquet",
                 "splits": split_manifests,
             }
             with (staging / "dataset_manifest.json").open(
@@ -178,7 +179,7 @@ class UnifiedDataPreparation:
         staging: Path,
     ) -> dict[str, Any]:
         output = staging / split
-        writer = BinarySampleWriter(
+        writer = ParquetSampleWriter(
             output,
             dataset_id=f"{self.config.dataset_id}:{split}",
             sample_type=self.task.sample_type,
@@ -187,6 +188,7 @@ class UnifiedDataPreparation:
             metadata={
                 "task_type": self.config.task_type,
                 "split": split,
+                "storage_format": "parquet",
                 "tokenizer_path": str(self.config.tokenizer_path),
             },
         )
@@ -262,7 +264,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare document-aware pretraining data or generic task records "
-            "into unified binary storage"
+            "into unified offline storage"
         )
     )
     parser.add_argument("--config", required=True)
@@ -270,6 +272,18 @@ def main() -> None:
         "--restart",
         action="store_true",
         help="discard an existing incomplete staging directory before preparation",
+    )
+    parser.add_argument(
+        "--target-tokens",
+        default=None,
+        help="override selection.target_tokens for pretraining, e.g. 4B",
+    )
+    parser.add_argument(
+        "--mixture",
+        action="append",
+        default=None,
+        metavar="SOURCE=RATIO",
+        help="override pretraining source ratios; repeat for each source",
     )
     args = parser.parse_args()
     try:
@@ -283,8 +297,41 @@ def main() -> None:
         and raw_config.get("task_type") in {"pretraining", "cpt"}
     ):
         from .pretraining import PretrainingDataPreparation, load_pretraining_config
+        from .pretraining.config import _parse_token_count
 
         config = load_pretraining_config(args.config)
+        if args.target_tokens is not None or args.mixture is not None:
+            if config.selection is None:
+                raise ValueError(
+                    "--target-tokens and --mixture require a selection config"
+                )
+            selection = config.selection
+            target_tokens = selection.target_tokens
+            mixture = selection.mixture
+            if args.target_tokens is not None:
+                target_tokens = _parse_token_count(args.target_tokens)
+            if args.mixture is not None:
+                mixture = {}
+                for item in args.mixture:
+                    name, separator, ratio = item.partition("=")
+                    if not separator or not name.strip() or not ratio.strip():
+                        raise ValueError(
+                            f"invalid --mixture value {item!r}; expected SOURCE=RATIO"
+                        )
+                    if name.strip() in mixture:
+                        raise ValueError(f"duplicate --mixture source {name.strip()!r}")
+                    mixture[name.strip()] = float(ratio)
+            config = replace(
+                config,
+                selection=replace(
+                    selection,
+                    target_tokens=target_tokens,
+                    mixture=mixture,
+                    mixture_manifest_path=(
+                        None if args.mixture is not None else selection.mixture_manifest_path
+                    ),
+                ),
+            )
         manifest = PretrainingDataPreparation(config).run(restart=args.restart)
         print(json.dumps(manifest, ensure_ascii=False, indent=2))
         return

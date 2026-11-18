@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from tqdm import tqdm
 
-from ...storage import BinaryDatasetReader
+from ...storage import ParquetDatasetReader
 from ..adapters import TextTokenizer
 from .config import PretrainingConfig
 from .segmentation import sliding_window_bounds
@@ -177,7 +177,7 @@ def build_manifest(
         mininterval=1.0,
     )
     for split in split_manifests:
-        with BinaryDatasetReader(staging / split) as reader:
+        with ParquetDatasetReader(staging / split) as reader:
             for metadata in reader.iter_metadata():
                 source = sources[str(metadata["source_id"])]
                 language = languages[str(metadata["metadata"]["language"])]
@@ -207,15 +207,16 @@ def build_manifest(
     storage = {
         split: {
             "samples": int(payload["sample_count"]),
-            "binary_storage_bytes": int(payload["stats"]["storage_bytes"]),
-            "binary_storage_gb": float(payload["stats"]["storage_gb"]),
+            "storage_format": config.format,
+            "storage_bytes": int(payload["stats"]["storage_bytes"]),
+            "storage_gb": float(payload["stats"]["storage_gb"]),
             "logical_input_gb": float(payload["stats"]["logical_input_gb"]),
             "loss_target_gb": float(payload["stats"]["loss_target_gb"]),
         }
         for split, payload in split_manifests.items()
     }
     total_storage_bytes = sum(
-        value["binary_storage_bytes"] for value in storage.values()
+        value["storage_bytes"] for value in storage.values()
     )
     source_shares = {
         name: value["unique_tokens"] / unique_tokens
@@ -296,12 +297,13 @@ def build_manifest(
             },
                 "storage": {
                     "splits": storage,
-                    "total_binary_storage_bytes": total_storage_bytes,
-                    "total_binary_storage_gb": (
+                    "format": config.format,
+                    "total_storage_bytes": total_storage_bytes,
+                    "total_storage_gb": (
                         total_storage_bytes / 1_000_000_000
                     ),
                     "definition": (
-                        "binary_storage_gb is the actual tcbin+tcidx size; "
+                        "storage_gb is the actual published shard size; "
                         "logical_input_gb is window_input_tokens*4 bytes; "
                         "loss_target_gb is supervised_tokens*4 bytes"
                     ),
@@ -340,6 +342,7 @@ def _config_snapshot(config: PretrainingConfig) -> dict[str, Any]:
         "version": config.version,
         "tokenizer_path": str(config.tokenizer_path),
         "output_dir": str(config.output_dir),
+        "format": config.format,
         "text_column": config.text_column,
         "pad_token": config.pad_token,
         "bos_token": config.bos_token,
@@ -357,7 +360,8 @@ def _config_snapshot(config: PretrainingConfig) -> dict[str, Any]:
                 **asdict(config.selection),
                 "mixture_manifest_path": str(
                     config.selection.mixture_manifest_path
-                ),
+                ) if config.selection.mixture_manifest_path is not None else None,
+                "mixture": config.selection.mixture,
             }
             if config.selection is not None
             else None

@@ -1,4 +1,4 @@
-"""Unified PyTorch DataLoader integration for indexed binary datasets."""
+"""Unified PyTorch DataLoader integration for indexed offline datasets."""
 from __future__ import annotations
 
 from typing import Any
@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from ..config import UnifiedDataConfig
 from ..exceptions import TaiChuConfigurationError
 from ..sampling import DistributedSampler, RandomSampler
-from ..storage import BinaryDatasetReader
+from ..storage import ParquetDatasetReader
 from ..tasks import get_task
 from .dataset import IndexedTokenDataset
 
@@ -108,6 +108,27 @@ class UnifiedDataLoaderFactory:
             raise TaiChuConfigurationError("rank must be in [0, world_size)")
         return int(rank), int(world_size)
 
+    def _validate_dataset_identity(self, reader, split: str) -> None:
+        canonical_split = (
+            "train"
+            if split in {"train", "training"}
+            else "validation"
+            if split in {"validation", "valid", "eval", "test"}
+            else split
+        )
+        expected_ids = {
+            self.config.dataset_id,
+            f"{self.config.dataset_id}:{canonical_split}",
+        }
+        if reader.dataset_id not in expected_ids:
+            actual_id = reader.dataset_id
+            reader.close()
+            raise TaiChuConfigurationError(
+                f"dataset identity mismatch for split {split!r}: "
+                f"configured {self.config.dataset_id!r}, manifest contains "
+                f"{actual_id!r}"
+            )
+
     def create(
         self,
         *,
@@ -123,7 +144,7 @@ class UnifiedDataLoaderFactory:
         if int(batch_size) <= 0:
             raise TaiChuConfigurationError("batch_size must be positive")
         rank, world_size = self._distributed_context(rank, world_size)
-        reader = BinaryDatasetReader(
+        reader = ParquetDatasetReader(
             self.config.storage.path_for(split),
             checksums=self.config.storage.verify_checksums,
         )
@@ -133,6 +154,7 @@ class UnifiedDataLoaderFactory:
                 f"task {self.config.task_type!r} expects {self.task.sample_type!r} "
                 f"but dataset contains {reader.sample_type!r}"
             )
+        self._validate_dataset_identity(reader, split)
         dataset = IndexedTokenDataset(reader)
         strategy = self.config.sampling.strategy
         if strategy == "pair_aware":
@@ -248,8 +270,42 @@ def build_sft_data_loader(
     )
 
 
+def build_pretrain_data_loader(
+    config: UnifiedDataConfig,
+    *,
+    pad_token_id: int,
+    batch_size: int,
+    split: str = "train",
+    rank: int | None = None,
+    world_size: int | None = None,
+    num_workers: int | None = None,
+    pin_memory: bool = True,
+    persistent_workers: bool = False,
+    drop_last: bool | None = None,
+) -> UnifiedDataLoader:
+    """Build a pretraining loader over the Parquet dataset backend."""
+    if config.task_type not in {"pretraining", "cpt"}:
+        raise TaiChuConfigurationError(
+            "pretraining loader requires task_type='pretraining' or 'cpt'"
+        )
+    return UnifiedDataLoaderFactory(
+        config,
+        pad_token_id=pad_token_id,
+    ).create(
+        split=split,
+        batch_size=batch_size,
+        rank=rank,
+        world_size=world_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        drop_last=drop_last,
+    )
+
+
 __all__ = [
     "UnifiedDataLoader",
     "UnifiedDataLoaderFactory",
+    "build_pretrain_data_loader",
     "build_sft_data_loader",
 ]

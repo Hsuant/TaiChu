@@ -1,5 +1,5 @@
 # 通用轨迹数据离线构建配置样例。
-# 原始轨迹经清洗、去重和分词后写入 Unified Binary Dataset。
+# 原始轨迹经清洗、去重和分词后写入 Unified Parquet Dataset。
 #
 # 使用说明：
 #   1. splits 中的路径均为项目内示例，不指向真实数据。
@@ -17,14 +17,14 @@ version: "1"
 
 # Tokenizer JSON 路径；必须与训练模型词表一致。
 tokenizer_path: "./taichu_tokenizer/tokenizer.json"
-# Unified Binary Dataset 输出目录。
+# Unified Parquet Dataset 输出目录。
 output_dir: "./data/unified/trajectory"
 
 # 是否在每条记录末尾追加 EOS Token。
 add_eos: true
 # 非法记录策略；error 立即失败，skip 跳过并记录。
 invalid_policy: "error"
-# 每个 Binary Shard 最多写入的样本数。
+# 每个 Parquet Shard 最多写入的样本数。
 shard_size: 50000
 
 # Padding Token；必须存在于 Tokenizer 词表中。

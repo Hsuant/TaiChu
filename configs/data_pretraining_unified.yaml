@@ -1,8 +1,8 @@
 # 通用预训练 Runtime 数据配置样例。
-# 该文件只描述训练时如何读取 Binary Dataset，不负责原始数据抽样与 Tokenization。
+# 该文件只描述训练时如何读取离线数据集，不负责原始数据抽样与 Tokenization。
 #
 # 使用说明：
-#   1. 先运行 prepare_pretrain_data.yaml 生成 Binary Dataset。
+#   1. 先运行 prepare_pretrain_data.yaml 生成 Parquet Dataset。
 #   2. 下列路径是项目内示例；数据生成到其他位置时同步替换。
 #   3. dataset_id 必须与 prepare manifest 和训练配置一致。
 
@@ -15,15 +15,15 @@ data:
   # 数据集稳定标识；断点恢复会校验该值。
   dataset_id: taichu-pretraining-4b
 
-  # Binary Dataset 存储与读取配置。
+  # 离线 Dataset 存储与读取配置。
   storage:
-    # 存储后端类型；当前只支持 binary_mmap。
-    format: binary_mmap
-    # 训练集 Binary Dataset 目录。
+    # 存储后端类型；预训练默认使用 Parquet。
+    format: parquet
+    # 训练集 Dataset 目录。
     train_path: ./data/unified/taichu_80m_4b/train
-    # 验证集 Binary Dataset 目录。
+    # 验证集 Dataset 目录。
     validation_path: ./data/unified/taichu_80m_4b/validation
-    # 是否校验 Bin/Index 文件校验和；会增加启动与读取开销。
+    # 是否校验 Parquet 文件校验和；会增加启动与读取开销。
     verify_checksums: false
     # 每个 DataLoader 的子进程数；0 表示主进程读取。
     num_workers: 4

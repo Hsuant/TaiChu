@@ -1,5 +1,5 @@
 # TaiChu 通用 SFT Runtime 数据配置。
-# 该文件只负责训练时读取 unified Binary Dataset；source 构建和 tokenization
+# 该文件只负责训练时读取 unified Parquet Dataset；source 构建和 tokenization
 # 由 configs/prepare_sft_data.yaml 控制。
 #
 # 使用说明：
@@ -14,10 +14,10 @@ data:
   # 必须与 prepare_sft_data.yaml 中的 dataset_id 保持一致。
   dataset_id: taichu-sft-80m-v1
 
-  # Binary Dataset 存储位置与读取并发配置。
+  # Parquet Dataset 存储位置与读取并发配置。
   storage:
     # 当前支持的训练存储格式。
-    format: binary_mmap
+    format: parquet
     # 由通用 SFT 构建流程生成的 source=unified 输出。
     train_path: "./data/SFT/unified/80m_v1/train"
     # 与训练集同源的验证集目录；启用验证时必须存在。

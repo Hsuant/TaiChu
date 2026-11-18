@@ -13,7 +13,7 @@ from ..exceptions import TaiChuDataFormatError
 
 
 MANIFEST_NAME = "manifest.json"
-STORAGE_FORMAT = "taichu-binary-v1"
+STORAGE_FORMAT = "taichu-parquet-v1"
 
 
 def _sha256_file(path: Path) -> str:
@@ -24,31 +24,19 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _fingerprint(shards: list[dict[str, Any]]) -> str:
-    digest = hashlib.sha256()
-    for shard in shards:
-        digest.update(str(shard["path"]).encode("utf-8"))
-        digest.update(str(shard["sha256"]).encode("ascii"))
-    return digest.hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class ShardInfo:
     path: str
-    index_path: str
     samples: int
     bytes: int
     sha256: str
-    index_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "path": self.path,
-            "index_path": self.index_path,
             "samples": self.samples,
             "bytes": self.bytes,
             "sha256": self.sha256,
-            "index_sha256": self.index_sha256,
         }
 
 
@@ -187,16 +175,11 @@ class DatasetManifest:
             dataset_root = dataset_root.parent
         for shard in self.shards:
             data_path = dataset_root / shard.path
-            index_path = dataset_root / shard.index_path
-            if not data_path.is_file() or not index_path.is_file():
+            if not data_path.is_file():
                 raise FileNotFoundError(f"missing storage shard {shard.path}")
             if checksums:
                 if _sha256_file(data_path) != shard.sha256:
                     raise TaiChuDataFormatError(f"checksum mismatch: {shard.path}")
-                if _sha256_file(index_path) != shard.index_sha256:
-                    raise TaiChuDataFormatError(
-                        f"index checksum mismatch: {shard.index_path}"
-                    )
 
     def write(self, directory: str | Path) -> Path:
         root = Path(directory)
@@ -217,22 +200,20 @@ def build_manifest(
     dataset_id: str,
     sample_type: str,
     version: str,
-    shard_files: list[tuple[Path, Path, int]],
+    shard_files: list[tuple[Path, int]],
     root: Path,
     metadata: dict[str, Any] | None = None,
     parent_version: str | None = None,
     checksums: bool = True,
 ) -> DatasetManifest:
     shards = []
-    for data_path, index_path, samples in shard_files:
+    for data_path, samples in shard_files:
         shards.append(
             ShardInfo(
                 path=data_path.relative_to(root).as_posix(),
-                index_path=index_path.relative_to(root).as_posix(),
                 samples=samples,
                 bytes=data_path.stat().st_size,
                 sha256=_sha256_file(data_path) if checksums else "",
-                index_sha256=_sha256_file(index_path) if checksums else "",
             )
         )
     manifest = DatasetManifest(

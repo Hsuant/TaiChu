@@ -8,7 +8,7 @@ canonical ``messages`` 记录；输出固定包含：
 ``source/``
     清洗、去重和配额选择后的可读 JSONL。
 ``train/`` and ``validation/``
-    由紧凑 token cache 直接生成的训练与验证 Binary Dataset。
+    由紧凑 token cache 直接生成的训练与验证 Parquet Dataset。
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ class SFTBuildConfig:
     tokenizer_path: Path
     output_dir: Path
 
-    # Binary Dataset 身份。训练恢复和实验追踪依赖这两个字段。
+    # Dataset 身份。训练恢复和实验追踪依赖这两个字段。
     dataset_id: str
     version: str = "1"
     profile: str = "default"
@@ -81,7 +81,7 @@ class SFTBuildConfig:
     assistant_only_loss: bool = True
     train_on_eos: bool = True
 
-    # unified Binary Dataset 的 shard 与预处理批大小。
+    # unified Parquet Dataset 的 shard 与预处理批大小。
     shard_size: int = 50_000
     preprocess_batch_size: int = 1024
 

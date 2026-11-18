@@ -7,7 +7,7 @@
 #   -> cluster 级 train/validation/diagnostic 隔离
 #   -> 完整文档 Tokenization
 #   -> 2046 Token 滑窗、128 Token 重叠、1918 Token 步长
-#   -> Binary Shard 与 Manifest
+#   -> Parquet Shard 与 Manifest
 #
 # 运行：
 #   # 先按 sample_pretrain_80m.yaml 替换来源样例路径并完成抽样。
@@ -26,6 +26,9 @@ tokenizer_path: "./taichu_tokenizer/tokenizer.json"
 # 处理后数据集的输出目录；目录已存在时不会覆盖。
 output_dir: "./data/unified/taichu_80m_4b"
 
+# 最终训练数据存储格式；预训练发布为 row-group 可流式读取的 Parquet。
+format: "parquet"
+
 # 任务类型；预训练固定为 pretraining，增量预训练可使用 cpt。
 task_type: "pretraining"
 
@@ -33,7 +36,7 @@ task_type: "pretraining"
 dataset_id: "taichu-pretraining-4b"
 
 # 数据处理版本；处理逻辑或输入语义变化时应同步升级。
-version: "2"
+version: "1"
 
 # 原始 JSONL/Parquet 记录中正文文本的字段名。
 text_column: "text"
@@ -50,7 +53,7 @@ eos_token: "<|taichu_end|>"
 # 非法记录策略；error 立即失败并保留错误上下文，skip 隔离错误记录后继续。
 invalid_policy: "error"
 
-# 每个 Binary Shard 最多写入的样本数；影响文件大小和读取并行度。
+# 每个 Parquet Shard 最多写入的样本数；影响文件大小和读取并行度。
 shard_size: 50000
 
 # 指纹计算与 Tokenization 并行进程数；建议不超过物理 CPU 核心数。
@@ -59,7 +62,8 @@ processing_workers: 10
 # 输出阶段使用单线程 Tokenizer 的并行进程数。
 output_workers: 16
 
-# 每个多进程任务包含的文档数；过大增加内存峰值，过小降低并行效率。
+# 每个多进程任务包含的文档数，同时用于批量 LSH 查询与写入；
+# 过大增加内存峰值，过小降低并行和 SQLite 批处理效率。
 fingerprint_batch_size: 256
 
 # 长文档滑窗与特殊 Token 长度约束。
@@ -91,11 +95,11 @@ dedup:
 # 固定、可复现的数据集划分配置。
 splits:
   # 训练集目标比例。
-  train_ratio: 0.99
+  train_ratio: 0.992
   # 主验证集目标比例。
-  validation_ratio: 0.005
+  validation_ratio: 0.002
   # 来源诊断集目标比例。
-  diagnostic_ratio: 0.005
+  diagnostic_ratio: 0.006
   # 划分 Hash 的固定随机种子；不得随训练轮次改变。
   seed: 42
 
@@ -121,6 +125,10 @@ cleaning:
 selection:
   # 最终训练集非 padding input token 目标。
   target_tokens: "4B"
+  # 可直接指定来源比例；键必须与 sources.name 完全一致。
+  # 例如：{fineweb2_zh: 0.20, industrycorpus_zh: 0.20, ...}
+  # mixture 与 mixture_manifest_path 二选一。
+  # mixture: {}
   # 数据抽样阶段生成的来源目标比例。
   mixture_manifest_path: "./data/raw/taichu_80m_4b/sampling_manifest.json"
   # 当前只支持非 padding input token 配额。

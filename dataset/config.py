@@ -8,9 +8,17 @@ from typing import Any
 from .exceptions import TaiChuConfigurationError
 
 
+def normalize_storage_format(value: str) -> str:
+    if str(value) != "parquet":
+        raise TaiChuConfigurationError(
+            "storage.format must be 'parquet'"
+        )
+    return "parquet"
+
+
 @dataclass(frozen=True, slots=True)
 class StorageConfig:
-    format: str = "binary_mmap"
+    format: str = "parquet"
     train_path: str | Path = ""
     validation_path: str | Path | None = None
     verify_checksums: bool = False
@@ -18,10 +26,7 @@ class StorageConfig:
     prefetch_factor: int = 2
 
     def __post_init__(self) -> None:
-        if self.format != "binary_mmap":
-            raise TaiChuConfigurationError(
-                "storage.format currently supports only 'binary_mmap'"
-            )
+        object.__setattr__(self, "format", normalize_storage_format(self.format))
         if not self.train_path:
             raise TaiChuConfigurationError("storage.train_path is required")
         if self.num_workers < 0:
@@ -195,4 +200,5 @@ __all__ = [
     "StorageConfig",
     "UnifiedDataConfig",
     "UnifiedPackingConfig",
+    "normalize_storage_format",
 ]

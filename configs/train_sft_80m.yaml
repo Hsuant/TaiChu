@@ -4,7 +4,7 @@
 # SFT Runtime 数据配置的相对路径；不能与内联 data 同时出现。
 data_config: "./data_sft_unified.yaml"
 
-# Tokenizer 必须与预训练基座和 Binary Dataset 完全一致。
+# Tokenizer 必须与预训练基座和 Parquet Dataset 完全一致。
 tokenizer:
   # Tokenizer JSON 文件路径。
   path: "./taichu_tokenizer/tokenizer.json"

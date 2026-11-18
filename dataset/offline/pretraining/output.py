@@ -14,9 +14,9 @@ from typing import Any, Mapping
 from tqdm import tqdm
 
 from ...storage import (
-    BinaryDatasetReader,
-    BinarySampleWriter,
-    BinaryShardReader,
+    ParquetDatasetReader,
+    ParquetSampleWriter,
+    ParquetShardReader,
     ShardInfo,
     atomic_replace_directory,
 )
@@ -34,7 +34,6 @@ def _select_shard(
         int,
         str,
         str,
-        str,
         bytes,
         int,
         str,
@@ -46,7 +45,6 @@ def _select_shard(
     (
         part_index,
         data_path,
-        index_path,
         part_root,
         mask,
         sample_count,
@@ -56,8 +54,8 @@ def _select_shard(
         metadata,
     ) = task
     output_dir = Path(part_root) / f"part-{part_index:05d}"
-    reader = BinaryShardReader(data_path, index_path)
-    writer = BinarySampleWriter(
+    reader = ParquetShardReader(data_path)
+    writer = ParquetSampleWriter(
         output_dir,
         dataset_id=f"{dataset_id}:part-{part_index:05d}",
         sample_type="pretraining",
@@ -130,7 +128,7 @@ def verify_split_isolation(
         mininterval=1.0,
     ) as progress:
         for split in manifests:
-            with BinaryDatasetReader(staging / split) as reader:
+            with ParquetDatasetReader(staging / split) as reader:
                 for metadata in reader.iter_metadata():
                     parents.setdefault(
                         metadata["metadata"]["parent_document_id"],
@@ -155,6 +153,31 @@ def verify_split_isolation(
     }
 
 
+def _normalize_mixture_weights(
+    weights: Mapping[str, float],
+) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for name, value in weights.items():
+        source = str(name).strip()
+        if not source:
+            raise ValueError("mixture source name cannot be empty")
+        weight = float(value)
+        if weight <= 0:
+            raise ValueError(
+                f"mixture source {source!r} needs a positive weight"
+            )
+        if source in normalized:
+            raise ValueError(f"duplicate mixture source {source!r}")
+        normalized[source] = weight
+    total = sum(normalized.values())
+    if total <= 0:
+        raise ValueError("mixture must contain at least one positive weight")
+    return {
+        name: weight / total
+        for name, weight in normalized.items()
+    }
+
+
 def _load_mixture_weights(path: str | Path) -> dict[str, float]:
     with Path(path).open("r", encoding="utf-8") as stream:
         payload = json.load(stream)
@@ -168,6 +191,8 @@ def _load_mixture_weights(path: str | Path) -> dict[str, float]:
         name = str(source.get("name", ""))
         if not name:
             raise ValueError("mixture manifest source name cannot be empty")
+        if name in weights:
+            raise ValueError(f"duplicate mixture manifest source {name!r}")
         value = source.get("target_bytes", source.get("weight_gb"))
         weight = float(value)
         if weight <= 0:
@@ -175,8 +200,26 @@ def _load_mixture_weights(path: str | Path) -> dict[str, float]:
                 f"mixture manifest source {name!r} needs a positive target"
             )
         weights[name] = weight
-    total = sum(weights.values())
-    return {name: weight / total for name, weight in weights.items()}
+    return _normalize_mixture_weights(weights)
+
+
+def _resolve_mixture_weights(
+    *,
+    mixture: Mapping[str, float] | None,
+    mixture_manifest_path: str | Path | None,
+) -> tuple[dict[str, float], str]:
+    if mixture is not None and mixture_manifest_path is not None:
+        raise ValueError(
+            "mixture and mixture_manifest_path are mutually exclusive"
+        )
+    if mixture is not None:
+        return _normalize_mixture_weights(mixture), "inline"
+    if mixture_manifest_path is None:
+        raise ValueError("mixture or mixture_manifest_path is required")
+    return (
+        _load_mixture_weights(mixture_manifest_path),
+        str(Path(mixture_manifest_path)),
+    )
 
 
 def _allocate_token_quotas(
@@ -259,11 +302,8 @@ def _rebalance_quotas(
     return effective, reallocations
 
 
-def _storage_bytes(root: Path, manifest: DatasetManifest) -> int:
-    return sum(
-        shard.bytes + (root / shard.index_path).stat().st_size
-        for shard in manifest.shards
-    )
+def _storage_bytes(manifest: DatasetManifest) -> int:
+    return sum(shard.bytes for shard in manifest.shards)
 
 
 def existing_split_manifests(
@@ -272,6 +312,7 @@ def existing_split_manifests(
     dataset_id: str,
     version: str,
     tokenizer_version: str,
+    processing_version: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     manifests: dict[str, dict[str, Any]] = {}
     for split in ("train", "validation", "diagnostic"):
@@ -289,7 +330,7 @@ def existing_split_manifests(
             "special_tokens": 0,
         }
         previous_parent = None
-        with BinaryDatasetReader(split_path) as reader:
+        with ParquetDatasetReader(split_path) as reader:
             with tqdm(
                 total=len(reader),
                 desc=f"inspect {split} manifest",
@@ -325,9 +366,14 @@ def existing_split_manifests(
             or manifest.version != version
             or manifest.metadata.get("tokenizer_version")
             != tokenizer_version
+            or (
+                processing_version is not None
+                and manifest.metadata.get("processing_version")
+                != processing_version
+            )
         ):
             continue
-        storage_bytes = _storage_bytes(split_path, manifest)
+        storage_bytes = _storage_bytes(manifest)
         stats["storage_bytes"] = storage_bytes
         stats["storage_gb"] = storage_bytes / 1_000_000_000
         stats["logical_input_gb"] = stats["input_tokens"] * 4 / 1_000_000_000
@@ -346,7 +392,8 @@ def select_pretraining_split(
     output: str | Path,
     *,
     target_tokens: int,
-    mixture_manifest_path: str | Path,
+    mixture_manifest_path: str | Path | None = None,
+    mixture: Mapping[str, float] | None = None,
     dataset_id: str,
     version: str,
     metric: str = "input_tokens",
@@ -365,12 +412,15 @@ def select_pretraining_split(
         raise ValueError("pretraining token selection supports input_tokens only")
     if seed < 0:
         raise ValueError("selection seed cannot be negative")
-    weights = _load_mixture_weights(mixture_manifest_path)
+    weights, mixture_source = _resolve_mixture_weights(
+        mixture=mixture,
+        mixture_manifest_path=mixture_manifest_path,
+    )
     quotas = _allocate_token_quotas(weights, target_tokens)
 
     source_path = Path(source)
     output_path = Path(output)
-    with BinaryDatasetReader(source_path) as reader:
+    with ParquetDatasetReader(source_path) as reader:
         if reader.sample_type != "pretraining":
             raise ValueError("token selection requires a pretraining dataset")
         indices_by_source: dict[str, list[int]] = defaultdict(list)
@@ -396,20 +446,39 @@ def select_pretraining_split(
             dynamic_ncols=True,
             mininterval=1.0,
         ) as progress:
-            for index in range(len(reader)):
-                metadata = reader.metadata_at(index)
+            for index, metadata in enumerate(reader.iter_metadata()):
                 source_name = str(metadata.get("source_id", ""))
                 if not source_name:
                     raise ValueError(f"sample {index} has no source_id")
                 sample_metadata = metadata.get("metadata", {})
-                input_tokens = int(sample_metadata["input_token_count"])
-                loss_tokens = int(sample_metadata["loss_token_count"])
-                content_tokens = int(sample_metadata["segment_token_count"])
-                overlap_tokens = int(sample_metadata["overlap_token_count"])
-                special_tokens = (
-                    int(bool(sample_metadata["has_bos"]))
-                    + int(bool(sample_metadata["has_eos"]))
+                if not isinstance(sample_metadata, Mapping):
+                    raise ValueError(f"sample {index} metadata must be a mapping")
+                input_tokens = int(
+                    metadata.get(
+                        "_storage_input_tokens",
+                        sample_metadata.get("input_token_count", 0),
+                    )
                 )
+                loss_tokens = int(
+                    metadata.get(
+                        "_storage_loss_tokens",
+                        sample_metadata.get("loss_token_count", input_tokens),
+                    )
+                )
+                content_tokens = int(
+                    sample_metadata.get("segment_token_count", input_tokens)
+                )
+                overlap_tokens = int(
+                    sample_metadata.get("overlap_token_count", 0)
+                )
+                special_tokens = (
+                    int(bool(sample_metadata.get("has_bos", False)))
+                    + int(bool(sample_metadata.get("has_eos", False)))
+                )
+                if input_tokens <= 0:
+                    raise ValueError(
+                        f"sample {index} has no non-padding input tokens"
+                    )
                 input_counts.append(input_tokens)
                 loss_counts.append(loss_tokens)
                 content_counts.append(content_tokens)
@@ -501,7 +570,12 @@ def select_pretraining_split(
             "metric": metric,
             "target_tokens": target_tokens,
             "seed": seed,
-            "mixture_manifest_path": str(Path(mixture_manifest_path)),
+            "mixture_source": mixture_source,
+            "mixture_manifest_path": (
+                str(Path(mixture_manifest_path))
+                if mixture_manifest_path is not None
+                else None
+            ),
             "source_weights": weights,
             "source_quotas": quotas,
             "source_effective_quotas": effective_quotas,
@@ -551,7 +625,6 @@ def select_pretraining_split(
                 int,
                 str,
                 str,
-                str,
                 bytes,
                 int,
                 str,
@@ -567,7 +640,6 @@ def select_pretraining_split(
                 (
                     part_index,
                     str(reader.root / shard.path),
-                    str(reader.root / shard.index_path),
                     str(part_root),
                     bytes(selected[sample_start:sample_end]),
                     shard.samples,
@@ -631,24 +703,17 @@ def select_pretraining_split(
                 part_manifest = DatasetManifest.load(part_path)
                 for shard in part_manifest.shards:
                     number = len(final_shards)
-                    data_name = f"data-{number:05d}.tcbin"
-                    index_name = f"data-{number:05d}.tcidx"
+                    data_name = f"data-{number:05d}.parquet"
                     os.replace(
                         Path(part_path) / shard.path,
                         staging / data_name,
                     )
-                    os.replace(
-                        Path(part_path) / shard.index_path,
-                        staging / index_name,
-                    )
                     final_shards.append(
                         ShardInfo(
                             path=data_name,
-                            index_path=index_name,
                             samples=shard.samples,
                             bytes=(staging / data_name).stat().st_size,
                             sha256=shard.sha256,
-                            index_sha256=shard.index_sha256,
                         )
                     )
             if not final_shards:
@@ -662,6 +727,7 @@ def select_pretraining_split(
                 metadata={
                     **base_metadata,
                     "selection": report,
+                    "storage_format": "parquet",
                 },
             ).with_content_hash()
             manifest.write(staging)
@@ -675,8 +741,9 @@ def select_pretraining_split(
             )
             raise
 
-    report["storage_bytes"] = _storage_bytes(output_path, manifest)
+    report["storage_bytes"] = _storage_bytes(manifest)
     report["storage_gb"] = report["storage_bytes"] / 1_000_000_000
+    report["storage_format"] = "parquet"
     return manifest, report
 
 
@@ -694,6 +761,7 @@ def apply_training_selection(
         selected,
         target_tokens=config.selection.target_tokens,
         mixture_manifest_path=config.selection.mixture_manifest_path,
+        mixture=config.selection.mixture,
         dataset_id=config.dataset_id,
         version=config.version,
         metric=config.selection.metric,
@@ -712,7 +780,7 @@ def apply_training_selection(
     samples = int(report["selected_samples"])
     documents = 0
     previous_parent = None
-    with BinaryDatasetReader(source) as reader:
+    with ParquetDatasetReader(source) as reader:
         with tqdm(
             total=len(reader),
             desc="inspect selected train",

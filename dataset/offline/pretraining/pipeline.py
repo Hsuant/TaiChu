@@ -38,7 +38,7 @@ from .store import get_state, open_store, record_error, set_state
 from .tokenization import initialize_tokenizer_worker, tokenize_batch
 
 
-PROCESSING_VERSION = "document-aware"
+PROCESSING_VERSION = "document-aware-parquet-v1"
 COMMIT_INTERVAL_DOCUMENTS = 5_000
 
 
@@ -91,7 +91,7 @@ def _tokenizer_version(path: Path) -> str:
 
 
 class PretrainingDataPreparation:
-    """Prepare raw documents into immutable pretraining binary datasets."""
+    """Prepare raw documents into immutable pretraining datasets."""
 
     def __init__(self, config: PretrainingConfig) -> None:
         if not config.tokenizer_path.is_file():
@@ -137,10 +137,11 @@ class PretrainingDataPreparation:
                 dataset_id=self.config.dataset_id,
                 version=self.config.version,
                 tokenizer_version=self.tokenizer_version,
+                processing_version=PROCESSING_VERSION,
             )
             if all(split in existing_splits for split in expected_splits):
                 print(
-                    "reusing existing binary split manifests",
+                    "reusing existing split manifests",
                     flush=True,
                 )
                 split_manifests = {

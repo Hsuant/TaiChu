@@ -1,4 +1,4 @@
-"""Canonical offline task preprocessing and binary dataset preparation."""
+"""Canonical offline task preprocessing and Parquet dataset preparation."""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any

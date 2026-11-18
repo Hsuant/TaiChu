@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ...config import normalize_storage_format
 from ..config import CleaningConfig
 
 
@@ -130,15 +131,51 @@ class PretrainingSource:
 @dataclass(frozen=True, slots=True)
 class TokenSelectionConfig:
     target_tokens: int
-    mixture_manifest_path: Path
+    mixture_manifest_path: Path | None = None
     metric: str = "input_tokens"
     seed: int = 42
+    mixture: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         if self.target_tokens <= 0:
             raise ValueError("selection.target_tokens must be positive")
-        if not str(self.mixture_manifest_path):
-            raise ValueError("selection.mixture_manifest_path is required")
+        if self.mixture_manifest_path is None and self.mixture is None:
+            raise ValueError(
+                "selection requires mixture or mixture_manifest_path"
+            )
+        if self.mixture_manifest_path is not None and self.mixture is not None:
+            raise ValueError(
+                "selection must set exactly one of mixture or "
+                "mixture_manifest_path"
+            )
+        if self.mixture_manifest_path is not None:
+            object.__setattr__(
+                self,
+                "mixture_manifest_path",
+                Path(self.mixture_manifest_path),
+            )
+        if self.mixture is not None:
+            if not isinstance(self.mixture, dict) or not self.mixture:
+                raise ValueError("selection.mixture must be a non-empty mapping")
+            normalized: dict[str, float] = {}
+            for name, value in self.mixture.items():
+                source = str(name).strip()
+                if not source:
+                    raise ValueError("selection.mixture source names cannot be empty")
+                try:
+                    weight = float(value)
+                except (TypeError, ValueError) as exc:
+                    raise TypeError(
+                        f"selection.mixture[{name!r}] must be numeric"
+                    ) from exc
+                if weight <= 0:
+                    raise ValueError("selection.mixture values must be positive")
+                if source in normalized:
+                    raise ValueError(f"duplicate selection.mixture source {source!r}")
+                normalized[source] = weight
+            if sum(normalized.values()) <= 0:
+                raise ValueError("selection.mixture must contain a positive weight")
+            object.__setattr__(self, "mixture", normalized)
         if self.metric != "input_tokens":
             raise ValueError("selection.metric currently supports only input_tokens")
         if self.seed < 0:
@@ -172,8 +209,10 @@ class PretrainingConfig:
         )
     )
     selection: TokenSelectionConfig | None = None
+    format: str = "parquet"
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "format", normalize_storage_format(self.format))
         if not self.dataset_id or not self.version:
             raise ValueError("dataset_id and version must be non-empty")
         if self.task_type not in {"pretraining", "cpt"}:
@@ -198,6 +237,18 @@ class PretrainingConfig:
             TokenSelectionConfig,
         ):
             raise ValueError("selection must be a TokenSelectionConfig")
+        if (
+            self.selection is not None
+            and self.selection.mixture is not None
+        ):
+            source_names = {source.name for source in self.sources}
+            mixture_names = set(self.selection.mixture)
+            if mixture_names != source_names:
+                raise ValueError(
+                    "selection.mixture sources must match configured sources: "
+                    f"missing={sorted(source_names - mixture_names)}, "
+                    f"unexpected={sorted(mixture_names - source_names)}"
+                )
 
 
 def load_pretraining_config(path: str | Path) -> PretrainingConfig:
@@ -248,9 +299,11 @@ def load_pretraining_config(path: str | Path) -> PretrainingConfig:
         selection_values["target_tokens"] = _parse_token_count(
             selection_values["target_tokens"]
         )
-        selection_values["mixture_manifest_path"] = Path(
-            selection_values["mixture_manifest_path"]
-        )
+        if "mixture_manifest_path" in selection_values:
+            manifest_path = selection_values["mixture_manifest_path"]
+            selection_values["mixture_manifest_path"] = (
+                Path(manifest_path) if manifest_path is not None else None
+            )
         values["selection"] = TokenSelectionConfig(**selection_values)
 
     for nested, cls in (
@@ -277,6 +330,8 @@ def load_pretraining_config(path: str | Path) -> PretrainingConfig:
         if name not in values:
             raise ValueError(f"missing pretraining preparation key: {name}")
         values[name] = Path(values[name])
+    if "format" not in values:
+        values["format"] = "parquet"
     return PretrainingConfig(sources=tuple(sources), **values)
 
 

@@ -1,4 +1,4 @@
-"""通用 SFT source 与 unified Binary Dataset 原子构建流程。
+"""通用 SFT source 与 unified Parquet Dataset 原子构建流程。
 
 处理顺序：
 
@@ -8,10 +8,10 @@
 4. 对完整 conversation 做稳定内容去重。
 5. 按可选 category quota 做确定性的 bottom-k 选择。
 6. 写入 source train/validation JSONL。
-7. 复用 ``UnifiedDataPreparation`` 生成 unified Binary Dataset。
+7. 复用 ``UnifiedDataPreparation`` 生成 unified Parquet Dataset。
 8. 全部成功后再原子发布整个 SFT 目录。
 
-配额、去重、长度校验和 Binary Dataset 构建保持数据源无关；平台字段只在
+配额、去重、长度校验和 Parquet Dataset 构建保持数据源无关；平台字段只在
 ``sources.py`` 中解析。
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 from ...storage.fs import atomic_replace_directory
 from ...schema import SFTSequenceSample
-from ...storage import BinarySampleWriter
+from ...storage import ParquetSampleWriter
 from ..readers import RecordSourceReader
 from .config import SFTBuildConfig
 from .policy import SFTContentPolicy, SFTContentRejected
@@ -283,7 +283,7 @@ class _Bucket:
 
 
 class SFTDataPreparation:
-    """构建 canonical SFT JSONL 和 unified Binary Dataset。"""
+    """构建 canonical SFT JSONL 和 unified Parquet Dataset。"""
 
     def __init__(self, config: SFTBuildConfig) -> None:
         """加载 tokenizer 和通用记录读取器。"""
@@ -317,7 +317,7 @@ class SFTDataPreparation:
                 staging,
                 token_cache_path,
             )
-            self._build_binary(
+            self._build_dataset(
                 staging,
                 train,
                 validation,
@@ -836,7 +836,7 @@ class SFTDataPreparation:
             selected.append(candidate)
         return selected
 
-    def _build_binary(
+    def _build_dataset(
         self,
         staging: Path,
         train: list[Candidate],
@@ -844,7 +844,7 @@ class SFTDataPreparation:
         token_cache_path: Path,
         report: dict[str, Any],
     ) -> None:
-        """Write tokens produced during selection directly into Binary Dataset."""
+        """Write tokens produced during selection directly into Parquet."""
         token_cache = _TokenCache(token_cache_path, write=False)
         split_manifests = {}
         try:
@@ -854,7 +854,7 @@ class SFTDataPreparation:
             ):
                 if not records:
                     continue
-                writer = BinarySampleWriter(
+                writer = ParquetSampleWriter(
                     staging / split,
                     dataset_id=f"{self.config.dataset_id}:{split}",
                     sample_type="sft",
@@ -863,6 +863,7 @@ class SFTDataPreparation:
                     metadata={
                         "task_type": "sft",
                         "split": split,
+                        "storage_format": "parquet",
                         "profile": self.config.profile,
                         "tokenizer_path": str(self.config.tokenizer_path),
                     },

@@ -1,5 +1,5 @@
 # 通用轨迹数据 Runtime 配置样例。
-# 该文件描述离线 PPO/轨迹训练的 Binary Dataset 读取方式。
+# 该文件描述离线 PPO/轨迹训练的 Parquet Dataset 读取方式。
 #
 # 使用说明：先运行 prepare_trajectory_data.yaml，再按生成目录替换 storage 路径。
 # 当前路径均为项目内示例，dataset_id 必须与 Manifest 保持一致。
@@ -11,12 +11,12 @@ data:
   # 训练任务类型；在线 Rollout 轨迹使用 ppo。
   task_type: ppo
   # 数据集稳定标识；断点恢复会校验该值。
-  dataset_id: taichu-online-rollouts-v1
+  dataset_id: taichu-trajectory-offline-v1
 
-  # Binary Dataset 存储与读取配置。
+  # Parquet Dataset 存储与读取配置。
   storage:
-    # 存储后端类型；当前只支持 binary_mmap。
-    format: binary_mmap
+    # 存储后端类型；当前只支持 parquet。
+    format: parquet
     # 轨迹训练集目录。
     train_path: ./data/unified/trajectory/train
     # 轨迹验证集目录。

@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from ...storage import BinaryDatasetReader
+from ...storage import ParquetDatasetReader
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -175,7 +175,7 @@ def diagnose_pretrain_dataset(
     if gradient_accumulation_steps <= 0 or world_size <= 0:
         raise ValueError("gradient accumulation and world size must be positive")
 
-    with BinaryDatasetReader(path) as reader:
+    with ParquetDatasetReader(path) as reader:
         indices = _sample_indices(len(reader), sample_size, seed)
         lengths: list[int] = []
         source_tokens: Counter[str] = Counter()
@@ -389,8 +389,8 @@ def compare_dataset_overlap(
 ) -> dict[str, Any]:
     """Measure exact sample ID and token-sequence overlap between two splits."""
     with (
-        BinaryDatasetReader(source_path) as source_reader,
-        BinaryDatasetReader(compare_path) as compare_reader,
+        ParquetDatasetReader(source_path) as source_reader,
+        ParquetDatasetReader(compare_path) as compare_reader,
     ):
         source_indices = _sample_indices(
             len(source_reader),
@@ -456,7 +456,7 @@ def _print_progress(done: int, total: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Diagnose a binary pretraining dataset without training"
+        description="Diagnose a pretraining dataset without training"
     )
     parser.add_argument("--path", required=True, type=Path)
     parser.add_argument("--sample-size", type=int, default=100_000)

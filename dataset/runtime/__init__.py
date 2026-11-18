@@ -4,6 +4,7 @@ from .dataset import IndexedTokenDataset
 from .loader import (
     UnifiedDataLoader,
     UnifiedDataLoaderFactory,
+    build_pretrain_data_loader,
     build_sft_data_loader,
 )
 from .online import ExperienceBuffer, HybridSampleSource
@@ -16,6 +17,7 @@ __all__ = [
     "ResumableBatchIterator",
     "UnifiedDataLoader",
     "UnifiedDataLoaderFactory",
+    "build_pretrain_data_loader",
     "build_sft_data_loader",
     "skip_batches",
 ]

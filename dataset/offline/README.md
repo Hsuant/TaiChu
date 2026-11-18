@@ -1,7 +1,7 @@
 # Offline Preparation
 
-`dataset.offline` 把原始记录转换为统一 Binary Dataset，并生成可用于恢复和审计的
-Manifest。
+`dataset.offline` 把原始记录转换为统一离线 Dataset，并生成可用于恢复和审计的
+Manifest。所有离线 Dataset 统一发布为 Parquet。
 
 ## 文档级预训练
 
@@ -15,7 +15,7 @@ JSONL / JSONL.GZ / Parquet
   → Cluster 级 Split
   → 全文档 Tokenization
   → 2,046 Token 滑窗 + 128 Overlap
-  → tcbin / tcidx / Manifest
+  → Parquet Shard / Manifest
 ```
 
 ```powershell
@@ -30,6 +30,8 @@ python -m dataset.offline.prepare `
 - Train / Validation / Diagnostic 的重复 Cluster 隔离。
 - 来源、语言、Token、窗口和泄漏统计。
 - 原子输出与可恢复 Staging。
+- `selection.target_tokens` 只统计非 padding input Token。
+- `selection.mixture` 或 sampling manifest 指定来源配比。
 
 ## 来源抽样
 
@@ -76,7 +78,7 @@ python -m dataset.offline.prepare `
 ## 精选 SFT 数据构建
 
 `dataset.offline.sft` 接收通用 `messages` 记录，执行完整上下文长度检查、
-跨来源去重、可选类别配额、source/validation 划分和 Binary Dataset 构建：
+跨来源去重、可选类别配额、source/validation 划分和 Parquet Dataset 构建：
 
 ```powershell
 python -m dataset.offline.sft `
@@ -103,12 +105,10 @@ data/unified/taichu_80m/
 ├── dataset_manifest.json
 ├── train/
 │   ├── manifest.json
-│   ├── data-00000.tcbin
-│   └── data-00000.tcidx
+│   └── data-00000.parquet
 ├── validation/
 │   ├── manifest.json
-│   ├── data-00000.tcbin
-│   └── data-00000.tcidx
+│   └── data-00000.parquet
 └── diagnostic/
 ```
 

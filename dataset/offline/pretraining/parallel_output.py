@@ -1,4 +1,4 @@
-"""Parallel document-range tokenization and binary shard writing."""
+"""Parallel document-range tokenization and shard writing."""
 from __future__ import annotations
 
 import hashlib
@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from tqdm import tqdm
 
-from ...storage import BinarySampleWriter
+from ...storage import ParquetSampleWriter
 from ...storage.manifest import DatasetManifest, ShardInfo
 from .config import PretrainingConfig
 from .segmentation import build_segment_samples
@@ -111,17 +111,17 @@ def _process_part(part_index: int, start: int, end: int) -> PartResult:
         timeout=30,
     )
     database.row_factory = sqlite3.Row
-    writers: dict[str, BinarySampleWriter] = {}
+    writers: dict[str, Any] = {}
     split_paths: dict[str, str] = {}
     stats = _new_stats()
     token_counts = array("I")
 
-    def writer_for(split: str) -> BinarySampleWriter:
+    def writer_for(split: str):
         writer = writers.get(split)
         if writer is not None:
             return writer
         output = _WORKER_PART_ROOT / f"part-{part_index:05d}" / split
-        writer = BinarySampleWriter(
+        writer = ParquetSampleWriter(
             output,
             dataset_id=f"{config.dataset_id}:{split}:part-{part_index:05d}",
             sample_type="pretraining",
@@ -246,6 +246,7 @@ def _final_split_metadata(
         "actual_input_tokens": int(stats["input_tokens"]),
         "actual_loss_tokens": int(stats["loss_tokens"]),
         "processing_version": processing_version,
+        "storage_format": config.format,
         "tokenizer_path": str(config.tokenizer_path),
         "tokenizer_version": tokenizer_version,
         "segmentation": asdict(config.segmentation),
@@ -264,7 +265,7 @@ def _merge_parts(
     total_bytes = sum(
         path.stat().st_size
         for path in part_root.rglob("*")
-        if path.is_file() and path.suffix in {".tcbin", ".tcidx"}
+        if path.is_file() and path.suffix == ".parquet"
     )
 
     def sha256_file(path: Path, progress) -> str:
@@ -298,26 +299,18 @@ def _merge_parts(
                 part_manifest = DatasetManifest.load(part_path)
                 for shard in part_manifest.shards:
                     number = len(shards)
-                    data_name = f"data-{number:05d}.tcbin"
-                    index_name = f"data-{number:05d}.tcidx"
+                    data_name = f"data-{number:05d}.parquet"
                     os.replace(
                         Path(part_path) / shard.path,
                         split_dir / data_name,
                     )
-                    os.replace(
-                        Path(part_path) / shard.index_path,
-                        split_dir / index_name,
-                    )
                     data_path = split_dir / data_name
-                    index_path = split_dir / index_name
                     shards.append(
                         ShardInfo(
                             path=data_name,
-                            index_path=index_name,
                             samples=shard.samples,
                             bytes=data_path.stat().st_size,
                             sha256=sha256_file(data_path, progress),
-                            index_sha256=sha256_file(index_path, progress),
                         )
                     )
                 for key in stats:
@@ -341,10 +334,7 @@ def _merge_parts(
                 ),
             ).with_content_hash()
             manifest.write(split_dir)
-            storage_bytes = sum(
-                shard.bytes + (split_dir / shard.index_path).stat().st_size
-                for shard in shards
-            )
+            storage_bytes = sum(shard.bytes for shard in shards)
             stats["storage_bytes"] = storage_bytes
             stats["storage_gb"] = storage_bytes / 1_000_000_000
             stats["logical_input_gb"] = (

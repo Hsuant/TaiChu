@@ -13,10 +13,10 @@ data:
   # 数据集稳定标识；断点恢复会校验该值。
   dataset_id: taichu-reward-v1
 
-  # Binary Dataset 存储与读取配置。
+  # Parquet Dataset 存储与读取配置。
   storage:
-    # 存储后端类型；当前只支持 binary_mmap。
-    format: binary_mmap
+    # 存储后端类型；当前只支持 parquet。
+    format: parquet
     # 奖励训练集目录。
     train_path: ./data/unified/reward/train
     # 奖励验证集目录。

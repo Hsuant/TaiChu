@@ -4,7 +4,7 @@
 #   python -m dataset.offline.sft --config configs/prepare_sft_data.yaml
 #
 # 该文件控制 raw conversation 的读取、清洗、去重、配额选择、tokenize、
-# train/validation 划分以及 Unified Binary Dataset 输出。
+# train/validation 划分以及 Unified Parquet Dataset 输出。
 #
 # 使用说明：
 #   1. 本文件中的 output_dir 与 raw_sources.path 均为示例，不指向任何真实数据。
@@ -30,9 +30,9 @@ profiles:
     # 最终目录：output_dir / output_subdir。
     output_subdir: "80m_v1"
 
-    # dataset_id 是 Binary Dataset 身份。训练配置和断点恢复都必须保持一致。
+    # dataset_id 是 Parquet Dataset 身份。训练配置和断点恢复都必须保持一致。
     dataset_id: "taichu-sft-80m-v1"
-    # 旧 80M 数据集处理版本；保持 1 以复现既有 Binary Dataset。
+    # 旧 80M 数据集处理版本；保持 1 以复现既有 Parquet Dataset。
     version: "1"
 
     # quotas 是过滤、去重后每个 category 最多保留的样本数，不是 token 数。
@@ -298,7 +298,7 @@ min_assistant_tokens: 32
 # conversation 被拒绝。该限制用于控制超长回答和显存峰值。
 max_assistant_tokens: 512
 
-# 每个 Binary Dataset shard 最多写入的样本数。
+# 每个 Parquet Dataset shard 最多写入的样本数。
 shard_size: 50000
 
 # 每次交给 tokenizer 的记录数。过大增加内存峰值，过小降低吞吐。

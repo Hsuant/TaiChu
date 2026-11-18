@@ -2,7 +2,7 @@
 
 Every adapter returns canonical message records for the generic SFT selection
 pipeline. Dataset-specific field parsing stays in this module so the core
-selection and binary preparation logic remains source-agnostic.
+selection and Parquet preparation logic remains source-agnostic.
 """
 from __future__ import annotations
 

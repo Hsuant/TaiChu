@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from dataset.exceptions import TaiChuDataFormatError
-from dataset.storage import BinaryDatasetReader, BinarySampleWriter
+from dataset.storage import ParquetDatasetReader, ParquetSampleWriter
 
 
 def subset_validation_dataset(
@@ -23,7 +23,7 @@ def subset_validation_dataset(
     if max_tokens <= 0:
         raise ValueError("max_tokens must be positive")
 
-    with BinaryDatasetReader(source) as reader:
+    with ParquetDatasetReader(source) as reader:
         if reader.sample_type != "pretraining":
             raise TaiChuDataFormatError(
                 "validation subsetting requires a pretraining dataset"
@@ -84,7 +84,7 @@ def subset_validation_dataset(
             "source_dataset_id": source_dataset_id,
         },
     }
-    writer = BinarySampleWriter(
+    writer = ParquetSampleWriter(
         output,
         dataset_id=f"{source_dataset_id}-validation-subset",
         sample_type="pretraining",

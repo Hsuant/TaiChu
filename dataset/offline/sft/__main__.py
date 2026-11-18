@@ -1,7 +1,7 @@
 """SFT 通用离线构建命令行入口。
 
 该入口位于 dataset 包内部，不依赖 scripts 目录。配置文件同时定义 source
-过滤/配额和 unified Binary Dataset 的 tokenization 参数。
+过滤/配额和 unified Parquet Dataset 的 tokenization 参数。
 """
 from __future__ import annotations
 
