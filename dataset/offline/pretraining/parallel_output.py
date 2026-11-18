@@ -260,84 +260,105 @@ def _merge_parts(
     tokenizer_version: str,
     processing_version: str,
 ) -> dict[str, Any]:
-    def sha256_file(path: Path) -> str:
+    part_root = staging / ".parallel-splits"
+    total_bytes = sum(
+        path.stat().st_size
+        for path in part_root.rglob("*")
+        if path.is_file() and path.suffix in {".tcbin", ".tcidx"}
+    )
+
+    def sha256_file(path: Path, progress) -> str:
         digest = hashlib.sha256()
         with path.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(block)
+                progress.update(len(block))
         return digest.hexdigest()
 
     manifests: dict[str, Any] = {}
-    for split in ("train", "validation", "diagnostic"):
-        split_dir = staging / split
-        split_dir.mkdir(parents=True, exist_ok=True)
-        shards: list[ShardInfo] = []
-        stats = _new_stats()[split]
-        for part_index in sorted(results):
-            result = results[part_index]
-            part_path = result.split_paths.get(split)
-            if part_path is None:
-                continue
-            part_manifest = DatasetManifest.load(part_path)
-            for shard in part_manifest.shards:
-                number = len(shards)
-                data_name = f"data-{number:05d}.tcbin"
-                index_name = f"data-{number:05d}.tcidx"
-                os.replace(
-                    Path(part_path) / shard.path,
-                    split_dir / data_name,
-                )
-                os.replace(
-                    Path(part_path) / shard.index_path,
-                    split_dir / index_name,
-                )
-                data_path = split_dir / data_name
-                index_path = split_dir / index_name
-                shards.append(
-                    ShardInfo(
-                        path=data_name,
-                        index_path=index_name,
-                        samples=shard.samples,
-                        bytes=data_path.stat().st_size,
-                        sha256=sha256_file(data_path),
-                        index_sha256=sha256_file(index_path),
+    with tqdm(
+        total=total_bytes,
+        desc="hash merged shards",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1000,
+        dynamic_ncols=True,
+        mininterval=1.0,
+    ) as progress:
+        for split in ("train", "validation", "diagnostic"):
+            split_dir = staging / split
+            split_dir.mkdir(parents=True, exist_ok=True)
+            shards: list[ShardInfo] = []
+            stats = _new_stats()[split]
+            for part_index in sorted(results):
+                result = results[part_index]
+                part_path = result.split_paths.get(split)
+                if part_path is None:
+                    continue
+                part_manifest = DatasetManifest.load(part_path)
+                for shard in part_manifest.shards:
+                    number = len(shards)
+                    data_name = f"data-{number:05d}.tcbin"
+                    index_name = f"data-{number:05d}.tcidx"
+                    os.replace(
+                        Path(part_path) / shard.path,
+                        split_dir / data_name,
                     )
-                )
-            for key in stats:
-                stats[key] += int(result.stats[split][key])
+                    os.replace(
+                        Path(part_path) / shard.index_path,
+                        split_dir / index_name,
+                    )
+                    data_path = split_dir / data_name
+                    index_path = split_dir / index_name
+                    shards.append(
+                        ShardInfo(
+                            path=data_name,
+                            index_path=index_name,
+                            samples=shard.samples,
+                            bytes=data_path.stat().st_size,
+                            sha256=sha256_file(data_path, progress),
+                            index_sha256=sha256_file(index_path, progress),
+                        )
+                    )
+                for key in stats:
+                    stats[key] += int(result.stats[split][key])
 
-        if not shards:
-            split_dir.rmdir()
-            continue
-        manifest = DatasetManifest(
-            dataset_id=f"{config.dataset_id}:{split}",
-            sample_type="pretraining",
-            version=config.version,
-            sample_count=sum(shard.samples for shard in shards),
-            shards=tuple(shards),
-            metadata=_final_split_metadata(
-                config,
-                split=split,
-                tokenizer_version=tokenizer_version,
-                processing_version=processing_version,
-                stats=stats,
-            ),
-        ).with_content_hash()
-        manifest.write(split_dir)
-        storage_bytes = sum(
-            shard.bytes + (split_dir / shard.index_path).stat().st_size
-            for shard in shards
-        )
-        stats["storage_bytes"] = storage_bytes
-        stats["storage_gb"] = storage_bytes / 1_000_000_000
-        stats["logical_input_gb"] = stats["input_tokens"] * 4 / 1_000_000_000
-        stats["loss_target_gb"] = stats["loss_tokens"] * 4 / 1_000_000_000
-        manifests[split] = {
-            "manifest": f"{split}/manifest.json",
-            "sample_count": manifest.sample_count,
-            "content_hash": manifest.content_hash,
-            "stats": stats,
-        }
+            if not shards:
+                split_dir.rmdir()
+                continue
+            manifest = DatasetManifest(
+                dataset_id=f"{config.dataset_id}:{split}",
+                sample_type="pretraining",
+                version=config.version,
+                sample_count=sum(shard.samples for shard in shards),
+                shards=tuple(shards),
+                metadata=_final_split_metadata(
+                    config,
+                    split=split,
+                    tokenizer_version=tokenizer_version,
+                    processing_version=processing_version,
+                    stats=stats,
+                ),
+            ).with_content_hash()
+            manifest.write(split_dir)
+            storage_bytes = sum(
+                shard.bytes + (split_dir / shard.index_path).stat().st_size
+                for shard in shards
+            )
+            stats["storage_bytes"] = storage_bytes
+            stats["storage_gb"] = storage_bytes / 1_000_000_000
+            stats["logical_input_gb"] = (
+                stats["input_tokens"] * 4 / 1_000_000_000
+            )
+            stats["loss_target_gb"] = (
+                stats["loss_tokens"] * 4 / 1_000_000_000
+            )
+            manifests[split] = {
+                "manifest": f"{split}/manifest.json",
+                "sample_count": manifest.sample_count,
+                "content_hash": manifest.content_hash,
+                "stats": stats,
+            }
     return manifests
 
 

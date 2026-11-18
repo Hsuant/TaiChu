@@ -12,6 +12,7 @@ from ..exceptions import TaiChuDataFormatError
 
 
 ProgressCallback = Callable[[int], None]
+_PROGRESS_UPDATE_BYTES = 4_000_000
 
 
 class RecordSourceReader:
@@ -68,11 +69,11 @@ class RecordSourceReader:
         progress_callback: ProgressCallback | None,
     ) -> Iterator[dict[str, Any]]:
         opener = gzip.open if path.name.lower().endswith(".gz") else open
+        pending_progress = 0
         with opener(path, "rb") as stream:
             for line_number, line in enumerate(stream, start=1):
                 if not line.strip():
-                    if progress_callback is not None:
-                        progress_callback(len(line))
+                    pending_progress += len(line)
                     continue
                 try:
                     record = orjson.loads(line)
@@ -85,8 +86,15 @@ class RecordSourceReader:
                         f"JSONL record in {path} at line {line_number} must be an object"
                     )
                 yield record
-                if progress_callback is not None:
-                    progress_callback(len(line))
+                pending_progress += len(line)
+                if (
+                    progress_callback is not None
+                    and pending_progress >= _PROGRESS_UPDATE_BYTES
+                ):
+                    progress_callback(pending_progress)
+                    pending_progress = 0
+        if progress_callback is not None and pending_progress:
+            progress_callback(pending_progress)
 
     @staticmethod
     def _read_parquet(
@@ -97,6 +105,7 @@ class RecordSourceReader:
             import pyarrow.parquet as parquet
         except ImportError as exc:
             raise ImportError("pyarrow is required to read Parquet sources") from exc
+        pending_progress = 0
         with parquet.ParquetFile(path) as handle:
             for batch in handle.iter_batches(use_threads=True):
                 records = batch.to_pylist()
@@ -105,8 +114,15 @@ class RecordSourceReader:
                 step = max(1, batch.nbytes // len(records))
                 for record in records:
                     yield record
-                    if progress_callback is not None:
-                        progress_callback(step)
+                    pending_progress += step
+                    if (
+                        progress_callback is not None
+                        and pending_progress >= _PROGRESS_UPDATE_BYTES
+                    ):
+                        progress_callback(pending_progress)
+                        pending_progress = 0
+        if progress_callback is not None and pending_progress:
+            progress_callback(pending_progress)
 
 
 __all__ = ["RecordSourceReader"]

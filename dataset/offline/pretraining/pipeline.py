@@ -29,6 +29,7 @@ from .fingerprinting import (
 from .hashing import cluster_id, split_for_cluster
 from .output import (
     apply_training_selection,
+    existing_split_manifests,
     verify_split_isolation,
     write_splits,
 )
@@ -38,6 +39,7 @@ from .tokenization import initialize_tokenizer_worker, tokenize_batch
 
 
 PROCESSING_VERSION = "document-aware"
+COMMIT_INTERVAL_DOCUMENTS = 5_000
 
 
 def _process_batch(
@@ -54,6 +56,7 @@ def _process_batch(
         ngram_size=ngram_size,
         num_hashes=num_hashes,
         seed=seed,
+        keep_shingles=False,
     )
     raw_tokens = [
         len(token_ids)
@@ -122,15 +125,38 @@ class PretrainingDataPreparation:
         try:
             deduplicator = self._scan(database)
             self._finalize_clusters(database, deduplicator, staging)
-            split_manifests = write_splits(
-                config=self.config,
-                tokenizer=self.tokenizer,
+            expected_splits = ["train"]
+            for split, ratio in (
+                ("validation", self.config.splits.validation_ratio),
+                ("diagnostic", self.config.splits.diagnostic_ratio),
+            ):
+                if ratio > 0:
+                    expected_splits.append(split)
+            existing_splits = existing_split_manifests(
+                staging,
+                dataset_id=self.config.dataset_id,
+                version=self.config.version,
                 tokenizer_version=self.tokenizer_version,
-                database=database,
-                document_count=deduplicator.document_count,
-                staging=staging,
-                processing_version=PROCESSING_VERSION,
             )
+            if all(split in existing_splits for split in expected_splits):
+                print(
+                    "reusing existing binary split manifests",
+                    flush=True,
+                )
+                split_manifests = {
+                    split: existing_splits[split]
+                    for split in expected_splits
+                }
+            else:
+                split_manifests = write_splits(
+                    config=self.config,
+                    tokenizer=self.tokenizer,
+                    tokenizer_version=self.tokenizer_version,
+                    database=database,
+                    document_count=deduplicator.document_count,
+                    staging=staging,
+                    processing_version=PROCESSING_VERSION,
+                )
             selection_report = None
             if self.config.selection is not None:
                 train_manifest, selection_report = apply_training_selection(
@@ -177,6 +203,7 @@ class PretrainingDataPreparation:
             desc="restore dedup index",
             unit="doc",
             dynamic_ncols=True,
+            mininterval=1.0,
         ) as progress:
             deduplicator = DocumentDeduplicator.restore(
                 database,
@@ -184,6 +211,7 @@ class PretrainingDataPreparation:
                 seed=self.config.splits.seed,
                 progress=progress.update,
                 load_exact=not scan_complete,
+                load_bloom=not scan_complete,
             )
         stored_fingerprint_version = get_state(database, "fingerprint_version")
         if deduplicator.document_count and (
@@ -241,6 +269,71 @@ class PretrainingDataPreparation:
             )
             pending.append((future, batch))
 
+        def prepare_and_submit(
+            raw_batch: list[dict[str, Any]],
+            progress=None,
+        ) -> None:
+            if not raw_batch:
+                return
+            existing: set[str] = set()
+            if existing_documents:
+                # Batch the resume lookup instead of issuing one random index query per record.
+                parent_ids = [item["parent_id"] for item in raw_batch]
+                for start in range(0, len(parent_ids), 900):
+                    chunk = parent_ids[start : start + 900]
+                    placeholders = ",".join("?" for _ in chunk)
+                    existing.update(
+                        str(row[0])
+                        for row in database.execute(
+                            f"""
+                            SELECT parent_document_id
+                            FROM documents
+                            WHERE parent_document_id IN ({placeholders})
+                            """,
+                            chunk,
+                        )
+                    )
+
+            batch: list[dict[str, Any]] = []
+            for item in raw_batch:
+                if item["parent_id"] in existing:
+                    continue
+                try:
+                    raw = item["record"][self.config.text_column]
+                    if not isinstance(raw, str):
+                        raise TypeError("text is not a string")
+                    cleaned, reason = self.cleaner.clean(raw)
+                    if cleaned is None:
+                        raise ValueError(reason)
+                except Exception as exc:
+                    record_error(
+                        database,
+                        source=item["source"],
+                        path=item["path"],
+                        record_index=item["ordinal"],
+                        stage="validate",
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                    if self.config.invalid_policy == "error":
+                        raise
+                    continue
+                batch.append(
+                    {
+                        "parent_id": item["parent_id"],
+                        "source": item["source"],
+                        "priority": item["priority"],
+                        "path": item["path"],
+                        "ordinal": item["ordinal"],
+                        "text": cleaned,
+                        "raw_text": raw,
+                        "raw_characters": len(raw),
+                    }
+                )
+            if batch:
+                submit_batch(batch)
+            while len(pending) >= workers * 2:
+                consume_batch(progress)
+
         def consume_batch(progress=None) -> None:
             future, batch = pending.popleft()
             try:
@@ -252,6 +345,7 @@ class PretrainingDataPreparation:
                         ngram_size=self.config.dedup.ngram_size,
                         num_hashes=self.config.dedup.num_hashes,
                         seed=self.config.splits.seed,
+                        keep_shingles=False,
                     )
                     for item in batch
                 ]
@@ -261,26 +355,36 @@ class PretrainingDataPreparation:
                         [item["raw_text"] for item in batch]
                     )
                 ]
-            for item, fingerprint, raw_tokens in zip(
-                batch,
-                fingerprints,
-                raw_token_counts,
-                strict=True,
-            ):
-                deduplicator.add_document(
-                    parent_document_id=item["parent_id"],
-                    source=item["source"],
-                    source_priority=item["priority"],
-                    source_path=item["path"],
-                    source_index=item["ordinal"],
-                    language=item["source"].language,
-                    text=item["text"],
-                    raw_characters=item["raw_characters"],
-                    raw_tokens=raw_tokens,
-                    fingerprint=fingerprint,
+            previously_committed = (
+                deduplicator.document_count // COMMIT_INTERVAL_DOCUMENTS
+            )
+            documents = [
+                {
+                    "parent_id": item["parent_id"],
+                    "source": item["source"],
+                    "priority": item["priority"],
+                    "path": item["path"],
+                    "ordinal": item["ordinal"],
+                    "language": item["source"].language,
+                    "text": item["text"],
+                    "raw_characters": item["raw_characters"],
+                    "raw_tokens": raw_tokens,
+                    "fingerprint": fingerprint,
+                }
+                for item, fingerprint, raw_tokens in zip(
+                    batch,
+                    fingerprints,
+                    raw_token_counts,
+                    strict=True,
                 )
-                if deduplicator.document_count % 1000 == 0:
-                    database.commit()
+            ]
+            deduplicator.add_documents(documents)
+            if (
+                deduplicator.document_count // COMMIT_INTERVAL_DOCUMENTS
+                > previously_committed
+            ):
+                deduplicator.flush_pending_buckets()
+                database.commit()
             if progress is not None:
                 progress.set_postfix(
                     documents=deduplicator.document_count,
@@ -307,6 +411,7 @@ class PretrainingDataPreparation:
                         unit_scale=True,
                         unit_divisor=1000,
                         dynamic_ncols=True,
+                        mininterval=1.0,
                     ) as progress:
                         for ordinal, record in enumerate(
                             self.reader.read(
@@ -320,30 +425,6 @@ class PretrainingDataPreparation:
                                 ordinal,
                                 record,
                             )
-                            if database.execute(
-                                "SELECT 1 FROM documents WHERE parent_document_id = ?",
-                                (parent_id,),
-                            ).fetchone():
-                                continue
-                            try:
-                                raw = record[self.config.text_column]
-                                if not isinstance(raw, str):
-                                    raise TypeError("text is not a string")
-                                cleaned, reason = self.cleaner.clean(raw)
-                                if cleaned is None:
-                                    raise ValueError(reason)
-                            except Exception as exc:
-                                record_error(
-                                    database,
-                                    source=source,
-                                    path=path,
-                                    record_index=ordinal,
-                                    stage="validate",
-                                    reason=f"{type(exc).__name__}: {exc}",
-                                )
-                                if self.config.invalid_policy == "error":
-                                    raise
-                                continue
                             batch.append(
                                 {
                                     "parent_id": parent_id,
@@ -351,26 +432,16 @@ class PretrainingDataPreparation:
                                     "priority": priority,
                                     "path": str(path),
                                     "ordinal": ordinal,
-                                    "text": cleaned,
-                                    "raw_text": raw,
-                                    "raw_characters": len(raw),
+                                    "record": record,
                                 }
                             )
                             if len(batch) >= self.config.fingerprint_batch_size:
-                                submit_batch(batch)
+                                prepare_and_submit(batch, progress)
                                 batch = []
-                            while len(pending) >= workers * 2:
-                                consume_batch()
-                            progress.set_postfix(
-                                documents=deduplicator.document_count,
-                                pending_batches=len(pending),
-                                candidates=deduplicator.candidate_documents,
-                                jaccard=deduplicator.jaccard_checks,
-                                max_candidates=deduplicator.max_candidates,
-                            )
                     if batch:
-                        submit_batch(batch)
+                        prepare_and_submit(batch, progress)
                     drain_pending(progress)
+                    deduplicator.flush_pending_buckets()
                     database.commit()
             set_state(database, "scan_complete", "1")
             return deduplicator

@@ -1,6 +1,8 @@
 """Tokenizer access shared by parallel scan and output workers."""
 from __future__ import annotations
 
+import os
+
 from tokenizers import Tokenizer
 
 from ..adapters import TextTokenizer
@@ -15,6 +17,7 @@ def initialize_tokenizer_worker(
     bos_token: str,
     eos_token: str,
 ) -> None:
+    os.environ["RAYON_NUM_THREADS"] = "1"
     global _WORKER_TOKENIZER
     _WORKER_TOKENIZER = TextTokenizer(
         Tokenizer.from_file(tokenizer_path),

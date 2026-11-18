@@ -44,10 +44,14 @@ source_quota = target_tokens * source_target_bytes / total_target_bytes
 ```
 
 Windows are shuffled deterministically inside each source and selected until the
-quota is reached. A source may overshoot by at most one window. If any source
-lacks enough candidate tokens, preparation fails before publishing the dataset.
-The final root manifest records target quotas, available tokens, actual selected
-tokens and source token shares.
+quota is reached. A source may overshoot by at most one window. When total
+candidate tokens are sufficient and the aggregate source deficit is at most 1%
+of the target, the deficit is redistributed across sources with surplus. This
+keeps small normalization/deduplication differences from failing after a long
+scan while preventing large silent mixture changes. Larger deficits still fail
+before publishing the dataset. The final root manifest records original quotas,
+effective quotas, reallocations, available tokens, actual selected tokens and
+source token shares.
 
 The SQLite staging database stores document text and exact digests. MinHash
 signatures are used to populate LSH rows but are not retained per document, and
@@ -77,6 +81,63 @@ Fingerprinting, raw-token counting and split tokenization run in bounded process
 pools. Band keys are computed once per document, exact Jaccard uses the already
 sorted NumPy shingle arrays, and split verification plus manifest aggregation
 read metadata without decoding token arrays.
+
+Scan workers return only the text digest, MinHash signature and raw token count.
+They still compute shingles locally to build the signature, but drop that payload
+before sending the batch back to the main process. The current document's
+shingles are recomputed only when its LSH buckets contain a candidate. In a
+1,000-document, 8.1 MB input benchmark this reduced the worker result payload
+from 47.7 MB to 1.08 MB without changing exact Jaccard verification. Every scan
+and output worker also initializes its tokenizer with `RAYON_NUM_THREADS=1` so a
+process pool does not multiply each worker by the machine's full CPU count.
+The in-memory union-find, source-priority and canonical-document maps use packed
+32-bit arrays rather than Python integer lists or dictionaries, which lowers the
+scan memory peak and page-file traffic on multi-million-document staging stores.
+Resume checks existing parent IDs one batch at a time instead of issuing one
+SQLite lookup per record, and byte-progress callbacks are coalesced. On the local
+warm cache, resuming 8,192 already-indexed baike documents (50.34 MB) took 0.302 s
+(166.5 MB/s including index restore). A deliberately hostile 200,000-document
+synthetic case averaging 225 bytes per record still scanned at 11.1 MB/s. These
+are resume-path measurements, not a cold full-corpus claim.
+
+LSH candidate reads and writes are also batched over the configured
+`fingerprint_batch_size`. Bucket keys are sorted by `(band, bucket, doc_id)`
+before insertion, while same-batch candidates are resolved from an in-memory
+bucket map. On a real 20,000-document, 91.9 MB baike sample this reduced scan
+time from 38.89 s to 14.02 s (2.36 to 6.55 MB/s) while preserving the same 4,020
+candidate checks and 4,020 exact Jaccard verifications. That measurement ran
+while the production preparation process was using the same disk, so it is a
+lower bound rather than a clean-machine result.
+
+Before querying LSH B-tree pages, a 256 MB, four-slice NumPy Bloom filter checks
+whether any batch bucket can exist. It is built incrementally for new stores and
+from existing bucket rows when resuming a large staging store. Bloom positives
+still go through the exact SQLite lookup and Jaccard verification, so there are
+no false negatives and no change to duplicate decisions. On a 100,000-document
+database adding 10,000 new documents, steady-state insertion increased from
+1,568 to 3,286 documents/s; Bloom construction took 2.66 s separately.
+After vectorizing batch pair filtering, the 20,000-document baike benchmark
+reached 5.10 MB/s including Bloom construction while the production preparation
+process was using the same disk. On a resumed production store the construction
+cost is paid once and amortized over the remaining scan.
+On the real 6.2-million-document staging store, a read-only production check
+built the filter in 112.5 s; filtering 4,096 batch bucket keys took 3.17 ms and
+left only 3 keys for SQLite lookup, so about 99.93% of random LSH B-tree probes
+were skipped.
+Bucket rows for in-flight documents are also held in a bounded in-memory map and
+flushed as larger globally sorted runs, about once per 5,000 documents. This
+keeps same-batch and in-flight candidates visible while reducing random LSH
+B-tree page splits. The real 20,000-document sample reached 5.23 MB/s including
+filter construction with the production job still sharing the disk.
+
+Selected-train materialization is shard-parallel. Each process reads one
+candidate train shard, applies its deterministic selection mask, writes a
+checksummed part shard, and the parent merges parts in original shard order.
+This preserves sample order and quota semantics while parallelizing the
+previously single-process selection write. Dedicated progress stages now cover
+merged-shard hashing, selection metadata scans, selected-train writing, split
+isolation checks, split-manifest inspection, and final document/sample manifest
+construction.
 
 Split output runs document-ID ranges in parallel. Each worker owns its tokenizer
 with `RAYON_NUM_THREADS=1`, performs Tokenization, segmentation and part-shard

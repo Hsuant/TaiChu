@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from tqdm import tqdm
+
 from ...storage import BinaryDatasetReader
 from ..adapters import TextTokenizer
 from .config import PretrainingConfig
@@ -95,6 +97,13 @@ def build_manifest(
     recovered_tokens = long_documents = tail_fragments = 0
     canonical_documents = 0
 
+    document_progress = tqdm(
+        total=document_count,
+        desc="build manifest: documents",
+        unit="doc",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
     for row in database.execute(
         """
         SELECT id, source_name, language, raw_tokens, cleaned_tokens,
@@ -154,7 +163,19 @@ def build_manifest(
             )
             if final_new < config.segmentation.min_fragment_tokens:
                 tail_fragments += 1
+        document_progress.update()
+    document_progress.close()
 
+    sample_progress = tqdm(
+        total=sum(
+            int(payload["sample_count"])
+            for payload in split_manifests.values()
+        ),
+        desc="build manifest: samples",
+        unit="sample",
+        dynamic_ncols=True,
+        mininterval=1.0,
+    )
     for split in split_manifests:
         with BinaryDatasetReader(staging / split) as reader:
             for metadata in reader.iter_metadata():
@@ -170,6 +191,8 @@ def build_manifest(
                     source["split_loss_tokens"].get(split, 0) + loss_tokens
                 )
                 language["loss_tokens"] += loss_tokens
+                sample_progress.update()
+    sample_progress.close()
 
     split_totals = {
         key: sum(int(payload["stats"][key]) for payload in split_manifests.values())
