@@ -11,7 +11,7 @@ flowchart LR
     A --> S["train_sft_80m.yaml"]
     D["taichu_tokenizer/"] --> P
     D --> S
-    G["Pretraining Binary Dataset"] --> P
+    G["Pretraining Parquet Dataset"] --> P
     K["data_sft_unified.yaml"] --> S
     E["pretrain final_model.pt"] --> S
     P --> R1["experiments/<scale>/pretrain/<run>"]
@@ -130,7 +130,7 @@ data:
   task_type: pretraining
   dataset_id: taichu-pretraining-4b
   storage:
-    format: binary_mmap
+    format: parquet
     train_path: "./data/unified/taichu_80m_4b/train"
     validation_path: "./data/unified/taichu_80m_4b/validation"
     num_workers: 2
@@ -153,6 +153,16 @@ data:
     strategy: fixed_length
     pad_to_multiple_of: 8
 ```
+
+当前 `configs/train_pretrain_80m.yaml` 与 SFT 一样通过 `data_config` 引用独立的
+Runtime 数据配置：
+
+```yaml
+data_config: "./data_pretraining_unified.yaml"
+```
+
+训练配置只允许 `data` 与 `data_config` 二选一。Runtime Loader 启动时会校验
+配置中的 `dataset_id` 与 Parquet split Manifest 的身份一致。
 
 训练 batch 参数位于 `training`：
 
@@ -242,12 +252,14 @@ python -m dataset.offline.sample_sources `
 - `tokenizer_path`
 - `output_dir`
 - `dataset_id` / `version`
+- `format`（预训练默认 `parquet`）
 - `processing_workers` / `output_workers`
 - `segmentation`
 - `dedup`
 - `splits`
 - `cleaning`
 - `sources`
+- `selection.target_tokens` / `selection.mixture` / `selection.mixture_manifest_path`
 
 命令：
 
@@ -257,6 +269,15 @@ python -m dataset.offline.prepare `
 ```
 
 输出目录已存在时默认失败；中断后的 Staging 目录可通过 `--restart` 处理。
+可临时覆盖目标 Token 和来源比例：
+
+```powershell
+python -m dataset.offline.prepare `
+  --config configs/prepare_pretrain_data.yaml `
+  --target-tokens 100M `
+  --mixture fineweb2_zh=0.6 `
+  --mixture fineweb_edu_en=0.4
+```
 
 ## 5. 路径与身份约束
 

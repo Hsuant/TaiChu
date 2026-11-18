@@ -44,7 +44,7 @@ TaiChu（太初）是一个面向研究、教学和工程验证的开源小语�
 | 问题 | TaiChu 的回答 |
 |---|---|
 | Token 从哪里来？ | 可训练、可验证、可导出到 Hugging Face 兼容格式的 Byte-level BPE Tokenizer |
-| 数据怎样进入模型？ | 文档级清洗、去重、隔离划分、滑窗编码、二进制分片与 `mmap` 读取 |
+| 数据怎样进入模型？ | 文档级清洗、去重、隔离划分、滑窗编码、Parquet 分片与流式读取 |
 | 训练是否可恢复？ | 模型、优化器、调度器、Scaler、RNG 与数据位置一起保存 |
 | 指标是否可信？ | Token 加权 Loss、PPL、BPB、Accuracy、精确 CE 分位数统一实现 |
 | 结果能否解释？ | 配置、Manifest、实验日志、独立评估与最小推理产物均可追踪 |
@@ -76,7 +76,7 @@ TaiChu 希望最终形成一套覆盖预训练、SFT、偏好优化与 Agent 数
 |---|---|---|
 | **Tokenizer** | Byte-level BPE、NFC、数字拆分、9 个固定特殊 Token、Chat Template、HF 兼容导出 | 让训练、评估和推理使用同一套 Token 协议 |
 | **模型结构** | Pre-Norm Decoder、RoPE、MHA/GQA、SwiGLU、RMSNorm、权重绑定、KV Cache、可选 MoE | 结构保持可读，同时覆盖现代 Decoder 的关键组件 |
-| **统一数据** | Schema、流式读取、清洗、精确/近重复去重、Cluster 隔离、`tcbin/tcidx`、Manifest | 训练热路径不重复解析文本或 Tokenize |
+| **统一数据** | Schema、流式读取、清洗、精确/近重复去重、Cluster 隔离、Parquet、Manifest | 训练热路径不重复解析文本或 Tokenize |
 | **Packing** | Stream Packing、`segment_ids`、块对角因果 Mask、组内 `position_ids` | 多条文档物理拼接后仍保持语义隔离 |
 | **训练执行** | AdamW、WSD、AMP、梯度累积、梯度裁剪、DDP、`torch.compile`、早停 | 单进程可调试，多卡路径保留严格状态协调 |
 | **实验追踪** | TensorBoard、SwanLab、结构化日志、资源摘要、独立评估 | 训练日志与评估产物可长期归档 |
@@ -98,9 +98,9 @@ flowchart LR
     B --> C["清洗 / 精确去重<br/>MinHash-LSH 近重复"]
     C --> D["Cluster 隔离划分"]
     D --> E["Tokenizer / Masks"]
-    E --> F["tcbin + tcidx"]
+    E --> F["Parquet Shards + Manifest"]
     F --> G["Manifest + Content Hash"]
-    G --> H["mmap Reader"]
+    G --> H["Parquet Row-group Reader"]
     H --> I["Sampler / Mixer"]
     I --> J["Packing + Batch Builder"]
     J --> K["TaiChuModel"]
@@ -114,7 +114,7 @@ flowchart LR
 ```text
 model/       Decoder 结构、Attention、RoPE、FFN、生成
 tokenizer/   BPE 训练、规范化、特殊 Token、Chat Template
-dataset/     数据 Schema、离线准备、二进制存储、采样、Packing、Runtime
+dataset/     数据 Schema、离线准备、Parquet 存储、采样、Packing、Runtime
 training/    共享训练运行时、Task 接口、实验路径、优化器、Checkpoint、评估
 trainer/     预训练与 SFT 的任务策略和命令入口
 eval/        基座定量评估与原始文本续写探针
@@ -199,7 +199,7 @@ Tokenizer 配置中的正式语料路径来自作者本地环境，不能直接�
 
 ## 五、数据体系
 
-TaiChu 只保留一条训练数据主路径：**原始记录 → 离线准备 → 版本化二进制数据
+TaiChu 只保留一条训练数据主路径：**原始记录 → 离线准备 → 版本化 Parquet 数据
 → Runtime → Packing/Batch → 模型输入**。
 
 ### 5.1 当前数据来源
@@ -229,7 +229,7 @@ token 训练集。
   → 重复 Cluster 稳定划分 train / validation / diagnostic
   → 全文档 Tokenization
   → 2,046 Token 窗口、128 重叠、1,918 步长
-  → tcbin / tcidx + Manifest
+  → Parquet Shards + Manifest
 ```
 
 窗口的 BOS/EOS 与 Loss 规则保证正文 Token 恰好被监督一次；重叠区只作为上下文，
@@ -238,9 +238,9 @@ token 训练集。
 
 ### 5.3 存储与恢复
 
-`tcbin` 保存 JSON Metadata 和按字段编码的一维数组，支持 `int16`、`uint16`、
-`int32`、`int64`、`float32`；`tcidx` 保存定长 Record Offset。Reader 使用只读
-`mmap`，让训练热路径不重新读取原始文本。
+所有 split 保存为跨平台 Parquet Shard，Token 数组与样本 Metadata 分列存储，
+Manifest 记录每个 Shard 的样本数、字节数与 SHA-256。训练热路径按 Row Group
+流式读取，不重新读取原始文本或执行 Tokenization。
 
 `DataState` 保存数据集 ID、版本、Epoch、Batch Index 和已消费样本数。恢复训练时
 会校验 Dataset Identity，再从对应位置继续。
@@ -523,7 +523,7 @@ Chat 入口实现 Chat Template、多轮上下文裁剪、KV Cache 流式生成�
 | 阶段 | 状态 | 说明 |
 |---|---|---|
 | Tokenizer | 已完成 | 32K 词表、特殊 Token、Chat Template、验证与导出 |
-| 统一数据基础设施 | 已完成并通过测试 | 文档级准备、二进制存储、Packing、Runtime Resume |
+| 统一数据基础设施 | 已完成并通过测试 | 文档级准备、Parquet 存储、Packing、Runtime Resume |
 | 预训练框架 | 已完成并通过测试 | 单进程、WSD、AMP、Checkpoint、评估、日志 |
 | SFT 训练框架 | 已完成并通过测试 | 预训练初始化、assistant-only Loss、Epoch 预算、恢复与产物 |
 | 80M 第一阶段预训练 | 已完成一次公开实验 | 精确指标与 Manifest 待归档 |
@@ -622,6 +622,4 @@ Tokenizer 元数据中的历史许可证字段需要在正式发布前统一修�
 
 ### 致谢
 
-感谢 MiniMind 项目在小型语言模型工程展示上的启发，以及 PyTorch、Hugging Face
-Tokenizers、SwanLab、TensorBoard 等开源生态提供的工具基础。TaiChu 的代码与结论
-仍以本仓库可审计的实现、配置和实验记录为准。
+TaiChu 的代码与结论仍以本仓库可审计的实现、配置和实验记录为准。

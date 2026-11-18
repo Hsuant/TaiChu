@@ -9,8 +9,8 @@ Raw Dataset
   -> Schema Validation
   -> Task Preprocessing Adapter
   -> Tokenization / Mask / Metadata
-  -> Versioned Binary Storage
-  -> Indexed mmap Reader
+  -> Versioned Parquet Storage
+  -> Row-group Reader
   -> Sampler / Distributed Sampler
   -> Optional Dataset Mixer
   -> Task-selected Packing
@@ -23,8 +23,8 @@ Raw Dataset
 Sample Schema、Preprocessing Adapter、Packing 策略、Batch Builder 和 Model Input
 Adapter。
 
-项目不再维护旧 `dataset.pretrain` 加载器、旧 flat data 配置、旧 Parquet
-训练热路径或兼容模式。当前只保留一条数据基础设施主路径。
+所有离线数据统一发布为 Parquet。
+项目不维护旧 `dataset.pretrain` 加载器或旧 flat data 配置。
 
 ## 2. LLM 生命周期任务矩阵
 
@@ -58,8 +58,8 @@ class CommonSample:
     metadata: dict
 ```
 
-`sample_type` 和 `array_fields` 是类级契约。`array_fields` 中声明的字段写入二进制
-数组区，其余字段写入 JSON Metadata。
+`sample_type` 和 `array_fields` 是类级契约。`array_fields` 中声明的字段按数组列
+写入存储，其余字段写入 JSON Metadata；`sample_to_storage` 是两种后端的共同契约。
 
 ### 3.2 任务 Schema
 
@@ -86,7 +86,7 @@ JSONL / JSONL.GZ / Parquet
   -> optional cleaning and exact deduplication
   -> tokenization
   -> task metadata and masks
-  -> binary shard + index
+  -> Parquet shard + manifest
   -> manifest + content hash
 ```
 
@@ -101,7 +101,7 @@ python -m dataset.offline.prepare `
 
 ```text
 manifest.json
-  -> BinaryDatasetReader
+  -> ParquetDatasetReader
   -> IndexedTokenDataset
   -> DistributedSampler / RandomSampler
   -> DataLoader workers + prefetch
@@ -110,13 +110,14 @@ manifest.json
   -> model input adapter
 ```
 
-训练热路径不读取原始 JSONL，不执行 Tokenization，不做文本清洗，也不解析普通 Parquet。
+训练热路径不读取原始 JSONL，不执行 Tokenization，也不做文本清洗。Parquet Reader
+按 Row Group 读取已发布的 Token 列。
 
 ### 4.3 Online
 
 RLHF、PPO 和 GRPO 可在运行时接入：
 
-1. 离线 Binary Dataset。
+1. 离线 Parquet Dataset。
 2. 当前 Policy 动态生成的 Sample。
 3. `ExperienceBuffer` 中的 Rollout。
 
@@ -128,7 +129,7 @@ RLHF、PPO 和 GRPO 可在运行时接入：
 ```text
 dataset/
 ├── schema/          # Common + task-specific sample contracts
-├── storage/         # versioned manifest + mmap binary reader/writer
+├── storage/         # versioned manifest + Parquet reader and writer
 ├── offline/
 │   ├── adapters/    # task semantics and masks
 │   ├── prepare.py   # offline orchestration + atomic output
@@ -169,20 +170,18 @@ schema
 ```text
 train/
 ├── manifest.json
-├── data-00000.tcbin
-├── data-00000.tcidx
-├── data-00001.tcbin
-└── data-00001.tcidx
+├── data-00000.parquet
+└── data-00001.parquet
 ```
 
-`tcbin` 保存：
+每个 Parquet Shard 保存：
 
-- Magic、格式版本。
-- JSON Metadata 区。
-- 按字段保存的 `int32`、`int64` 或 `float32` 一维数组。
+- 通用样本身份字段：`sample_id`、`dataset_id`、`source_id`、`sample_type`。
+- `input_token_count` 与 `loss_token_count`，其中前者只统计非 padding input token。
+- 任务声明的数组列，例如 `input_ids`、`labels`、`attention_mask`、`document_ids`。
+- 可扩展的 JSON Metadata。
 
-`tcidx` 保存固定宽度 Record Offset。Reader 通过只读 `mmap` 和 offset 随机访问，
-不需要把全部 Sample 对象常驻 Python 内存。
+Reader 按 Row Group 随机访问，不需要把全部 Sample 对象常驻 Python 内存。
 
 `manifest.json` 记录：
 
@@ -227,8 +226,8 @@ Prompt Mask、Assistant-only Loss、EOS Mask、Conversation Boundary 和 Segment
 离线阶段或 Packing 阶段生成。`labels` 在数据层不做因果移位。
 
 批量 SFT Builder 在筛选阶段一次生成完整 Token IDs 与 Assistant Mask，并写入紧凑
-token cache；Binary 发布阶段直接读取 cache 写 `SFTSequenceSample`，不会重新逐 turn
-tokenization，也不会在训练二进制 metadata 中重复保存完整 messages。
+token cache；Parquet 发布阶段直接读取 cache 写 `SFTSequenceSample`，不会重新逐 turn
+tokenization，也不会在训练 Parquet Metadata 中重复保存完整 messages。
 
 ### 7.3 Preference
 
@@ -257,7 +256,7 @@ Stop Reason。Loss 函数从 Batch 中读取任务字段，不从 `input_ids` �
 ### 单卡
 
 ```text
-BinaryDatasetReader
+open_dataset_reader / ParquetDatasetReader
   -> RandomSampler
   -> DataLoader
 ```
@@ -406,7 +405,7 @@ Storage、Manifest、Sampler、Distributed Sampler、Mixer 和 Checkpoint 不应
 
 | 问题 | 答案 |
 |---|---|
-| 所有任务共享什么 | Schema 基类、Binary Storage、Manifest、Reader、Sampler、Mixer、Prefetch、Checkpoint、Metrics |
+| 所有任务共享什么 | Schema 基类、Parquet Storage、Manifest、Reader、Sampler、Mixer、Prefetch、Checkpoint、Metrics |
 | 任务专用是什么 | Schema 字段、Preprocessing Adapter、Packing、Batch Builder、Model Input Adapter、Loss Metadata |
 | Offline 做什么 | 校验、清洗、格式化、Tokenization、Mask、Metadata、版本化写入 |
 | Online 做什么 | Rollout、Experience Buffer、动态 Candidate、模型生成字段 |
@@ -420,21 +419,21 @@ Storage、Manifest、Sampler、Distributed Sampler、Mixer 和 Checkpoint 不应
 自动化测试覆盖：
 
 - Common / Pretraining / SFT / Preference / Reward / Trajectory / Multimodal Schema。
-- Binary Shard、Manifest、Checksum 和 mmap 随机访问。
+- Parquet / Parquet Shard、Manifest、Checksum 和随机访问。
 - 多 Shard 数据集读取。
 - 多轮 Conversation 的 Assistant-only Mask。
 - Preference Pair 与 Pair-aware Batch。
 - Reward / Trajectory Batch 契约。
 - Pretraining Stream Packing、块对角 Attention 和 SFT Sample-isolated Packing。
 - 单卡 Sampler、多 Rank 分片、Epoch 可复现性。
-- 统一离线 JSONL 到 Binary 数据集。
+- 统一离线 JSONL 到 Parquet 数据集。
 - 配置严格校验和单一 Runtime 路径。
 
 当前维护工作区完整回归为 `268 passed, 3 skipped, 152 subtests passed`。
 
 CPU 端到端验证还覆盖了：
 
-- `600` 条 JSONL -> Unified Binary Dataset。
+- `600` 条 JSONL -> Unified Offline Dataset。
 - 预训练 `79` 步、验证、生成诊断和 Checkpoint。
 - 从 `checkpoint-60` 恢复并在校验 Dataset ID/Version 后继续到第 `79` 步。
 
@@ -450,7 +449,7 @@ Checkpoint、恢复和最终模型保存。该测试入口当前未纳入公开 
 
 测试覆盖：
 
-- 离线数据生成结果与 Binary 读取结果。
+- 离线数据生成结果与 Parquet 读取结果。
 - `input_ids`、`labels`、`attention_mask` 的逐位置对比。
 - `logits[:, :-1]` 与 `labels[:, 1:]` 的 next-token 对齐。
 - 模型 loss 与手动 CrossEntropy 的数值差。
@@ -464,6 +463,6 @@ Checkpoint、恢复和最终模型保存。该测试入口当前未纳入公开 
 仍未验证：
 
 - GPU 数据吞吐和 NCCL 多节点同步。
-- 超大语料下的 mmap Page Cache、Shard 数量与 Worker 压测。
+- 超大语料下的 Parquet Page Cache、Shard 数量与 Worker 压测。
 - DPO、IPO、KTO、PPO、GRPO、RLHF 的完整训练算法。
 - 真实多模态 Tensor 解码和模型侧对齐。

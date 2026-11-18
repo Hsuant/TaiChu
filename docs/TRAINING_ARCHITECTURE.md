@@ -28,7 +28,7 @@ trainer/train_pretrain.py        trainer/train_sft.py
 | 路径 | 职责 |
 |---|---|
 | `model/` | 模型结构、前向、Loss、生成和 KV Cache |
-| `dataset/` | 类型化样本、离线准备、二进制存储、采样、Packing、Batch、Runtime |
+| `dataset/` | 类型化样本、离线准备、Parquet 存储、采样、Packing、Batch、Runtime |
 | `training/config.py` | 训练配置数据类、严格 YAML 解析、跨模块校验 |
 | `training/cli.py` | 参数定义和不可变配置覆盖 |
 | `training/causal_lm.py` | 任务接口、共享装配 Pipeline 和 Causal LM 训练循环 |
@@ -200,7 +200,7 @@ parse CLI
 可以复用的稳定能力：
 
 - 配置解析、环境初始化、随机种子
-- 数据 Schema、Binary Storage、Sampler、Packing、Batch Builder
+- 数据 Schema、Parquet Storage、Sampler、Packing、Batch Builder
 - 模型构建、DDP、AMP、编译
 - Optimizer、Scheduler、Checkpoint、RNG 恢复
 - 日志、诊断、验证指标和独立评估框架

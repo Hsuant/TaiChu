@@ -19,7 +19,7 @@ raw JSONL / GZ / Parquet
   -> 2046-token windows, stride 1918, overlap 128
   -> optional source-token quota selection for train
   -> one independent PretrainingSample per window
-  -> Binary Shard + Manifest
+  -> Parquet Shard + Manifest
 ```
 
 The command is:
@@ -29,12 +29,27 @@ python -m dataset.offline.prepare `
   --config configs/prepare_pretrain_data.yaml
 ```
 
+Command-line overrides are available for experiments:
+
+```powershell
+python -m dataset.offline.prepare `
+  --config configs/prepare_pretrain_data.yaml `
+  --target-tokens 100M `
+  --mixture fineweb2_zh=0.5 `
+  --mixture industrycorpus_zh=0.5
+```
+
+The final output is a split directory containing `manifest.json` and
+`data-*.parquet` shards. All split manifests and the root manifest are published
+only after the complete dataset is written.
+
 ## Source Token Quotas
 
 `selection` in `prepare_pretrain_data.yaml` optionally fixes the final train
-split to a non-padding input-token budget. Source targets are read from the
-sampling stage's `sampling_manifest.json`; they are normalized automatically,
-so the training configuration does not repeat source weights.
+split to a non-padding input-token budget. Source ratios can be declared inline
+with `selection.mixture`, or inherited from the sampling stage's
+`sampling_manifest.json` through `selection.mixture_manifest_path`. Ratios are
+normalized automatically and must name every configured source exactly once.
 
 Selection runs only after cleaning, duplicate clustering, split assignment and
 window tokenization. Each source gets a token quota:
@@ -44,7 +59,8 @@ source_quota = target_tokens * source_target_bytes / total_target_bytes
 ```
 
 Windows are shuffled deterministically inside each source and selected until the
-quota is reached. A source may overshoot by at most one window. When total
+quota is reached. The budget counts non-padding `input_ids`, and the Parquet
+writer persists that count explicitly. A source may overshoot by at most one window. When total
 candidate tokens are sufficient and the aggregate source deficit is at most 1%
 of the target, the deficit is redistributed across sources with surplus. This
 keeps small normalization/deduplication differences from failing after a long
@@ -161,7 +177,7 @@ page-size and query changes.
 On a 2,000-document sample, omitting per-document shingle/signature payloads
 reduced staging from 37.6 MB to 10.8 MB for 8.28 MB of cleaned UTF-8 text. For
 that historical 18.01 GB raw mix, the projection was roughly 24 GB of staging
-plus roughly 79 GB of final binary output at peak. Re-measure free space and
+plus the final Parquet output at peak. Re-measure free space and
 output size for the current corpus before a full run.
 
 `pending_batches` is the bounded in-flight queue, normally
@@ -304,7 +320,7 @@ Automated tests cover:
 - BOS only on first windows and EOS only on final windows,
 - exact and exact-Jaccard-verified near-duplicate clustering,
 - deterministic split isolation,
-- JSONL to Binary integration with the bundled tokenizer,
+- JSONL to Parquet integration with the bundled tokenizer,
 - block-diagonal Attention and Group-local position IDs.
 
 Full-corpus deduplication, the configured production sampling volume and GPU

@@ -6,8 +6,8 @@
 Raw records
   → task adapter / cleaning
   → typed sample
-  → tcbin + tcidx + manifest
-  → mmap reader
+  → Parquet shards + manifest
+  → row-group reader
   → sampler
   → packing
   → batch builder
@@ -26,6 +26,8 @@ from dataset import (
     TrajectorySample,
     UnifiedDataConfig,
     UnifiedDataLoaderFactory,
+    build_pretrain_data_loader,
+    build_sft_data_loader,
 )
 ```
 
@@ -47,7 +49,7 @@ Schema 存在不等于训练算法已实现。
 ```text
 dataset/
 ├── schema/       # CommonSample 与任务样本
-├── storage/      # tcbin/tcidx、Manifest、mmap
+├── storage/      # Parquet、Manifest、Row Group Reader
 ├── offline/      # 抽样、读取、清洗、Adapter、准备管线
 ├── sampling/     # Random / Distributed / Mixer / Shuffle
 ├── packing/      # Stream / Sample-isolated
@@ -73,11 +75,10 @@ python -m pytest -q
 
 ## 验证边界
 
-- Binary Storage、Manifest、mmap、Sampler、Packing、Batch 与 Runtime Resume 有自动化测试。
-- `tcbin` 支持 `int16`、`uint16`、`int32`、`int64`、`float32`。
+- Parquet Storage、Manifest、Sampler、Packing、Batch 与 Runtime Resume 有自动化测试。
 - `segment_ids` 已进入模型 Attention；增量解码不接受 Segment Mask。
 - 当前公开训练只使用 Pretraining / CPT 路径。
-- GPU 多 Worker 吞吐、超大 Shard 数量和 mmap Page Cache 仍需目标环境压测。
+- GPU 多 Worker 吞吐、超大 Shard 数量和 Parquet Page Cache 仍需目标环境压测。
 
 详细文档：
 

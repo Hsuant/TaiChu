@@ -30,7 +30,7 @@
 | P0 | `.gitignore` 的 `experiments/` 同时忽略 `docs/experiments/` | 收窄为根目录 `/experiments/`，训练产物仍忽略 |
 | P1 | 第一阶段实验没有统一档案和模板 | 新增实验索引、模板、80M 档案 |
 | P1 | SwanLab 实际 LR 曲线约 `5e-4`，仓库默认配置为 `3e-4` | 明确区分“运行可见值”和“仓库默认值” |
-| P1 | Binary Storage 文档未完整列出 `int16/uint16` | 按 `dataset/storage/binary.py` 修正 |
+| P1 | 存储文档与二进制后端历史说明不一致 | 统一为 Parquet Storage 与 Row Group 读取 |
 | P1 | 训练代码支持 GPU/AMP/NCCL 路径，但缺少目标硬件验证 | 在 README、状态和 Roadmap 中保留为待验证 |
 | P1 | `tests/` 在当前 Git 历史被删除，工作区又忽略该目录 | 保留测试结果，但明确公开仓库不可直接复现 |
 | P1 | `prepare_pretrain_data.yaml` 与 80M 训练配置的 Dataset ID 不一致 | 文档列为已知问题；按约束未修改配置 |

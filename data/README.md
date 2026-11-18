@@ -12,7 +12,7 @@ data/
 │   └── eval_wiki_en.jsonl
 ├── raw/          # 原始语料，默认不提交
 ├── processed/    # 中间清洗结果，默认不提交
-└── unified/      # tcbin/tcidx 与 Manifest，默认不提交
+└── unified/      # Parquet Shards 与 Manifest，默认不提交
 ```
 
 当前仓库只提交 `data/eval/` 下的评估样例。过去文档中的 `data/samples/`
@@ -60,12 +60,10 @@ data/unified/taichu_80m_4b/
 ├── dataset_manifest.json
 ├── train/
 │   ├── manifest.json
-│   ├── data-00000.tcbin
-│   └── data-00000.tcidx
+│   └── data-00000.parquet
 ├── validation/
 │   ├── manifest.json
-│   ├── data-00000.tcbin
-│   └── data-00000.tcidx
+│   └── data-00000.parquet
 └── diagnostic/
 ```
 

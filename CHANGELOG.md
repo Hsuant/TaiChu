@@ -31,7 +31,7 @@ TaiChu-80M 预训练基座。
 - 修复 README 对已删除文档、配置和数据样例目录的引用。
 - 修复 `data/README.md` 中不存在的样例目录和文档链接。
 - 修复训练与数据文档中不一致的测试数量。
-- 修复 Dataset 文档对 Binary DType 范围的不完整描述。
+- 修复 Dataset 文档对存储 DType 范围的不完整描述。
 - 修复实验能力描述，明确 SFT、DPO、RLHF 与 Agent 尚未实现。
 
 ### Removed
@@ -46,7 +46,7 @@ TaiChu-80M 预训练基座。
 
 ### Added
 
-- 统一数据基础设施：Schema、Binary Storage、Sampler、Packing、Batch、Runtime Resume。
+- 统一数据基础设施：Schema、Parquet Storage、Sampler、Packing、Batch、Runtime Resume。
 - 文档级预训练准备：精确/近重复去重、Cluster 隔离、滑窗与 Manifest。
 - 独立 `training/` 组件层、最小推理产物、SwanLab 恢复和终端 Chat。
 

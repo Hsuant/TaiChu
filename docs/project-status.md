@@ -11,7 +11,7 @@
 | 可用公开模型档位 | 80M / 150M / 190M 配置；完整权重不随仓库分发 |
 | 第一公开实验 | TaiChu-80M，SwanLab Run `zxdscptz`，状态“完成” |
 | 代码测试基线 | `268 passed, 3 skipped, 152 subtests passed` |
-| 数据主路径 | 文档级/会话数据 → 去重/选择 → Binary mmap → Packing → Pretraining / SFT |
+| 数据主路径 | 文档级/会话数据 → 去重/选择 → Parquet → Packing → Pretraining / SFT |
 | 推理入口 | 独立评估、原始文本续写、终端 Chat |
 | 指令模型 | 尚无经过验证的 SFT 公开权重 |
 | SFT | 数据构建、Assistant-only 训练、恢复与集成测试已实现 |
@@ -40,7 +40,7 @@
 - 文档级清洗、精确去重、MinHash/LSH 近重复检测。
 - Cluster 级 train / validation / diagnostic 隔离。
 - 2,046 Token 滑窗与 128 Token Context Overlap。
-- `tcbin/tcidx`、Manifest、Content Hash、mmap Reader。
+- Parquet、Manifest、Content Hash、Row Group Reader。
 - Sampler、Mixer、Stream Packing、Batch Builder 与 Runtime Resume。
 
 ### 训练
