@@ -200,6 +200,16 @@ python -m trainer.validate_tokenizer `
 验证包括词表大小、特殊 Token ID、文件协议、随机 Unicode 往返、单条/批量一致性和
 Hugging Face 兼容加载。
 
+### 生成 HF 配置
+
+```powershell
+python -m scripts.gen --output-dir path/to/model_dir
+```
+
+脚本默认从 `configs/chat_80m.yaml` 指向的模型产物读取 `model_config`,
+从对应 Tokenizer 读取特殊 Token ID,并写入 `config.json` 与
+`generation_config.json`。已有文件默认不覆盖,使用 `--force` 覆盖。
+
 ## 7. 当前边界
 
 - 仓库不分发训练好的完整模型权重。
